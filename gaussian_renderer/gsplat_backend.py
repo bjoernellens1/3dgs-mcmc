@@ -45,32 +45,30 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     viewmats = viewmat[None].contiguous()
     Ks = K[None].contiguous()
 
-    # Background: gsplat expects flat [C] (broadcast over all pixels)
+    # Background: gsplat expects flat [C] for packed=True
     bg = bg_color.contiguous() if bg_color is not None else None
 
     # Colors / SH handling
     # -------------------------------------------------------------------------
-    # pc.get_features returns [N, K, 3] where K = (max_sh_degree+1)**2.
-    # gsplat expects the same layout when sh_degree is provided.
-    colors = pc.get_features.contiguous()
-    sh_degree = pc.active_sh_degree
+    # DEBUG: Python-side SH evaluation to bypass gsplat ROCm SH backward kernel
+    from utils.sh_utils import eval_sh
+    colors_sh = pc.get_features.contiguous()
+    shs_view = colors_sh.transpose(1, 2).contiguous().view(
+        -1, 3, (pc.max_sh_degree + 1) ** 2
+    )
+    dir_pp = pc.get_xyz - viewpoint_camera.camera_center.to(device).view(1, 3)
+    dir_norm = dir_pp.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    dir_pp_normalized = dir_pp / dir_norm
+    colors = torch.clamp(
+        eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5,
+        0.0,
+        1.0,
+    ).contiguous()
+    sh_degree = None
 
-    if override_color is not None:
-        if override_color.dim() == 1:
-            override_color = override_color.unsqueeze(0).expand(means.shape[0], -1)
-        colors = override_color.contiguous()
-        sh_degree = None
-    elif pipe.convert_SHs_python:
-        from utils.sh_utils import eval_sh
-        shs_view = colors.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
-        dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_xyz.shape[0], 1))
-        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-        colors_precomp = torch.clamp_min(
-            eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5, 0.0
-        )
-        colors = colors_precomp.contiguous()
-        sh_degree = None
-
+    # tile_size=8 causes NaN gradients on ROCm/gfx1151 with wave32-patched gsplat.
+    # Default is 16. See docs/ROCM_PODMAN.md.
+    tile_size = getattr(pipe, "tile_size", 16)
     render_colors, render_alphas, meta = rasterization(
         means=means,
         quats=quats,
@@ -81,9 +79,9 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         Ks=Ks,
         width=W,
         height=H,
-        sh_degree=sh_degree,
+        sh_degree=None,
         packed=True,
-        tile_size=8,  # 8 performs better on AMD GPUs (ROCm/gsplat default)
+        tile_size=tile_size,
         backgrounds=bg,
         render_mode="RGB",
         sparse_grad=False,

@@ -121,7 +121,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
+            if (iteration in saving_iterations) or (args.save_interval > 0 and iteration % args.save_interval == 0):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
@@ -145,7 +145,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
                 gaussians._xyz.add_(noise)
 
-            if (iteration in checkpoint_iterations):
+            if (iteration in checkpoint_iterations) or (args.checkpoint_interval > 0 and iteration % args.checkpoint_interval == 0):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
@@ -226,6 +226,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_interval", type=int, default=2000,
+                        help="Save a checkpoint every N iterations (independent of --checkpoint_iterations).")
+    parser.add_argument("--save_interval", type=int, default=2000,
+                        help="Save a PLY point cloud every N iterations (independent of --save_iterations).")
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     

@@ -1,0 +1,23 @@
+services:
+  train:
+    image: ghcr.io/bjoernellens1/3dgs-mcmc:latest
+    pull_policy: missing
+    privileged: true
+    security_opt:
+      - "label=disable"
+    group_add:
+      - "video"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      HSA_XNACK: "1"
+      HSA_ENABLE_SDMA: "0"
+      PYTORCH_ROCM_ARCH: "gfx1151"
+    volumes:
+      - ./output:/workspace/3dgs-mcmc/output
+      - ./data:/data
+    working_dir: /workspace/3dgs-mcmc
+    command: bash
+    build:
+      context: .
