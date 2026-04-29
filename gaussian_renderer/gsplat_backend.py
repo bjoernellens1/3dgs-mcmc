@@ -50,20 +50,29 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
 
     # Colors / SH handling
     # -------------------------------------------------------------------------
-    # DEBUG: Python-side SH evaluation to bypass gsplat ROCm SH backward kernel
+    # Python-side SH evaluation to bypass gsplat ROCm SH backward kernel.
+    # Optimized: avoid pc.get_features round-trip, slice only active coeffs,
+    # and special-case degree 0 to skip eval_sh entirely.
     from utils.sh_utils import eval_sh
-    colors_sh = pc.get_features.contiguous()
-    shs_view = colors_sh.transpose(1, 2).contiguous().view(
-        -1, 3, (pc.max_sh_degree + 1) ** 2
-    )
-    dir_pp = pc.get_xyz - viewpoint_camera.camera_center.to(device).view(1, 3)
-    dir_norm = dir_pp.norm(dim=1, keepdim=True).clamp_min(1e-8)
-    dir_pp_normalized = dir_pp / dir_norm
-    colors = torch.clamp(
-        eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5,
-        0.0,
-        1.0,
-    ).contiguous()
+
+    if pc.active_sh_degree == 0:
+        colors = torch.clamp(pc._features_dc[:, 0, :] + 0.5, 0.0, 1.0).contiguous()
+    else:
+        active_coeffs = (pc.active_sh_degree + 1) ** 2
+        features_dc = pc._features_dc.transpose(1, 2)  # [N, 3, 1]
+        features_rest = pc._features_rest[:, :active_coeffs - 1, :].transpose(1, 2)
+        shs_view = torch.cat((features_dc, features_rest), dim=2).contiguous()
+
+        cam_center = viewpoint_camera.camera_center.to(device=device, dtype=means.dtype).view(1, 3)
+        dir_pp = means - cam_center
+        dir_pp_normalized = torch.nn.functional.normalize(dir_pp, dim=1, eps=1e-8)
+
+        colors = torch.clamp(
+            eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5,
+            0.0,
+            1.0,
+        ).contiguous()
+
     sh_degree = None
 
     # tile_size=8 causes NaN gradients on ROCm/gfx1151 with wave32-patched gsplat.
