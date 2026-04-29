@@ -1,0 +1,18 @@
+[project]
+name = "3dgs-mcmc"
+version = "0.1.0"
+description = "3D Gaussian Splatting with MCMC - ROCm port"
+requires-python = ">=3.10"
+dependencies = [
+    # torch and torchvision are provided by the rocm/pytorch base image.
+    # If installing outside Docker, install ROCm PyTorch wheels first.
+    "numpy",
+    "plyfile",
+    "tqdm",
+    "opencv-python",
+    "amd-gsplat @ git+https://github.com/ROCm/gsplat.git@release/1.5.3b2",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -14,7 +14,11 @@ import json
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
+try:
+    from gaussian_renderer import network_gui
+except Exception:
+    network_gui = None
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state

@@ -17,7 +17,10 @@ import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2
+except Exception:
+    from utils.rocm_knn_fallback import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.reloc_utils import compute_relocation_cuda
