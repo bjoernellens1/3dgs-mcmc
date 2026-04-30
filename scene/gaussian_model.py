@@ -434,7 +434,8 @@ class GaussianModel:
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
                 stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-            del self.optimizer.state[group['params'][0]]
+            if group['params'][0] in self.optimizer.state:
+                del self.optimizer.state[group['params'][0]]
             group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
             self.optimizer.state[group['params'][0]] = stored_state
 
