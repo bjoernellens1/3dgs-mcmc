@@ -254,19 +254,100 @@ With the optimizations applied (`--init_type sfm`, `--sh_degree_schedule 3000 60
 
 The SfM initialization alone cuts the initial Gaussian count nearly in half, and delaying SH degree growth keeps the early training much faster while still reaching full `sh_degree=3` by iteration 9000.
 
+## Energy-Guided MCMC Observations
+
+### Splat count stalls at ~76k (SfM init)
+
+This occurs on **both 10k and 30k runs** with SfM initialization:
+
+| Iteration | Gaussians | Growth factor | Grow interval | rho | Notes |
+|-----------|-----------|---------------|---------------|-----|-------|
+| 600 | 54,275 → 56,873 | 1.048 | 150 | 0.009 | Early aggressive growth |
+| 975 | 59,590 → 62,184 | 1.044 | 325 | 0.010 | Growth slowing |
+| 6,768 | 74,318 → 75,081 | 1.010 | 1,692 | 0.013 | Minimal late growth |
+| 9,510 | 75,851 → 76,245 | 1.005 | 1,902 | 0.013 | Nearly stalled |
+
+**Root cause:** The exponential growth-factor decay (`growth_factor_tau=0.35`) is too aggressive for the current cap_max. By `u_growth ≈ 0.78` (reached around iter 9.5k regardless of total run length), `time_decay = exp(-0.78/0.35) ≈ 0.11`, yielding `growth_factor ≈ 1.005`. This is intrinsic to the schedule — not a 10k-run artifact.
+
+**Why this happens with SfM init:**
+- SfM starts with only 54k Gaussians (vs 100k random)
+- The schedule's `cap_decay = (1-rho)^2 ≈ 0.97` is near 1 because `rho ≈ 0.013`, so cap pressure is negligible
+- The **time decay** dominates, shrinking growth factor regardless of how far below cap_max we are
+
+**Side effects:**
+- **Far-away objects filtered more aggressively** than with schedule-only MCMC. The utility score penalizes low-visibility and low-gradient Gaussians, which disproportionately affects distant or occluded regions.
+- **Dead threshold rises from 0.003 → 0.006**, making late-stage relocation more willing to recycle weak Gaussians.
+- **Strong reconstruction with very low splat count**: 76k Gaussians at iter 10k is extremely lean compared to typical 3DGS-MCMC runs (often 200k–500k).
+
+**How to increase splat count:**
+```bash
+# Slower growth-factor decay (default tau=0.35)
+--mcmc_growth_factor_tau 0.6
+
+# Higher initial growth factor (default 1.05)
+--mcmc_growth_factor_start 1.10
+
+# Extend growth window (default 12_000)
+--mcmc_stop_growth_iter 20000
+
+# Or disable energy guidance entirely
+--no-energy_mcmc
+```
+
 ## TensorBoard
 
-TensorBoard summaries are written to the model output folder (e.g. `output/bicycle`), which is volume-mounted back to the host. View them from the host without entering the container:
+**Current issue:** The `localhost/3dgs-mcmc-rocm:7.2-tb` image does not actually contain TensorBoard, so `train.py` skips logging (`TENSORBOARD_FOUND = False`). This will be fixed in the next image rebuild. For now, install it at runtime:
+
+```bash
+podman run --rm -it --privileged --security-opt label=disable \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add=video \
+  -e HSA_XNACK=1 \
+  -e HSA_ENABLE_SDMA=0 \
+  -e PYTORCH_ROCM_ARCH=gfx1151 \
+  -v $(pwd):/workspace/3dgs-mcmc:Z \
+  localhost/3dgs-mcmc-rocm:7.2-tb \
+  bash -c "pip install tensorboard && python train.py ..."
+```
+
+### Viewing TensorBoard on localhost
+
+Once event files are written, you have two options:
+
+**Option A — Run TensorBoard inside the container (recommended):**
+
+Add port forwarding to your run command:
+
+```bash
+podman run --rm --privileged --security-opt label=disable \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add=video \
+  -p 127.0.0.1:6006:6006 \
+  -e HSA_XNACK=1 \
+  -e HSA_ENABLE_SDMA=0 \
+  -e PYTORCH_ROCM_ARCH=gfx1151 \
+  -v /home/bjoern/Downloads/mipnerf360_v2_dataset:/data/mipnerf360_v2_dataset:Z \
+  -v $(pwd):/workspace/3dgs-mcmc:Z \
+  localhost/3dgs-mcmc-rocm:7.2-tb \
+  bash -c "pip install tensorboard && \
+    tensorboard --logdir /workspace/3dgs-mcmc/output/bicycle --host 0.0.0.0 --port 6006 & \
+    python train.py -s /data/mipnerf360_v2_dataset/bicycle \
+      --config configs/bicycle.json -m output/bicycle --eval"
+```
+
+Then open `http://localhost:6006` on your host.
+
+**Option B — Run TensorBoard on the host (if tensorboard is installed):**
 
 ```bash
 cd /home/bjoern/git/3dgs-mcmc
 tensorboard --logdir output/bicycle --bind_all
 ```
 
-Then open `http://<host-ip>:6006` in a browser. If `tensorboard` is not installed on the host, use a temporary venv or a second container:
+If tensorboard is not installed on the host, use a disposable container:
 
 ```bash
-podman run --rm -p 6006:6006 \
+podman run --rm -p 127.0.0.1:6006:6006 \
   -v $(pwd)/output/bicycle:/logs:Z \
   docker.io/tensorflow/tensorflow:latest \
   tensorboard --logdir /logs --host 0.0.0.0

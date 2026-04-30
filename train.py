@@ -55,6 +55,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         start_iter=opt.densify_from_iter,
         stop_growth_iter=getattr(opt, "mcmc_stop_growth_iter", 12_000),
         stop_reloc_iter=opt.densify_until_iter,
+        growth_factor_start=getattr(opt, "mcmc_growth_factor_start", 1.05),
+        growth_factor_min=getattr(opt, "mcmc_growth_factor_min", 1.002),
+        growth_factor_tau=getattr(opt, "mcmc_growth_factor_tau", 0.35),
+        grow_interval_min=getattr(opt, "mcmc_grow_interval_min", 100),
+        grow_interval_max=getattr(opt, "mcmc_grow_interval_max", 2000),
+        grow_tau=getattr(opt, "mcmc_grow_tau", 0.35),
     )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
