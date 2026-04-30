@@ -422,8 +422,12 @@ class GaussianModel:
             assert len(group["params"]) == 1
             tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
-            
-            if inds is not None:
+
+            if stored_state is None:
+                stored_state = {}
+                stored_state["exp_avg"] = torch.zeros_like(tensor)
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+            elif inds is not None:
                 stored_state["exp_avg"][inds] = 0
                 stored_state["exp_avg_sq"][inds] = 0
             else:
