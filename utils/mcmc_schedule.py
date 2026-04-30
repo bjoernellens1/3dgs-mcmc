@@ -29,6 +29,10 @@ class MCMCScheduleConfig:
     dead_opacity_end: float = 0.010
     dead_opacity_power: float = 1.5
 
+    # Target-deficit growth controller (optional, selectable)
+    use_target_deficit: bool = False
+    target_splat_end: int = 150_000
+
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -74,9 +78,20 @@ def get_mcmc_schedule(iteration, current_n, cap_max, cfg: MCMCScheduleConfig):
     time_decay = math.exp(-u_growth / max(cfg.growth_factor_tau, 1e-6))
     cap_decay = max(0.0, 1.0 - rho) ** cfg.cap_growth_power
 
-    growth_factor = 1.0 + (
-        (cfg.growth_factor_start - 1.0) * time_decay * cap_decay
-    )
+    if cfg.use_target_deficit:
+        # Target-deficit growth controller:
+        # Compute annealed target fraction q (same schedule as compute_effective_count_loss)
+        u_q = min(iteration / 30000.0, 1.0)
+        q = exp_interp(u_q, 0.05, 0.85, 0.45)  # q_start, q_end, tau_N
+        N_target = cfg.target_splat_end * q
+        deficit = max(0.0, (N_target - current_n) / max(N_target, 1.0))
+        growth_factor = 1.0 + (
+            (cfg.growth_factor_start - 1.0) * time_decay * (deficit ** cfg.cap_growth_power)
+        )
+    else:
+        growth_factor = 1.0 + (
+            (cfg.growth_factor_start - 1.0) * time_decay * cap_decay
+        )
 
     if growth_factor > 1.0:
         growth_factor = max(cfg.growth_factor_min, growth_factor)

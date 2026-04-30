@@ -111,6 +111,23 @@ class OptimizationParams(ParamGroup):
         self.energy_temp_start = 2.0
         self.energy_temp_min = 0.3
         self.energy_temp_tau = 0.4
+        self.energy_beta_opacity = 1.0
+        self.energy_beta_scale = 0.5
+        self.energy_alpha_dead = 0.005
+        self.energy_w_support = 2.0
+        # MCMC schedule parameters (exposed for ablation studies)
+        self.mcmc_relocate_interval_min = 50
+        self.mcmc_relocate_interval_max = 500
+        self.mcmc_relocate_tau = 0.65
+        self.mcmc_cap_growth_power = 2.0
+        self.mcmc_cap_interval_strength = 4.0
+        self.mcmc_cap_interval_power = 2.0
+        self.mcmc_cap_stop_ratio = 0.98
+        self.mcmc_dead_opacity_start = 0.003
+        self.mcmc_dead_opacity_end = 0.010
+        self.mcmc_dead_opacity_power = 1.5
+        self.mcmc_use_target_deficit = False
+        self.mcmc_target_splat_end = 150000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -65,6 +65,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         grow_interval_min=getattr(opt, "mcmc_grow_interval_min", 100),
         grow_interval_max=getattr(opt, "mcmc_grow_interval_max", 2000),
         grow_tau=getattr(opt, "mcmc_grow_tau", 0.35),
+        relocate_interval_min=getattr(opt, "mcmc_relocate_interval_min", 50),
+        relocate_interval_max=getattr(opt, "mcmc_relocate_interval_max", 500),
+        relocate_tau=getattr(opt, "mcmc_relocate_tau", 0.65),
+        cap_growth_power=getattr(opt, "mcmc_cap_growth_power", 2.0),
+        cap_interval_strength=getattr(opt, "mcmc_cap_interval_strength", 4.0),
+        cap_interval_power=getattr(opt, "mcmc_cap_interval_power", 2.0),
+        cap_stop_ratio=getattr(opt, "mcmc_cap_stop_ratio", 0.98),
+        dead_opacity_start=getattr(opt, "mcmc_dead_opacity_start", 0.003),
+        dead_opacity_end=getattr(opt, "mcmc_dead_opacity_end", 0.010),
+        dead_opacity_power=getattr(opt, "mcmc_dead_opacity_power", 1.5),
+        use_target_deficit=getattr(opt, "mcmc_use_target_deficit", False),
+        target_splat_end=getattr(opt, "mcmc_target_splat_end", 150000),
     )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -134,14 +146,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if args.energy_mcmc:
             # Effective count loss: steer toward target population curve
             L_eff = compute_effective_count_loss(
-                gaussians.get_opacity,
+                gaussians._opacity,  # raw, not activated (loss needs differentiable raw params)
                 iteration=iteration,
                 cap_max=args.cap_max,
             )
             loss = loss + args.lambda_eff_count * L_eff
 
             # Opacity entropy loss: encourage decisive alive/dead opacities
-            L_entropy = compute_opacity_entropy_loss(gaussians.get_opacity)
+            L_entropy = compute_opacity_entropy_loss(gaussians._opacity)  # raw, not activated
             loss = loss + args.lambda_opacity_entropy * L_entropy
 
         loss.backward()
@@ -152,8 +164,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_end.record()
 
+        # Compute utility between backward and step (reads gradient norms)
+        if args.energy_mcmc:
+            utility = compute_gaussian_utility(
+                gaussians=gaussians,
+                render_pkg=render_pkg,
+                iteration=iteration,
+                w_alpha=args.energy_w_alpha,
+                w_vis=args.energy_w_vis,
+                w_grad=args.energy_w_grad,
+                w_scale=args.energy_w_scale,
+                w_dead=args.energy_w_dead,
+                w_support=getattr(args, "energy_w_support", 2.0),
+                beta_opacity=getattr(args, "energy_beta_opacity", 1.0),
+                beta_scale=getattr(args, "energy_beta_scale", 0.5),
+                alpha_dead=getattr(args, "energy_alpha_dead", 0.005),
+            )
+
+            # Temperature annealing for birth/death sampling
+            u_temp = min(iteration / 30000.0, 1.0)
+            tau_t = max(getattr(args, "energy_temp_tau", 0.4), 1e-6)
+            denom_t = 1.0 - math.exp(-1.0 / tau_t)
+            alpha_t = (1.0 - math.exp(-u_temp / tau_t)) / denom_t
+            temperature = (
+                args.energy_temp_min
+                + (args.energy_temp_start - args.energy_temp_min)
+                * (1.0 - alpha_t)
+            )
+        else:
+            utility = None
+            temperature = 1.0
+
+        # Optimizer step (must come BEFORE MCMC mutations)
+        if iteration < opt.iterations:
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+
+            L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
+            actual_covariance = L @ L.transpose(1, 2)
+
+            def op_sigmoid(x, k=100, x0=0.995):
+                return 1 / (1 + torch.exp(-k * (x - x0)))
+            
+            noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1 - gaussians.get_opacity)) * args.noise_lr * xyz_lr
+            noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+            gaussians._xyz.add_(noise)
+
+        # Progress bar, logging, geometry dashboard
         with torch.no_grad():
-            # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
@@ -161,7 +219,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations) or (args.save_interval > 0 and iteration % args.save_interval == 0):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -198,46 +255,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             flush=True,
                         )
 
-            sched = get_mcmc_schedule(
-                iteration=iteration,
-                current_n=gaussians.get_xyz.shape[0],
-                cap_max=args.cap_max,
-                cfg=mcmc_cfg,
-            )
+        # Compute MCMC schedule
+        sched = get_mcmc_schedule(
+            iteration=iteration,
+            current_n=gaussians.get_xyz.shape[0],
+            cap_max=args.cap_max,
+            cfg=mcmc_cfg,
+        )
 
-            # Optional closed-loop: suppress growth if LSOM is rising
-            if args.energy_mcmc and iteration > opt.densify_from_iter:
-                geo = getattr(gaussians, "_last_geo", {})
-                lsom = geo.get("low_support_opacity_mass", 0.0)
-                if lsom > 0.15:
-                    # Too many unsupported splats: halve growth factor
-                    sched["growth_factor"] = max(1.0, sched["growth_factor"] * 0.5)
-                    print(f"[mcmc-control] LSOM={lsom:.3f} > 0.15, suppressing growth", flush=True)
+        # Optional closed-loop: suppress growth if LSOM is rising
+        if args.energy_mcmc and iteration > opt.densify_from_iter:
+            geo = getattr(gaussians, "_last_geo", {})
+            lsom = geo.get("low_support_opacity_mass", 0.0)
+            if lsom > 0.15:
+                # Too many unsupported splats: halve growth factor
+                sched["growth_factor"] = max(1.0, sched["growth_factor"] * 0.5)
+                print(f"[mcmc-control] LSOM={lsom:.3f} > 0.15, suppressing growth", flush=True)
 
-            # -----------------------------------------------------------------
-            # MCMC relocation and growth
-            # Two paths: energy-guided (new default) vs schedule-only (legacy)
-            # Backward compatibility: --no-energy_mcmc runs the old path
-            # -----------------------------------------------------------------
-            if args.energy_mcmc:
-                with torch.no_grad():
-                    utility = compute_gaussian_utility(
-                        gaussians=gaussians,
-                        render_pkg=render_pkg,
-                        iteration=iteration,
-                    )
-
-                # Temperature annealing for birth/death sampling
-                u_temp = min(iteration / 30000.0, 1.0)
-                tau_t = max(getattr(args, "energy_temp_tau", 0.4), 1e-6)
-                denom_t = 1.0 - math.exp(-1.0 / tau_t)
-                alpha_t = (1.0 - math.exp(-u_temp / tau_t)) / denom_t
-                temperature = (
-                    args.energy_temp_min
-                    + (args.energy_temp_start - args.energy_temp_min)
-                    * (1.0 - alpha_t)
-                )
-
+        # -----------------------------------------------------------------
+        # MCMC relocation and growth (AFTER optimizer step, inside no_grad)
+        # Two paths: energy-guided (new default) vs schedule-only (legacy)
+        # Backward compatibility: --no-energy_mcmc runs the old path
+        # -----------------------------------------------------------------
+        if args.energy_mcmc:
+            with torch.no_grad():
                 if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
                     dead_mask = compute_dead_mask(
                         gaussians=gaussians,
@@ -282,9 +323,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         f"rho={sched['rho']:.3f}",
                         flush=True,
                     )
-            else:
-                # LEGACY PATH: schedule-only MCMC (no energy guidance)
-                # Kept for reproducibility and backward compatibility.
+        else:
+            # LEGACY PATH: schedule-only MCMC (no energy guidance)
+            # Kept for reproducibility and backward compatibility.
+            with torch.no_grad():
                 if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
                     dead_mask = (
                         gaussians.get_opacity <= sched["dead_opacity_threshold"]
@@ -321,24 +363,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         flush=True,
                     )
 
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-
-                L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
-                actual_covariance = L @ L.transpose(1, 2)
-
-                def op_sigmoid(x, k=100, x0=0.995):
-                    return 1 / (1 + torch.exp(-k * (x - x0)))
-                
-                noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1- gaussians.get_opacity))*args.noise_lr*xyz_lr
-                noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-                gaussians._xyz.add_(noise)
-
-            if (iteration in checkpoint_iterations) or (args.checkpoint_interval > 0 and iteration % args.checkpoint_interval == 0):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+        if (iteration in checkpoint_iterations) or (args.checkpoint_interval > 0 and iteration % args.checkpoint_interval == 0):
+            print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -425,6 +452,11 @@ if __name__ == "__main__":
                         help="Iterations at which to increase SH degree (default: 1000 2000 3000).")
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
+    
+    # Handle --no-energy_mcmc / --no-energy-mcmc manually
+    # because ParamGroup bool flags only support --flag (action="store_true")
+    if "--no-energy_mcmc" in sys.argv or "--no-energy-mcmc" in sys.argv:
+        args.energy_mcmc = False
     
     if args.config is not None:
         # Load the configuration file

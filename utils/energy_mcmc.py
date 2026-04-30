@@ -30,7 +30,9 @@ def compute_effective_count(opacities, dead_threshold=0.005, softness=0.002):
     N_eff = sum_j sigmoid((alpha_j - alpha_dead) / s)
     
     Args:
-        opacities: [N, 1] raw opacity parameters (before sigmoid)
+        opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
+                   because this function participates in the loss graph and
+                   must be differentiable w.r.t. raw parameters.
         dead_threshold: opacity threshold
         softness: softness of the sigmoid
     Returns:
@@ -51,7 +53,8 @@ def compute_effective_count_loss(
     L_eff = ((N_eff - N_target) / cap_max)^2
     
     Args:
-        opacities: [N, 1] raw opacity parameters
+        opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
+                   because this function participates in the loss graph.
         iteration: current iteration
         cap_max: maximum allowed Gaussians
         q_start: initial target cap fraction
@@ -87,6 +90,10 @@ def compute_opacity_entropy_loss(opacities):
     L_entropy = mean(-a log(a) - (1-a) log(1-a))
     
     Minimizing entropy makes MCMC dead/alive decisions cleaner.
+    
+    Args:
+        opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
+                   because this function participates in the loss graph.
     """
     alpha = torch.sigmoid(opacities).squeeze(-1)
     eps = 1e-6
@@ -98,6 +105,7 @@ def compute_gaussian_utility(
     gaussians, render_pkg, iteration,
     w_alpha=1.0, w_vis=2.0, w_grad=3.0,
     w_scale=0.5, w_dead=1.0,
+    w_support=2.0,
     beta_opacity=1.0, beta_scale=0.5,
     alpha_dead=0.005,
 ):
@@ -105,7 +113,8 @@ def compute_gaussian_utility(
     Compute per-Gaussian utility score for MCMC birth/death decisions.
     
     U_j = w_alpha * alpha_j
-        + w_vis * v_j
+        + w_vis * v_j (single-frame visibility)
+        + w_support * support_j (multi-view EMA visibility)
         + w_grad * norm_grad_j
         - w_scale * scale_penalty_j
         - w_dead * dead_penalty_j
@@ -121,12 +130,15 @@ def compute_gaussian_utility(
     device = gaussians.get_xyz.device
     N = gaussians.get_xyz.shape[0]
     
-    # Opacity term
-    alpha = torch.sigmoid(gaussians.get_opacity).squeeze(-1)
+    # Opacity term: get_opacity is already activated (sigmoid applied)
+    alpha = gaussians.get_opacity.squeeze(-1)
     
-    # Visibility term
+    # Visibility term (current frame)
     visibility = render_pkg.get("visibility_filter", torch.ones(N, device=device, dtype=torch.bool))
     v = visibility.float()
+    
+    # Support EMA term (multi-view visibility, not just current frame)
+    support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else v
     
     # Gradient term: norm of xyz gradient
     # NOTE: requires that loss.backward() has been called
@@ -154,6 +166,7 @@ def compute_gaussian_utility(
     utility = (
         w_alpha * alpha
         + w_vis * v
+        + w_support * support
         + w_grad * norm_grad
         - w_scale * scale_penalty
         - w_dead * dead_penalty
@@ -165,29 +178,36 @@ def compute_gaussian_utility(
 def compute_dead_mask(
     gaussians, utility=None,
     opacity_threshold=0.005,
+    support_threshold=0.01,
     utility_quantile=0.05,
+    use_utility_quantile=True,
     min_visibility_count=3,
 ):
     """
-    Compute dead mask combining opacity, utility, and visibility.
+    Compute dead mask combining opacity, support, and optionally utility.
     
-    dead_j = alpha_j < opacity_threshold
-            OR (utility_j < quantile(utility, q))
-            OR (visible_count_j < min_vis)
+    dead_j = alpha_j < opacity_threshold AND support_j < support_threshold
+    optionally OR utility_j < quantile(utility, q)
     
     Args:
         gaussians: GaussianModel instance
         utility: [N] optional utility scores
         opacity_threshold: opacity dead threshold
+        support_threshold: support EMA dead threshold
         utility_quantile: bottom quantile for utility-based death
+        use_utility_quantile: whether to append utility quantile death
         min_visibility_count: minimum times visible to survive
     Returns:
         [N] bool mask
     """
-    alpha = torch.sigmoid(gaussians.get_opacity).squeeze(-1)
-    dead = alpha < opacity_threshold
+    # get_opacity is already activated (sigmoid applied)
+    alpha = gaussians.get_opacity.squeeze(-1)
+    support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else torch.ones_like(alpha)
     
-    if utility is not None and utility.numel() > 0:
+    # Core death: low opacity AND low support
+    dead = (alpha < opacity_threshold) & (support < support_threshold)
+    
+    if use_utility_quantile and utility is not None and utility.numel() > 0:
         q_val = torch.quantile(utility, utility_quantile)
         dead = dead | (utility < q_val)
     

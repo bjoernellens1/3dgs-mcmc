@@ -33,7 +33,8 @@ def compute_low_support_opacity_mass(gaussians, tau_support=0.03):
 
     Returns scalar tensor.
     """
-    alpha = torch.sigmoid(gaussians.get_opacity).squeeze(-1)
+    # get_opacity is already activated (sigmoid applied)
+    alpha = gaussians.get_opacity.squeeze(-1)
     support = gaussians.visibility_ema.squeeze(-1)
     low_support = support < tau_support
 
@@ -56,7 +57,8 @@ def compute_sfm_anchor_outlier_mass(gaussians, sfm_points, tau_dist=0.5):
         return torch.tensor(0.0, device=gaussians.get_xyz.device)
 
     xyz = gaussians.get_xyz
-    alpha = torch.sigmoid(gaussians.get_opacity).squeeze(-1)
+    # get_opacity is already activated (sigmoid applied)
+    alpha = gaussians.get_opacity.squeeze(-1)
 
     # Nearest SfM distance per Gaussian
     dists = torch.cdist(xyz, sfm_points)  # [N, M]
@@ -76,7 +78,8 @@ def compute_opacity_scale_floater_score(gaussians, s_ref=0.15, tau_support=0.03)
 
     Returns scalar tensor.
     """
-    alpha = torch.sigmoid(gaussians.get_opacity).squeeze(-1)
+    # get_opacity is already activated (sigmoid applied)
+    alpha = gaussians.get_opacity.squeeze(-1)
     max_scale = gaussians.get_scaling.max(dim=1).values
     support = gaussians.visibility_ema.squeeze(-1)
 
@@ -91,7 +94,8 @@ def compute_geometry_dashboard(gaussians, sfm_points=None):
     Compute all geometry metrics and return as a dict.
     """
     N = gaussians.get_xyz.shape[0]
-    alpha = torch.sigmoid(gaussians.get_opacity)
+    # get_opacity is already activated (sigmoid applied)
+    alpha = gaussians.get_opacity
 
     metrics = {
         "num_gaussians": float(N),
