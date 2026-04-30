@@ -234,6 +234,26 @@ podman run --rm --privileged --security-opt label=disable \
     --save_iterations 30000
 ```
 
+## Observed Training Improvements
+
+With the optimizations applied (`--init_type sfm`, `--sh_degree_schedule 3000 6000 9000`, `--densify_until_iter 15000`, `--densification_interval 200`), the full 30k bicycle training on ROCm/gfx1151 shows:
+
+| Metric | Before (random init, default schedule) | After (optimized) |
+|--------|----------------------------------------|-------------------|
+| Initial Gaussians | 100,000 (random) | 54,275 (SfM) |
+| Early iteration speed | ~5–8 it/s (post-densification) | ~28–34 it/s |
+| SH degree 0 duration | 0–1000 it | 0–3000 it |
+| Densification interval | every 100 it | every 200 it |
+| Growth cutoff | 25,000 it | 15,000 it |
+
+**Checkpoint sizes** (indicating controlled Gaussian growth):
+- iter 2000: 57 MB
+- iter 4000: 93 MB
+- iter 6000: 151 MB
+- iter 8000: 246 MB
+
+The SfM initialization alone cuts the initial Gaussian count nearly in half, and delaying SH degree growth keeps the early training much faster while still reaching full `sh_degree=3` by iteration 9000.
+
 ## TensorBoard
 
 TensorBoard summaries are written to the model output folder (e.g. `output/bicycle`), which is volume-mounted back to the host. View them from the host without entering the container:
