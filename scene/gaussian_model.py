@@ -507,9 +507,9 @@ class GaussianModel:
         self.replace_tensors_to_optimizer(inds=reinit_idx) 
         
 
-    def add_new_gs(self, cap_max):
+    def add_new_gs(self, cap_max, growth_factor=1.05):
         current_num_points = self._opacity.shape[0]
-        target_num = min(cap_max, int(1.05 * current_num_points))
+        target_num = min(cap_max, int(growth_factor * current_num_points))
         num_gs = max(0, target_num - current_num_points)
 
         if num_gs <= 0:

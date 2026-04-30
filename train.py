@@ -28,6 +28,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.gaussian_model import build_scaling_rotation
+from utils.mcmc_schedule import MCMCScheduleConfig, get_mcmc_schedule
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,6 +44,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    mcmc_cfg = MCMCScheduleConfig(
+        start_iter=opt.densify_from_iter,
+        stop_growth_iter=getattr(opt, "mcmc_stop_growth_iter", 12_000),
+        stop_reloc_iter=opt.densify_until_iter,
+    )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -125,10 +131,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
+            sched = get_mcmc_schedule(
+                iteration=iteration,
+                current_n=gaussians.get_xyz.shape[0],
+                cap_max=args.cap_max,
+                cfg=mcmc_cfg,
+            )
+
+            if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
+                dead_mask = (
+                    gaussians.get_opacity <= sched["dead_opacity_threshold"]
+                ).squeeze(-1)
+
+                dead_count = int(dead_mask.sum().item())
                 gaussians.relocate_gs(dead_mask=dead_mask)
-                gaussians.add_new_gs(cap_max=args.cap_max)
+
+                print(
+                    f"[mcmc-reloc] iter={iteration} "
+                    f"dead={dead_count} "
+                    f"thr={sched['dead_opacity_threshold']:.5f} "
+                    f"reloc_int={sched['relocate_interval']} "
+                    f"rho={sched['rho']:.3f} "
+                    f"N={gaussians.get_xyz.shape[0]}",
+                    flush=True,
+                )
+
+            if sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
+                before = gaussians.get_xyz.shape[0]
+                added = gaussians.add_new_gs(
+                    cap_max=args.cap_max,
+                    growth_factor=sched["growth_factor"],
+                )
+                after = gaussians.get_xyz.shape[0]
+
+                print(
+                    f"[mcmc-grow] iter={iteration} "
+                    f"added={added} "
+                    f"N={before}->{after} "
+                    f"factor={sched['growth_factor']:.4f} "
+                    f"grow_int={sched['grow_interval']} "
+                    f"rho={sched['rho']:.3f}",
+                    flush=True,
+                )
 
             # Optimizer step
             if iteration < opt.iterations:
