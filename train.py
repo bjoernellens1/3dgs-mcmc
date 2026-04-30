@@ -36,6 +36,10 @@ from utils.energy_mcmc import (
     compute_gaussian_utility,
     compute_dead_mask,
 )
+from utils.geometry_metrics import (
+    update_visibility_ema,
+    compute_geometry_dashboard,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -142,6 +146,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
+        # Update visibility EMA for geometry dashboard
+        with torch.no_grad():
+            update_visibility_ema(gaussians, render_pkg["is_used"])
+
         iter_end.record()
 
         with torch.no_grad():
@@ -159,12 +167,52 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # Geometry failure dashboard
+            if iteration % 100 == 0:
+                with torch.no_grad():
+                    # Load SfM points once for anchor distance
+                    if not hasattr(scene, "_sfm_points"):
+                        try:
+                            import numpy as np
+                            from scene.dataset_readers import fetchPly
+                            sfm_pcd = fetchPly(os.path.join(dataset.source_path, "sparse", "0", "points3D.ply"))
+                            scene._sfm_points = torch.tensor(np.asarray(sfm_pcd.points), dtype=torch.float32, device="cuda")
+                        except Exception:
+                            scene._sfm_points = None
+
+                    geo = compute_geometry_dashboard(gaussians, sfm_points=getattr(scene, "_sfm_points", None))
+                    gaussians._last_geo = geo
+
+                    for k, v in geo.items():
+                        if tb_writer:
+                            tb_writer.add_scalar(f"geometry/{k}", v, iteration)
+
+                    # Print concise dashboard every 500 iters
+                    if iteration % 500 == 0:
+                        print(
+                            f"[geo] iter={iteration} "
+                            f"N={int(geo['num_gaussians'])} "
+                            f"LSOM={geo.get('low_support_opacity_mass', 0.0):.4f} "
+                            f"OSF={geo.get('opacity_scale_floater_score', 0.0):.4f} "
+                            f"mean_sup={geo.get('mean_support', 0.0):.4f}",
+                            flush=True,
+                        )
+
             sched = get_mcmc_schedule(
                 iteration=iteration,
                 current_n=gaussians.get_xyz.shape[0],
                 cap_max=args.cap_max,
                 cfg=mcmc_cfg,
             )
+
+            # Optional closed-loop: suppress growth if LSOM is rising
+            if args.energy_mcmc and iteration > opt.densify_from_iter:
+                geo = getattr(gaussians, "_last_geo", {})
+                lsom = geo.get("low_support_opacity_mass", 0.0)
+                if lsom > 0.15:
+                    # Too many unsupported splats: halve growth factor
+                    sched["growth_factor"] = max(1.0, sched["growth_factor"] * 0.5)
+                    print(f"[mcmc-control] LSOM={lsom:.3f} > 0.15, suppressing growth", flush=True)
 
             # -----------------------------------------------------------------
             # MCMC relocation and growth

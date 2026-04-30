@@ -147,6 +147,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.visibility_ema = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -256,6 +257,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+        self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -305,6 +307,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.visibility_ema = self.visibility_ema[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -348,6 +351,7 @@ class GaussianModel:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -517,8 +521,9 @@ class GaussianModel:
         self._opacity[reinit_idx] = self._opacity[dead_indices]
         self._scaling[reinit_idx] = self._scaling[dead_indices]
 
-        self.replace_tensors_to_optimizer(inds=reinit_idx) 
-        
+        self.replace_tensors_to_optimizer(inds=reinit_idx)
+        self.visibility_ema[dead_indices] = 0.0
+        self.visibility_ema[reinit_idx] = self.visibility_ema[reinit_idx].clamp_max(0.5)
 
     def relocate_gs_energy_guided(self, dead_mask=None, parent_scores=None, temperature=1.0):
         """
@@ -562,6 +567,8 @@ class GaussianModel:
         self._scaling[reinit_idx] = self._scaling[dead_indices]
 
         self.replace_tensors_to_optimizer(inds=reinit_idx)
+        self.visibility_ema[dead_indices] = 0.0
+        self.visibility_ema[reinit_idx] = self.visibility_ema[reinit_idx].clamp_max(0.5)
 
     def add_new_gs_energy_guided(self, cap_max, growth_factor=1.05, parent_scores=None, temperature=1.0):
         """
@@ -603,6 +610,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
         self.replace_tensors_to_optimizer(inds=add_idx)
+        self.visibility_ema = torch.cat((self.visibility_ema, torch.zeros((num_gs, 1), device="cuda")), dim=0)
         return num_gs
 
     def add_new_gs(self, cap_max, growth_factor=1.05):
@@ -630,6 +638,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
         self.replace_tensors_to_optimizer(inds=add_idx)
+        self.visibility_ema = torch.cat((self.visibility_ema, torch.zeros((num_gs, 1), device="cuda")), dim=0)
 
         return num_gs
 
