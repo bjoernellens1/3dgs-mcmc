@@ -425,6 +425,7 @@ class GaussianModel:
 
             if stored_state is None:
                 stored_state = {}
+                stored_state["step"] = torch.tensor(0, dtype=torch.int32, device=tensor.device)
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
                 stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
             elif inds is not None:
