@@ -279,7 +279,27 @@ This occurs on **both 10k and 30k runs** with SfM initialization:
 - **Dead threshold rises from 0.003 → 0.006**, making late-stage relocation more willing to recycle weak Gaussians.
 - **Strong reconstruction with very low splat count**: 76k Gaussians at iter 10k is extremely lean compared to typical 3DGS-MCMC runs (often 200k–500k).
 
-**How to increase splat count:**
+### Random init vs SfM init comparison (energy MCMC, 10k iterations)
+
+| Init | Final N | Test PSNR | Train PSNR | Quality |
+|------|---------|-----------|------------|---------|
+| SfM | ~76k | ~14.4 | ~11.8 | Clean geometry, well-placed splats |
+| Random | ~131k | ~18.9 | ~17.6 | Floaters, splats in wrong locations |
+
+**Key finding: higher splat count is counterproductive without geometric priors.**
+
+Random init starts with 100k Gaussians (vs 54k SfM) and grows to 131k. Despite higher PSNR, the visual quality is worse because:
+
+1. **No geometric prior**: Random points have no scene structure. The energy MCMC utility score tries to guide placement, but without initialization near actual surfaces, many splats converge to wrong depths or become "floaters" in free space.
+2. **PSNR is misleading**: PSNR rewards overall pixel similarity but does not penalize localized artifacts strongly. A few hundred misplaced bright splats can inflate PSNR while degrading perceptual quality.
+3. **SfM provides surface anchors**: The 54k SfM points are already near actual scene geometry. Energy MCMC then refines and selectively grows from these anchors, keeping the model lean and accurate.
+4. **Utility score has limits**: The gradient-based utility term rewards Gaussians that reduce photometric loss. With random init, early gradients are noisy and can reinforce bad placements before the model has learned coarse structure.
+
+**Recommendation:**
+- **For COLMAP scenes, always use `--init_type sfm`** unless you specifically need to test MCMC from-scratch reconstruction.
+- If you must use random init, consider a much longer stabilization phase before growth (e.g. `--densify_from_iter 2000`) or reduce `--mcmc_growth_factor_start` to limit early chaotic expansion.
+
+**How to increase splat count (SfM init only):**
 ```bash
 # Slower growth-factor decay (default tau=0.35)
 --mcmc_growth_factor_tau 0.6
@@ -296,23 +316,9 @@ This occurs on **both 10k and 30k runs** with SfM initialization:
 
 ## TensorBoard
 
-**Current issue:** The `localhost/3dgs-mcmc-rocm:7.2-tb` image does not actually contain TensorBoard, so `train.py` skips logging (`TENSORBOARD_FOUND = False`). This will be fixed in the next image rebuild. For now, install it at runtime:
-
-```bash
-podman run --rm -it --privileged --security-opt label=disable \
-  --device=/dev/kfd --device=/dev/dri \
-  --group-add=video \
-  -e HSA_XNACK=1 \
-  -e HSA_ENABLE_SDMA=0 \
-  -e PYTORCH_ROCM_ARCH=gfx1151 \
-  -v $(pwd):/workspace/3dgs-mcmc:Z \
-  localhost/3dgs-mcmc-rocm:7.2-tb \
-  bash -c "pip install tensorboard && python train.py ..."
-```
-
 ### Viewing TensorBoard on localhost
 
-Once event files are written, you have two options:
+The `localhost/3dgs-mcmc-rocm:7.2-tb` image now includes TensorBoard. Event files are written to the output folder (`output/<name>/`), which is volume-mounted back to the host.
 
 **Option A — Run TensorBoard inside the container (recommended):**
 
@@ -329,8 +335,7 @@ podman run --rm --privileged --security-opt label=disable \
   -v /home/bjoern/Downloads/mipnerf360_v2_dataset:/data/mipnerf360_v2_dataset:Z \
   -v $(pwd):/workspace/3dgs-mcmc:Z \
   localhost/3dgs-mcmc-rocm:7.2-tb \
-  bash -c "pip install tensorboard && \
-    tensorboard --logdir /workspace/3dgs-mcmc/output/bicycle --host 0.0.0.0 --port 6006 & \
+  bash -c "tensorboard --logdir /workspace/3dgs-mcmc/output/bicycle --host 0.0.0.0 --port 6006 & \
     python train.py -s /data/mipnerf360_v2_dataset/bicycle \
       --config configs/bicycle.json -m output/bicycle --eval"
 ```
