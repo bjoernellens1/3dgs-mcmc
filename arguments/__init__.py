@@ -94,6 +94,17 @@ class OptimizationParams(ParamGroup):
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
         self.mcmc_stop_growth_iter = 12000
+        self.energy_mcmc = True
+        self.lambda_eff_count = 0.1
+        self.lambda_opacity_entropy = 0.01
+        self.energy_w_alpha = 1.0
+        self.energy_w_vis = 2.0
+        self.energy_w_grad = 3.0
+        self.energy_w_scale = 0.5
+        self.energy_w_dead = 1.0
+        self.energy_temp_start = 2.0
+        self.energy_temp_min = 0.3
+        self.energy_temp_tau = 0.4
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

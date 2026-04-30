@@ -11,6 +11,7 @@
 
 import os
 import json
+import math
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -29,6 +30,12 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.gaussian_model import build_scaling_rotation
 from utils.mcmc_schedule import MCMCScheduleConfig, get_mcmc_schedule
+from utils.energy_mcmc import (
+    compute_effective_count_loss,
+    compute_opacity_entropy_loss,
+    compute_gaussian_utility,
+    compute_dead_mask,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -112,6 +119,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
         loss = loss + args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
+        # Energy-guided MCMC losses (Stage A: soft loss steering)
+        # Backward compatibility: only active when --energy_mcmc is enabled (default)
+        if args.energy_mcmc:
+            # Effective count loss: steer toward target population curve
+            L_eff = compute_effective_count_loss(
+                gaussians.get_opacity,
+                iteration=iteration,
+                cap_max=args.cap_max,
+            )
+            loss = loss + args.lambda_eff_count * L_eff
+
+            # Opacity entropy loss: encourage decisive alive/dead opacities
+            L_entropy = compute_opacity_entropy_loss(gaussians.get_opacity)
+            loss = loss + args.lambda_opacity_entropy * L_entropy
+
         loss.backward()
 
         iter_end.record()
@@ -138,41 +160,112 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 cfg=mcmc_cfg,
             )
 
-            if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
-                dead_mask = (
-                    gaussians.get_opacity <= sched["dead_opacity_threshold"]
-                ).squeeze(-1)
+            # -----------------------------------------------------------------
+            # MCMC relocation and growth
+            # Two paths: energy-guided (new default) vs schedule-only (legacy)
+            # Backward compatibility: --no-energy_mcmc runs the old path
+            # -----------------------------------------------------------------
+            if args.energy_mcmc:
+                with torch.no_grad():
+                    utility = compute_gaussian_utility(
+                        gaussians=gaussians,
+                        render_pkg=render_pkg,
+                        iteration=iteration,
+                    )
 
-                dead_count = int(dead_mask.sum().item())
-                gaussians.relocate_gs(dead_mask=dead_mask)
-
-                print(
-                    f"[mcmc-reloc] iter={iteration} "
-                    f"dead={dead_count} "
-                    f"thr={sched['dead_opacity_threshold']:.5f} "
-                    f"reloc_int={sched['relocate_interval']} "
-                    f"rho={sched['rho']:.3f} "
-                    f"N={gaussians.get_xyz.shape[0]}",
-                    flush=True,
+                # Temperature annealing for birth/death sampling
+                u_temp = min(iteration / 30000.0, 1.0)
+                tau_t = max(getattr(args, "energy_temp_tau", 0.4), 1e-6)
+                denom_t = 1.0 - math.exp(-1.0 / tau_t)
+                alpha_t = (1.0 - math.exp(-u_temp / tau_t)) / denom_t
+                temperature = (
+                    args.energy_temp_min
+                    + (args.energy_temp_start - args.energy_temp_min)
+                    * (1.0 - alpha_t)
                 )
 
-            if sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
-                before = gaussians.get_xyz.shape[0]
-                added = gaussians.add_new_gs(
-                    cap_max=args.cap_max,
-                    growth_factor=sched["growth_factor"],
-                )
-                after = gaussians.get_xyz.shape[0]
+                if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
+                    dead_mask = compute_dead_mask(
+                        gaussians=gaussians,
+                        utility=utility,
+                        opacity_threshold=sched["dead_opacity_threshold"],
+                        utility_quantile=0.05,
+                    )
 
-                print(
-                    f"[mcmc-grow] iter={iteration} "
-                    f"added={added} "
-                    f"N={before}->{after} "
-                    f"factor={sched['growth_factor']:.4f} "
-                    f"grow_int={sched['grow_interval']} "
-                    f"rho={sched['rho']:.3f}",
-                    flush=True,
-                )
+                    dead_count = int(dead_mask.sum().item())
+                    gaussians.relocate_gs_energy_guided(
+                        dead_mask=dead_mask,
+                        parent_scores=utility,
+                        temperature=temperature,
+                    )
+
+                    print(
+                        f"[mcmc-reloc] iter={iteration} "
+                        f"dead={dead_count} "
+                        f"thr={sched['dead_opacity_threshold']:.5f} "
+                        f"reloc_int={sched['relocate_interval']} "
+                        f"rho={sched['rho']:.3f} "
+                        f"N={gaussians.get_xyz.shape[0]}",
+                        flush=True,
+                    )
+
+                if sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
+                    before = gaussians.get_xyz.shape[0]
+                    added = gaussians.add_new_gs_energy_guided(
+                        cap_max=args.cap_max,
+                        growth_factor=sched["growth_factor"],
+                        parent_scores=utility,
+                        temperature=temperature,
+                    )
+                    after = gaussians.get_xyz.shape[0]
+
+                    print(
+                        f"[mcmc-grow] iter={iteration} "
+                        f"added={added} "
+                        f"N={before}->{after} "
+                        f"factor={sched['growth_factor']:.4f} "
+                        f"grow_int={sched['grow_interval']} "
+                        f"rho={sched['rho']:.3f}",
+                        flush=True,
+                    )
+            else:
+                # LEGACY PATH: schedule-only MCMC (no energy guidance)
+                # Kept for reproducibility and backward compatibility.
+                if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
+                    dead_mask = (
+                        gaussians.get_opacity <= sched["dead_opacity_threshold"]
+                    ).squeeze(-1)
+
+                    dead_count = int(dead_mask.sum().item())
+                    gaussians.relocate_gs(dead_mask=dead_mask)
+
+                    print(
+                        f"[mcmc-reloc] iter={iteration} "
+                        f"dead={dead_count} "
+                        f"thr={sched['dead_opacity_threshold']:.5f} "
+                        f"reloc_int={sched['relocate_interval']} "
+                        f"rho={sched['rho']:.3f} "
+                        f"N={gaussians.get_xyz.shape[0]}",
+                        flush=True,
+                    )
+
+                if sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
+                    before = gaussians.get_xyz.shape[0]
+                    added = gaussians.add_new_gs(
+                        cap_max=args.cap_max,
+                        growth_factor=sched["growth_factor"],
+                    )
+                    after = gaussians.get_xyz.shape[0]
+
+                    print(
+                        f"[mcmc-grow] iter={iteration} "
+                        f"added={added} "
+                        f"N={before}->{after} "
+                        f"factor={sched['growth_factor']:.4f} "
+                        f"grow_int={sched['grow_interval']} "
+                        f"rho={sched['rho']:.3f}",
+                        flush=True,
+                    )
 
             # Optimizer step
             if iteration < opt.iterations:
