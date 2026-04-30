@@ -34,7 +34,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_degree_schedule):
     if dataset.cap_max == -1:
         print("Please specify the maximum number of Gaussians using --cap_max.")
         exit()
@@ -78,8 +78,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         xyz_lr = gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        # Increase SH degree at configured schedule (default: 1000, 2000, 3000)
+        if iteration in sh_degree_schedule:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -230,6 +230,8 @@ if __name__ == "__main__":
                         help="Save a checkpoint every N iterations (independent of --checkpoint_iterations).")
     parser.add_argument("--save_interval", type=int, default=2000,
                         help="Save a PLY point cloud every N iterations (independent of --save_iterations).")
+    parser.add_argument("--sh_degree_schedule", nargs="+", type=int, default=[1000, 2000, 3000],
+                        help="Iterations at which to increase SH degree (default: 1000 2000 3000).")
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     
@@ -250,7 +252,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule)
 
     # All done
     print("\nTraining complete.")

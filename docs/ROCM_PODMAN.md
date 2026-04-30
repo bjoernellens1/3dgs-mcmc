@@ -140,6 +140,100 @@ podman run --rm --privileged --security-opt label=disable \
     --start_checkpoint output/bicycle/chkpnt2000.pth
 ```
 
+## Optimization Launch Configs
+
+These flags trade training speed against final quality. The defaults are safe for full 30k MCMC training. For faster iteration during development, use one of the configs below.
+
+### SH degree schedule (`--sh_degree_schedule`)
+
+Default: `[1000, 2000, 3000]` (degree 0 → 1 at 1000, 1 → 2 at 2000, 2 → 3 at 3000).
+
+Delaying higher-order SH until geometry has stabilized avoids expensive color optimization while Gaussians are still chaotic:
+
+```bash
+--sh_degree_schedule 3000 6000 9000
+```
+
+This preserves final quality (`sh_degree=3` is still reached) but keeps the early iterations cheaper.
+
+### Densification schedule
+
+| Flag | Default | Fast config | Effect |
+|------|---------|-------------|--------|
+| `--densify_from_iter` | 500 | 500 | When relocation/growth starts |
+| `--densify_until_iter` | 25000 | 15000 | When growth stops (biggest speed win) |
+| `--densification_interval` | 100 | 200 | How often relocate/add runs |
+
+Ending growth earlier prevents the Gaussian count from exploding in late training:
+
+```bash
+--densify_until_iter 15000 --densification_interval 200
+```
+
+### Initialization type
+
+For COLMAP scenes, SfM initialization converges faster than random:
+
+```bash
+--init_type sfm
+```
+
+For MCMC-paper-faithful experiments, keep `--init_type random`.
+
+### Resolution
+
+For fast debugging or parameter sweeps, lower resolution dramatically speeds up rasterization:
+
+```bash
+-r 4   # 1/4 resolution (default in configs/bicycle.json)
+-r 2   # 1/2 resolution (higher quality, still fast)
+-r 8   # 1/8 resolution (very fast, lower quality)
+```
+
+### Recommended fast-quality-safe config
+
+```bash
+podman run --rm --privileged --security-opt label=disable \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add=video \
+  -e HSA_XNACK=1 \
+  -e HSA_ENABLE_SDMA=0 \
+  -e PYTORCH_ROCM_ARCH=gfx1151 \
+  -v /home/bjoern/Downloads/mipnerf360_v2_dataset:/data/mipnerf360_v2_dataset:Z \
+  -v $(pwd):/workspace/3dgs-mcmc:Z \
+  localhost/3dgs-mcmc-rocm:7.2-tb \
+  python train.py -s /data/mipnerf360_v2_dataset/bicycle \
+    --config configs/bicycle.json -m output/bicycle_fast --eval \
+    --init_type sfm \
+    --sh_degree_schedule 3000 6000 9000 \
+    --densify_until_iter 15000 \
+    --densification_interval 200 \
+    --test_iterations 30000 \
+    --save_iterations 30000
+```
+
+For random-init MCMC with the same speedups:
+
+```bash
+podman run --rm --privileged --security-opt label=disable \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add=video \
+  -e HSA_XNACK=1 \
+  -e HSA_ENABLE_SDMA=0 \
+  -e PYTORCH_ROCM_ARCH=gfx1151 \
+  -v /home/bjoern/Downloads/mipnerf360_v2_dataset:/data/mipnerf360_v2_dataset:Z \
+  -v $(pwd):/workspace/3dgs-mcmc:Z \
+  localhost/3dgs-mcmc-rocm:7.2-tb \
+  python train.py -s /data/mipnerf360_v2_dataset/bicycle \
+    --config configs/bicycle.json -m output/bicycle_fast_mcmc --eval \
+    --init_type random \
+    --sh_degree_schedule 3000 6000 9000 \
+    --densify_until_iter 15000 \
+    --densification_interval 200 \
+    --test_iterations 30000 \
+    --save_iterations 30000
+```
+
 ## TensorBoard
 
 TensorBoard summaries are written to the model output folder (e.g. `output/bicycle`), which is volume-mounted back to the host. View them from the host without entering the container:
