@@ -302,6 +302,7 @@ def get_web_viewer() -> WebViewer | None:
 def encode_render_image(image_tensor) -> np.ndarray | None:
     """Convert a GPU float render tensor (3,H,W) to CPU uint8 RGB numpy array.
 
+    Synchronous (blocks until GPU→CPU copy finishes).
     Returns (H, W, 3) uint8 RGB, or None on failure.
     """
     try:
@@ -315,3 +316,58 @@ def encode_render_image(image_tensor) -> np.ndarray | None:
         return arr
     except Exception:
         return None
+
+
+# ---- Async GPU→CPU copy helpers (pinned memory + separate CUDA stream) ----
+
+_viewer_pinned_buf: Any = None  # torch.Tensor | None
+
+def encode_render_image_async_start(image_tensor, stream) -> Any:
+    """
+    Start an async GPU→CPU copy of a render image using a pinned CPU buffer.
+
+    The copy runs on *stream* (a ``torch.cuda.Stream``) and does NOT block
+    the calling thread.  Caller MUST synchronize the stream before reading
+    the buffer (e.g. via ``encode_render_image_finish``).
+
+    Args:
+        image_tensor: GPU float tensor (3, H, W), values in [0, 1].
+        stream: torch.cuda.Stream for the async copy.
+
+    Returns:
+        The pinned CPU buffer (torch.Tensor, uint8 HWC).  The data is NOT
+        valid until stream.synchronize() is called.
+    """
+    global _viewer_pinned_buf
+
+    # Clamp + quantize + transpose on GPU first (no sync needed)
+    processed = (
+        (image_tensor.detach().clamp(0, 1) * 255)
+        .byte()
+        .permute(1, 2, 0)
+        .contiguous()  # (H, W, 3) uint8, contiguous
+    )
+
+    # Allocate or reuse a pinned CPU buffer of the same shape
+    if _viewer_pinned_buf is None or _viewer_pinned_buf.shape != processed.shape:
+        _viewer_pinned_buf = torch.empty(
+            processed.shape, dtype=processed.dtype, device="cpu", pin_memory=True
+        )
+
+    # Queue the async copy on the caller-provided stream
+    with torch.cuda.stream(stream):
+        _viewer_pinned_buf.copy_(processed, non_blocking=True)
+
+    return _viewer_pinned_buf
+
+
+def encode_render_image_finish(pinned_buf) -> np.ndarray:
+    """
+    Read a numpy array from a pinned CPU buffer.
+
+    Caller MUST have called ``stream.synchronize()`` on the stream passed
+    to ``encode_render_image_async_start`` before calling this.
+
+    Returns (H, W, 3) uint8 RGB numpy array.
+    """
+    return pinned_buf.numpy()

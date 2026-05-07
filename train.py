@@ -311,6 +311,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         _prof = None
 
+    # Persistent CUDA stream for async GPU→CPU viewer image copies.
+    # Keeps the copy from blocking the main training stream.
+    _viewer_stream = torch.cuda.Stream() if web_viewer is not None else None
+
     for iteration in range(first_iter, opt.iterations + 1):        
         stage_times, mark_stage, finish_stage = begin_stage_timer(sync=benchmark_sync)
         # if network_gui.conn == None:
@@ -365,17 +369,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Cache a copy on CPU for the live web viewer.
         # Every image_interval iterations, render from the viewer's chosen camera
         # so the view stays stable (the image shows the same camera every time).
+        # Uses a dedicated CUDA stream + pinned memory for async GPU→CPU copy so
+        # the main training stream is not blocked by the transfer.
         _viewer_image_arr = None
+        _viewer_render_time_ms = 0.0
+        _viewer_pinned_buf = None  # non-None when async copy is in-flight
         if web_viewer is not None and web_viewer.image_interval > 0 and iteration % web_viewer_image_interval == 0:
             _viewer_cam = scene.getTrainCameras()[web_viewer.viewer_cam_idx]
             if viewpoint_cam is _viewer_cam:
                 # Training happened to render from the viewer's camera — reuse it
-                _viewer_image_arr = _web_viewer_mod.encode_render_image(image)
+                _viewer_pinned_buf = _web_viewer_mod.encode_render_image_async_start(image, _viewer_stream)
             else:
                 # Do an extra render pass from the viewer's fixed camera
+                _viewer_render_start = torch.cuda.Event(enable_timing=True)
+                _viewer_render_end = torch.cuda.Event(enable_timing=True)
+                _viewer_render_start.record()
                 with torch.no_grad():
                     _viewer_pkg = render(_viewer_cam, gaussians, pipe, bg, update_sh_rest=update_sh_rest)
-                    _viewer_image_arr = _web_viewer_mod.encode_render_image(_viewer_pkg["render"])
+                    # Start async GPU→CPU copy on viewer stream (non-blocking)
+                    _viewer_pinned_buf = _web_viewer_mod.encode_render_image_async_start(_viewer_pkg["render"], _viewer_stream)
+                _viewer_render_end.record()
+                _viewer_render_end.synchronize()
+                _viewer_render_time_ms = _viewer_render_start.elapsed_time(_viewer_render_end)
         mark_stage("forward")
 
         # Loss — capture intermediate values for logging (no recompute)
@@ -542,14 +557,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Progress bar, logging, geometry dashboard
         with torch.no_grad():
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # Cache scalar values ONCE — all downstream code uses these (avoids redundant syncs)
+            _Ll1_val = Ll1.item()
+            _loss_val = loss.item()
+            _iter_time_ms = iter_start.elapsed_time(iter_end)
+
+            ema_loss_for_log = 0.4 * _loss_val + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
-
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, _Ll1_val, _loss_val, l1_loss, _iter_time_ms, testing_iterations, scene, render, (pipe, background),
+                            no_empty_cache=getattr(run_args, 'no_empty_cache', False))
             if progress_disabled and (iteration % 500 == 0 or iteration == opt.iterations):
                 now = time.perf_counter()
                 delta_iter = max(1, iteration - progress_log_last_iter)
@@ -569,8 +589,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Geometry failure dashboard
-            if iteration % 100 == 0:
+            # Geometry failure dashboard — every 500 iters to avoid sync collision
+            if iteration % 500 == 0:
                 with torch.no_grad():
                     # Load SfM points once for anchor distance
                     if not hasattr(scene, "_sfm_points"):
@@ -601,22 +621,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         )
         mark_stage("reporting")
 
+        # Log CUDA memory allocator stats every 50 iterations for debugging stutters
+        if tb_writer and iteration % 50 == 0 and torch.cuda.is_available():
+            try:
+                mem_stats = torch.cuda.memory_stats()
+                tb_writer.add_scalar('memory/allocated_bytes', mem_stats.get('allocated_bytes.all.current', 0), iteration)
+                tb_writer.add_scalar('memory/reserved_bytes', mem_stats.get('reserved_bytes.all.current', 0), iteration)
+                tb_writer.add_scalar('memory/active_bytes', mem_stats.get('active_bytes.all.current', 0), iteration)
+                tb_writer.add_scalar('memory/num_alloc_retries', mem_stats.get('num_alloc_retries', 0), iteration)
+                tb_writer.add_scalar('memory/num_segments', mem_stats.get('num_segments', 0), iteration)
+                tb_writer.add_scalar('memory/num_segments_reclaimed', mem_stats.get('num_segments_reclaimed', 0), iteration)
+                tb_writer.add_scalar('memory/cached_events', mem_stats.get('cuda_events.max', 0), iteration)
+                # Log # of GPU kernel launches in last iteration (from the profiler viewpoint)
+                tb_writer.add_scalar('memory/oversize_allocations', mem_stats.get('oversize_allocations.current', 0), iteration)
+            except Exception:
+                pass  # memory stats may not be available on all ROCm versions
+
         # Push metrics and image to the live web viewer
         if web_viewer is not None:
-            _iter_time_ms = iter_start.elapsed_time(iter_end)
             _it_s = 1000.0 / max(_iter_time_ms, 0.001) if _iter_time_ms > 0 else 0.0
             web_viewer.push_metrics({
                 "iteration": iteration,
-                "loss": loss.item(),
-                "l1": Ll1.item(),
+                "loss": _loss_val,
+                "l1": _Ll1_val,
                 "num_gaussians": gaussians.get_xyz.shape[0],
                 "sh_degree": gaussians.active_sh_degree,
                 "iter_time_ms": _iter_time_ms,
+                "viewer_render_ms": _viewer_render_time_ms,
                 "it_s": _it_s,
             })
-            if _viewer_image_arr is not None:
-                web_viewer.push_image(_viewer_image_arr, iteration)
-                _viewer_image_arr = None  # release reference
+            # Finalize async GPU→CPU copy (pinned buffer + separate stream avoids blocking main stream)
+            if _viewer_pinned_buf is not None:
+                _viewer_stream.synchronize()
+                _viewer_image_arr = _web_viewer_mod.encode_render_image_finish(_viewer_pinned_buf)
+                _viewer_pinned_buf = None
+                if _viewer_image_arr is not None:
+                    web_viewer.push_image(_viewer_image_arr, iteration)
 
         # Compute MCMC schedule
         sched = get_mcmc_schedule(
@@ -636,6 +676,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             tb_writer.add_scalar('mcmc/allow_growth', int(sched['allow_growth']), iteration)
             tb_writer.add_scalar('mcmc/allow_relocation', int(sched['allow_relocation']), iteration)
             tb_writer.add_scalar('train_loss_patches/xyz_lr', xyz_lr, iteration)
+            tb_writer.add_scalar('timing/viewer_render_ms', _viewer_render_time_ms, iteration)
 
         # Optional closed-loop: suppress growth if LSOM is rising
         if use_energy_mcmc and iteration > opt.densify_from_iter:
@@ -826,16 +867,17 @@ def prepare_output_and_logger(args, run_args=None):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1_val, loss_val, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, no_empty_cache=False):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1_val, iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', loss_val, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('active_sh_degree', scene.gaussians.active_sh_degree, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
-        torch.cuda.empty_cache()
+        if not no_empty_cache:
+            torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
@@ -862,7 +904,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
+        if not no_empty_cache:
+            torch.cuda.empty_cache()
 
 def load_config(config_file):
     with open(config_file, 'r') as file:
@@ -925,6 +968,10 @@ if __name__ == "__main__":
     parser.add_argument("--profile", type=str, default=None,
                         help="Path to save PyTorch profiler trace (e.g. /tmp/profile.json). "
                              "Captures ~100 iters starting at iter 50 to catch the 100-iter stutter.")
+    parser.add_argument("--no_empty_cache", action="store_true", default=False,
+                        help="Skip torch.cuda.empty_cache() calls at test iterations for profiling.")
+    parser.add_argument("--log_memory", action="store_true", default=False,
+                        help="Log CUDA memory allocator stats every 50 iterations to TensorBoard.")
     args = parser.parse_args(sys.argv[1:])
     
     # Handle --no-energy_mcmc / --no-energy-mcmc manually
