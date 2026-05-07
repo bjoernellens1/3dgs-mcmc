@@ -23,6 +23,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 
 # FastAPI / uvicorn — optional; WebViewer init handles graceful fallback
 try:
