@@ -134,11 +134,14 @@ class OptimizationParams(ParamGroup):
         self.mcmc_dead_opacity_power = 1.5
         self.mcmc_use_target_deficit = False
         self.mcmc_target_splat_end = 150000
+        self.mcmc_target_q_start = 0.05
+        self.mcmc_target_q_end = 0.85
+        self.mcmc_target_tau = 0.45
         # Taming-3DGS strategy parameters. These are inert unless
         # --densification_strategy is set to "taming" or "hybrid".
         self.taming_budget = -1.0
         self.taming_budget_mode = "final_count"
-        self.taming_cams = 10
+        self.taming_cams = 3
         self.taming_score_interval = 100
         self.taming_min_opacity = 0.005
         self.taming_prune_stop_iter = 3200
@@ -156,7 +159,11 @@ class OptimizationParams(ParamGroup):
         self.taming_blend_importance = 50.0
         # Live web viewer (optional, set --web_viewer_port to enable)
         self.web_viewer_port = 0
-        self.web_viewer_image_interval = 10
+        self.web_viewer_image_interval = 100
+        self.web_viewer_fixed_camera = False
+        self.scalar_log_interval = 10
+        self.geometry_log_interval = 500
+        self.sfm_anchor_interval = 2000
         self.strategy_log_interval = 500
         self.mcmc_control_log_interval = 500
         super().__init__(parser, "Optimization Parameters")

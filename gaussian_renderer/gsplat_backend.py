@@ -1,7 +1,12 @@
 import math
 import torch
 from gsplat.rendering import rasterization
-from gsplat.cuda._wrapper import rasterize_to_indices_in_range
+try:
+    from gsplat.cuda._wrapper import rasterize_to_indices_in_range
+    HAS_EXACT_TAMING_STATS = True
+except Exception:
+    rasterize_to_indices_in_range = None
+    HAS_EXACT_TAMING_STATS = False
 
 
 def _fov2focal(fov, pixels):
@@ -42,6 +47,13 @@ def _compute_camera_depths(means, viewmat):
 
 
 def _compute_exact_taming_stats(meta, pixel_weights, num_points, width, height, device):
+    if not HAS_EXACT_TAMING_STATS:
+        raise RuntimeError(
+            "Exact Taming stats require gsplat.cuda._wrapper.rasterize_to_indices_in_range, "
+            "which is unavailable in this gsplat build. Disable Taming scoring or install "
+            "a gsplat build that exposes this private wrapper."
+        )
+
     if pixel_weights is None:
         return {
             "accum_weights": torch.zeros(num_points, device=device, dtype=torch.float32),

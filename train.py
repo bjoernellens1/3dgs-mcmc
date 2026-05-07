@@ -172,7 +172,8 @@ def begin_stage_timer(sync=False):
 
 
 def log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, scene, densification_strategy):
-    if tb_writer:
+    scalar_log_interval = max(1, int(getattr(args, "scalar_log_interval", 10)))
+    if tb_writer and (iteration % scalar_log_interval == 0 or iteration == getattr(args, "iterations", iteration)):
         for name, seconds in stage_times.items():
             tb_writer.add_scalar(f"timing/{name}_ms", seconds * 1000.0, iteration)
         tb_writer.add_scalar("parallelism/gsplat_sparse_grad", int(getattr(args, "gsplat_sparse_grad", False)), iteration)
@@ -198,6 +199,9 @@ def log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, sce
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_degree_schedule, run_args=None):
+    if run_args is None:
+        raise ValueError("training() requires run_args so feature flags are explicit and non-global.")
+    args = run_args
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, run_args=run_args)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -225,6 +229,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dead_opacity_power=getattr(opt, "mcmc_dead_opacity_power", 1.5),
         use_target_deficit=getattr(opt, "mcmc_use_target_deficit", False),
         target_splat_end=getattr(opt, "mcmc_target_splat_end", 150000),
+        target_q_start=getattr(opt, "mcmc_target_q_start", 0.05),
+        target_q_end=getattr(opt, "mcmc_target_q_end", 0.85),
+        target_tau=getattr(opt, "mcmc_target_tau", 0.45),
     )
     densification_strategy = getattr(opt, "densification_strategy", "mcmc").lower()
     valid_strategies = {"mcmc", "taming", "hybrid"}
@@ -287,7 +294,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Optional live web viewer
     web_viewer = None
     web_viewer_port = getattr(args, "web_viewer_port", 0)
-    web_viewer_image_interval = max(1, getattr(args, "web_viewer_image_interval", 10))
+    web_viewer_image_interval = max(1, getattr(args, "web_viewer_image_interval", 100))
+    web_viewer_fixed_camera = bool(getattr(args, "web_viewer_fixed_camera", False))
     if web_viewer_port > 0 and _web_viewer_mod is not None:
         _train_cams = scene.getTrainCameras()
         web_viewer = _web_viewer_mod.start_web_viewer(
@@ -376,8 +384,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _viewer_pinned_buf = None  # non-None when async copy is in-flight
         if web_viewer is not None and web_viewer.image_interval > 0 and iteration % web_viewer_image_interval == 0:
             _viewer_cam = scene.getTrainCameras()[web_viewer.viewer_cam_idx]
-            if viewpoint_cam is _viewer_cam:
+            if viewpoint_cam is _viewer_cam or not web_viewer_fixed_camera:
                 # Training happened to render from the viewer's camera — reuse it.
+                # By default the viewer shows the current training-camera render
+                # to avoid a second rasterization pass during training.
                 # Record a CUDA event so the viewer stream waits for the render to complete.
                 _render_ready = torch.cuda.Event()
                 _render_ready.record()
@@ -421,6 +431,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians._opacity,  # raw, not activated (loss needs differentiable raw params)
                 iteration=iteration,
                 cap_max=args.cap_max,
+                max_iterations=opt.iterations,
+                target_splat_end=getattr(args, "mcmc_target_splat_end", None),
+                q_start=getattr(args, "mcmc_target_q_start", 0.05),
+                q_end=getattr(args, "mcmc_target_q_end", 0.85),
+                tau_N=getattr(args, "mcmc_target_tau", 0.45),
             )
             loss = loss + args.lambda_eff_count * L_eff
 
@@ -434,7 +449,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             N_target = None
 
         # Per-iteration TB logging of loss components (captured values, no recompute)
-        if tb_writer:
+        scalar_log_interval = max(1, int(getattr(args, "scalar_log_interval", 10)))
+        should_log_scalars = tb_writer and (iteration % scalar_log_interval == 0 or iteration == opt.iterations)
+        if should_log_scalars:
             tb_writer.add_scalar('train_loss_patches/ssim_loss', (1.0 - _ssim_val).item(), iteration)
             tb_writer.add_scalar('train_loss_patches/opacity_reg_term', _opacity_reg.item(), iteration)
             tb_writer.add_scalar('train_loss_patches/scale_reg_term', _scale_reg.item(), iteration)
@@ -487,7 +504,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 + (args.energy_temp_start - args.energy_temp_min)
                 * (1.0 - alpha_t)
             )
-            if tb_writer:
+            if should_log_scalars:
                 tb_writer.add_scalar('mcmc/temperature', temperature, iteration)
         else:
             utility = None
@@ -525,7 +542,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 taming_stats_logged = True
 
-            camlist = sample_taming_cameras(scene.getTrainCameras(), getattr(args, "taming_cams", 10))
+            camlist = sample_taming_cameras(scene.getTrainCameras(), getattr(args, "taming_cams", 3))
             edge_maps = [taming_edge_maps[id(cam)].to(device=gaussians.get_xyz.device) for cam in camlist]
             with torch.no_grad():
                 taming_scores = compute_taming_scores(
@@ -578,8 +595,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
-            training_report(tb_writer, iteration, _Ll1_val, _loss_val, l1_loss, _iter_time_ms, testing_iterations, scene, render, (pipe, background),
-                            no_empty_cache=getattr(run_args, 'no_empty_cache', False))
+            training_report(
+                tb_writer,
+                iteration,
+                _Ll1_val,
+                _loss_val,
+                l1_loss,
+                _iter_time_ms,
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                no_empty_cache=getattr(run_args, 'no_empty_cache', False),
+                log_scalars=bool(should_log_scalars),
+            )
             if progress_disabled and (iteration % 500 == 0 or iteration == opt.iterations):
                 now = time.perf_counter()
                 delta_iter = max(1, iteration - progress_log_last_iter)
@@ -591,7 +620,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 progress_log_last_iter = iteration
                 progress_log_last_time = now
-                if tb_writer:
+                if should_log_scalars:
                     tb_writer.add_scalar('iterations_per_sec', it_s, iteration)
                     tb_writer.add_scalar('total_points', gaussians.get_xyz.shape[0], iteration)
                     tb_writer.add_scalar('train_loss_patches/psnr', psnr(image, gt_image).mean().item(), iteration)
@@ -599,11 +628,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Geometry failure dashboard — every 500 iters to avoid sync collision
-            if iteration % 500 == 0:
+            # Geometry failure dashboard — configurable to avoid sync collisions.
+            geometry_log_interval = max(1, int(getattr(args, "geometry_log_interval", 500)))
+            sfm_anchor_interval = max(1, int(getattr(args, "sfm_anchor_interval", 2000)))
+            if iteration % geometry_log_interval == 0:
                 with torch.no_grad():
-                    # Load SfM points once for anchor distance
-                    if not hasattr(scene, "_sfm_points"):
+                    # Load SfM points once, but only on the slower SfM-anchor cadence.
+                    include_sfm_anchor = iteration % sfm_anchor_interval == 0
+                    if include_sfm_anchor and not hasattr(scene, "_sfm_points"):
                         try:
                             import numpy as np
                             from scene.dataset_readers import fetchPly
@@ -612,27 +644,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         except Exception:
                             scene._sfm_points = None
 
-                    geo = compute_geometry_dashboard(gaussians, sfm_points=getattr(scene, "_sfm_points", None))
+                    geo = compute_geometry_dashboard(
+                        gaussians,
+                        sfm_points=getattr(scene, "_sfm_points", None) if include_sfm_anchor else None,
+                    )
                     gaussians._last_geo = geo
 
                     for k, v in geo.items():
-                        if tb_writer:
+                        if should_log_scalars:
                             tb_writer.add_scalar(f"geometry/{k}", v, iteration)
 
-                    # Print concise dashboard every 500 iters
-                    if iteration % 500 == 0:
-                        print(
-                            f"[geo] iter={iteration} "
-                            f"N={int(geo['num_gaussians'])} "
-                            f"LSOM={geo.get('low_support_opacity_mass', 0.0):.4f} "
-                            f"OSF={geo.get('opacity_scale_floater_score', 0.0):.4f} "
-                            f"mean_sup={geo.get('mean_support', 0.0):.4f}",
-                            flush=True,
-                        )
+                    print(
+                        f"[geo] iter={iteration} "
+                        f"N={int(geo['num_gaussians'])} "
+                        f"LSOM={geo.get('low_support_opacity_mass', 0.0):.4f} "
+                        f"OSF={geo.get('opacity_scale_floater_score', 0.0):.4f} "
+                        f"mean_sup={geo.get('mean_support', 0.0):.4f}",
+                        flush=True,
+                    )
         mark_stage("reporting")
 
         # Log CUDA memory allocator stats every 50 iterations for debugging stutters
-        if tb_writer and iteration % 50 == 0 and torch.cuda.is_available():
+        if should_log_scalars and getattr(args, "log_memory", False) and torch.cuda.is_available():
             try:
                 mem_stats = torch.cuda.memory_stats()
                 tb_writer.add_scalar('memory/allocated_bytes', mem_stats.get('allocated_bytes.all.current', 0), iteration)
@@ -677,7 +710,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
         # Log schedule metrics to TensorBoard
-        if tb_writer:
+        if should_log_scalars:
             tb_writer.add_scalar('mcmc/growth_factor', sched['growth_factor'], iteration)
             tb_writer.add_scalar('mcmc/capacity_ratio_rho', sched['rho'], iteration)
             tb_writer.add_scalar('mcmc/dead_opacity_threshold', sched['dead_opacity_threshold'], iteration)
@@ -877,8 +910,8 @@ def prepare_output_and_logger(args, run_args=None):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1_val, loss_val, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, no_empty_cache=False):
-    if tb_writer:
+def training_report(tb_writer, iteration, Ll1_val, loss_val, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, no_empty_cache=False, log_scalars=True):
+    if tb_writer and log_scalars:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1_val, iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss_val, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
@@ -982,12 +1015,10 @@ if __name__ == "__main__":
                         help="Skip torch.cuda.empty_cache() calls at test iterations for profiling.")
     parser.add_argument("--log_memory", action="store_true", default=False,
                         help="Log CUDA memory allocator stats every 50 iterations to TensorBoard.")
+    parser.add_argument("--no-energy_mcmc", "--no-energy-mcmc",
+                        dest="energy_mcmc", action="store_false",
+                        help="Disable energy-guided MCMC and use the legacy schedule-only path.")
     args = parser.parse_args(sys.argv[1:])
-    
-    # Handle --no-energy_mcmc / --no-energy-mcmc manually
-    # because ParamGroup bool flags only support --flag (action="store_true")
-    if "--no-energy_mcmc" in sys.argv or "--no-energy-mcmc" in sys.argv:
-        args.energy_mcmc = False
     
     if args.config is not None:
         # Load the configuration file
@@ -995,6 +1026,10 @@ if __name__ == "__main__":
         # Set the configuration parameters on args, if they are not already set by command line arguments
         for key, value in config.items():
             setattr(args, key, value)
+
+    # Keep explicit negative CLI flags authoritative even when --config is used.
+    if "--no-energy_mcmc" in sys.argv or "--no-energy-mcmc" in sys.argv:
+        args.energy_mcmc = False
 
     apply_parallelism_profile(args)
 

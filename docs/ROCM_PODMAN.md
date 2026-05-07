@@ -24,7 +24,7 @@ The `7.2-tb` tag includes TensorBoard. Logs are written to the output folder and
 
 | Variable | Value | Why |
 |----------|-------|-----|
-| `HSA_XNACK` | `1` | **Now safe.** After rebuilding `gsplat` from the `numeric_fixes` branch, `HSA_XNACK=1` works on gfx1151. If you still see page faults, fall back to `0`. |
+| `HSA_XNACK` | `1` | Current container runs use the pinned `ROCm/gsplat` `release/1.5.3b2` build with this repo's local setup/wave32 patches. If you still see page faults, fall back to `0` for debugging. |
 | `HSA_ENABLE_SDMA` | `0` | Recommended for Strix Halo / gfx1151 to avoid DMA-related hangs. |
 | `PYTORCH_ROCM_ARCH` | `gfx1151` | Ensures PyTorch extensions compile for the correct AMD GPU architecture. |
 
@@ -56,9 +56,9 @@ Without `--privileged`, even simple `torch.cuda` matmuls will fail with AMDGPU V
 Memory access fault by GPU node-1 ... Reason: Page not present or supervisor privilege.
 ```
 
-**Root cause:** The `release/1.5.3b2` branch of ROCm/gsplat has a bug in its HIP backward kernels for gfx1151 (Strix Halo). The forward pass works; the backward pass fails.
+**Root cause:** Unpatched ROCm/gsplat builds can use wave64 assumptions that are invalid for gfx1151 / wave32 execution.
 
-**Fix:** Rebuild `gsplat` from the `numeric_fixes` branch inside the container:
+**Fix:** Keep the repo-pinned `release/1.5.3b2` dependency, but rebuild it with the local patch scripts used by the Dockerfile:
 
 ```bash
 podman run --rm -it --privileged --security-opt label=disable \
@@ -77,7 +77,7 @@ pip uninstall -y amd-gsplat gsplat
 
 cd /tmp
 rm -rf gsplat
-git clone --branch numeric_fixes --depth 1 https://github.com/ROCm/gsplat.git
+git clone --branch release/1.5.3b2 --depth 1 https://github.com/ROCm/gsplat.git
 cd gsplat
 git submodule update --init --recursive
 
@@ -89,7 +89,7 @@ python setup.py build_ext --inplace
 pip install --no-deps --no-build-isolation .
 ```
 
-After rebuilding, `gsplat` backward works and training proceeds normally.
+After rebuilding with these patches, `gsplat` backward works and training proceeds normally. The project intentionally keeps using `release/1.5.3b2`; do not switch branches just to match older notes.
 
 ## Debugging GPU Faults
 

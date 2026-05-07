@@ -380,6 +380,8 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, reset_params=True):
+        old_count = self.get_xyz.shape[0]
+        old_visibility_ema = getattr(self, "visibility_ema", None)
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -399,7 +401,26 @@ class GaussianModel:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        else:
+            new_count = self.get_xyz.shape[0] - old_count
+            if (
+                old_visibility_ema is not None
+                and old_visibility_ema.shape[0] == old_count
+            ):
+                self.visibility_ema = torch.cat(
+                    (
+                        old_visibility_ema,
+                        torch.zeros(
+                            (new_count, 1),
+                            device=old_visibility_ema.device,
+                            dtype=old_visibility_ema.dtype,
+                        ),
+                    ),
+                    dim=0,
+                )
+            else:
+                self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -528,8 +549,14 @@ class GaussianModel:
             New callers pass scores=... for utility-guided sampling.
         """
         if scores is not None:
-            # Utility-guided: use softmax over scores
-            probs = torch.softmax(scores / temperature, dim=0)
+            # Utility-guided: robustly normalize before softmax so a few
+            # outliers do not collapse all relocation/growth sampling.
+            scores = torch.nan_to_num(scores.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            scores = torch.log1p(torch.clamp(scores, min=0.0))
+            median = scores.median()
+            mad = (scores - median).abs().median().clamp_min(1e-6)
+            scores = ((scores - median) / mad).clamp(-5.0, 5.0)
+            probs = torch.softmax(scores / max(float(temperature), 1e-6), dim=0)
         else:
             # Legacy: normalize provided probabilities
             probs = probs / (probs.sum() + torch.finfo(torch.float32).eps)
@@ -658,7 +685,6 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
         self.replace_tensors_to_optimizer(inds=add_idx)
-        self.visibility_ema = torch.cat((self.visibility_ema, torch.zeros((num_gs, 1), device="cuda")), dim=0)
         return num_gs
 
     def add_new_gs(self, cap_max, growth_factor=1.05):
@@ -686,7 +712,6 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
         self.replace_tensors_to_optimizer(inds=add_idx)
-        self.visibility_ema = torch.cat((self.visibility_ema, torch.zeros((num_gs, 1), device="cuda")), dim=0)
 
         return num_gs
 

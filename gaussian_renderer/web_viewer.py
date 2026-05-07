@@ -6,7 +6,7 @@ and a live rendered camera view to a browser dashboard.
 
 Usage:
     --web_viewer_port 6010    # Enable viewer on port 6010
-    --web_viewer_image_interval 10  # Push render image every N iters
+    --web_viewer_image_interval 100  # Push render image every N iters
 
 The viewer is off by default (port=0). Requires fastapi, uvicorn, websockets.
 """
@@ -86,7 +86,7 @@ class WebViewer:
                 while True:
                     msg = await ws.receive_text()
                     if msg == "ping":
-                        await ws.send_text("pong")
+                        await ws.send_json({"type": "pong"})
                     else:
                         # Try to parse as JSON command
                         try:
@@ -116,6 +116,7 @@ class WebViewer:
         async def _startup():
             self._loop = asyncio.get_running_loop()
             asyncio.create_task(self._broadcast_loop())
+            self._ready = True
 
         # ------------------------------------------------------------------
         @app.get("/")
@@ -163,7 +164,17 @@ class WebViewer:
             iteration: current training iteration.
         """
         try:
-            self._queue.put_nowait(("image", (image_np, iteration)))
+            img_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+            success, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not success:
+                return
+            payload = {
+                "iteration": iteration,
+                "width": int(image_np.shape[1]),
+                "height": int(image_np.shape[0]),
+                "jpeg": buf.tobytes(),
+            }
+            self._queue.put_nowait(("image", payload))
         except Full:
             pass
 
@@ -183,7 +194,6 @@ class WebViewer:
                     ws_ping_timeout=30,
                 )
                 server = uvicorn.Server(config)
-                self._ready = True
                 server.run()
             except Exception as e:
                 self._error = e
@@ -210,21 +220,13 @@ class WebViewer:
                     if msg_type == "metrics":
                         await ws.send_json(data)
                     elif msg_type == "image":
-                        arr, iteration = data
-                        # RGB → BGR for OpenCV
-                        img_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                        success, buf = cv2.imencode(
-                            ".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85]
-                        )
-                        if success:
-                            # Send JSON metadata, then binary JPEG
-                            await ws.send_json({
-                                "type": "image",
-                                "iteration": iteration,
-                                "width": arr.shape[1],
-                                "height": arr.shape[0],
-                            })
-                            await ws.send_bytes(buf.tobytes())
+                        await ws.send_json({
+                            "type": "image",
+                            "iteration": data["iteration"],
+                            "width": data["width"],
+                            "height": data["height"],
+                        })
+                        await ws.send_bytes(data["jpeg"])
                 except Exception:
                     dead.add(ws)
 
@@ -240,7 +242,7 @@ class WebViewer:
 
 def start_web_viewer(
     port: int = 6010,
-    image_interval: int = 10,
+    image_interval: int = 100,
     total_cams: int = 1,
     viewer_cam_idx: int = 0,
 ) -> WebViewer | None:

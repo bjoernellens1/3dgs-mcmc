@@ -53,7 +53,8 @@ def compute_effective_count(opacities, dead_threshold=0.005, softness=0.002):
 def compute_effective_count_loss(
     opacities, iteration, cap_max,
     dead_threshold=0.005, softness=0.002,
-    q_start=0.05, q_end=0.85, tau_N=0.45
+    q_start=0.05, q_end=0.85, tau_N=0.45,
+    max_iterations=30000, target_splat_end=None,
 ):
     """
     Loss that steers the effective Gaussian count toward a target curve.
@@ -64,19 +65,25 @@ def compute_effective_count_loss(
         opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
                    because this function participates in the loss graph.
         iteration: current iteration
-        cap_max: maximum allowed Gaussians
+        cap_max: maximum allowed Gaussians and fallback target scale
         q_start: initial target cap fraction
         q_end: final target cap fraction
         tau_N: exponential interpolation tau for target curve
+        max_iterations: training horizon used to normalize the target curve
+        target_splat_end: optional soft target count independent of cap_max
     Returns:
         scalar loss tensor
     """
     if cap_max <= 0:
-        return torch.tensor(0.0, device=opacities.device)
+        zero = torch.tensor(0.0, device=opacities.device)
+        return zero, zero.detach(), 0.0
     
-    # Normalize progress
-    # NOTE: using hardcoded 30k as max for q curve; could be parameterized
-    u = min(iteration / 30000.0, 1.0)
+    target_scale = target_splat_end if target_splat_end is not None and target_splat_end > 0 else cap_max
+    if target_scale <= 0:
+        zero = torch.tensor(0.0, device=opacities.device)
+        return zero, zero.detach(), 0.0
+
+    u = min(iteration / float(max(1, max_iterations)), 1.0)
     
     # Exponential interpolation for q
     tau = max(tau_N, 1e-6)
@@ -85,9 +92,9 @@ def compute_effective_count_loss(
     q = q_start + (q_end - q_start) * alpha_q
     
     N_eff = compute_effective_count(opacities, dead_threshold, softness)
-    N_target = cap_max * q
+    N_target = target_scale * q
     
-    loss = ((N_eff - N_target) / cap_max) ** 2
+    loss = ((N_eff - N_target) / target_scale) ** 2
     return loss, N_eff.detach(), N_target
 
 
@@ -198,7 +205,7 @@ def compute_dead_mask(
     Compute dead mask combining opacity, support, and optionally utility.
     
     dead_j = alpha_j < opacity_threshold AND support_j < support_threshold
-    optionally OR utility_j < quantile(utility, q)
+    optionally OR (low opacity AND utility_j < quantile(utility, q))
     
     Args:
         gaussians: GaussianModel instance
@@ -220,7 +227,7 @@ def compute_dead_mask(
     
     if use_utility_quantile and utility is not None and utility.numel() > 0:
         q_val = torch.quantile(utility, utility_quantile)
-        dead = dead | (utility < q_val)
+        dead = dead | ((alpha < opacity_threshold) & (utility < q_val))
     
     # NOTE: visibility tracking across iterations would require
     # accumulating visibility counts. For now we use current frame only.
