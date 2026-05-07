@@ -55,7 +55,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.cap_max = -1
-        self.init_type = "random"
+        self.init_type = "sfm"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -90,9 +90,15 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 25_000
         self.densify_grad_threshold = 0.0002
         self.random_background = False
+        self.optimizer_type = "adam"
+        self.gsplat_sparse_grad = False
+        self.sh_update_interval = 1
+        self.parallelism_profile = "off"
+        self.benchmark_dir = ""
         self.noise_lr = 5e5
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
+        self.densification_strategy = "mcmc"
         self.mcmc_stop_growth_iter = 12000
         self.mcmc_growth_factor_start = 1.05
         self.mcmc_growth_factor_min = 1.002
@@ -128,6 +134,31 @@ class OptimizationParams(ParamGroup):
         self.mcmc_dead_opacity_power = 1.5
         self.mcmc_use_target_deficit = False
         self.mcmc_target_splat_end = 150000
+        # Taming-3DGS strategy parameters. These are inert unless
+        # --densification_strategy is set to "taming" or "hybrid".
+        self.taming_budget = -1.0
+        self.taming_budget_mode = "final_count"
+        self.taming_cams = 10
+        self.taming_score_interval = 100
+        self.taming_min_opacity = 0.005
+        self.taming_prune_stop_iter = 3200
+        self.taming_view_importance = 50.0
+        self.taming_edge_importance = 50.0
+        self.taming_mse_importance = 50.0
+        self.taming_grad_importance = 25.0
+        self.taming_dist_importance = 50.0
+        self.taming_opacity_importance = 100.0
+        self.taming_depth_importance = 5.0
+        self.taming_loss_importance = 10.0
+        self.taming_radii_importance = 10.0
+        self.taming_scale_importance = 25.0
+        self.taming_count_importance = 0.1
+        self.taming_blend_importance = 50.0
+        # Live web viewer (optional, set --web_viewer_port to enable)
+        self.web_viewer_port = 0
+        self.web_viewer_image_interval = 10
+        self.strategy_log_interval = 500
+        self.mcmc_control_log_interval = 500
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

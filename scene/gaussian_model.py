@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import math
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -22,6 +23,15 @@ from utils.rocm_knn_fallback import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.reloc_utils import compute_relocation_cuda
+
+
+def _dense_grad(grad):
+    if grad is None:
+        return None
+    if getattr(grad, "layout", torch.strided) != torch.strided:
+        return grad.to_dense()
+    return grad
+
 
 class GaussianModel:
 
@@ -56,6 +66,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.optimizer_type = "adam"
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -163,7 +174,24 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.optimizer_type = getattr(training_args, "optimizer_type", "adam").lower()
+        if self.optimizer_type in {"adam", "default"}:
+            self.optimizer_type = "adam"
+            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        elif self.optimizer_type == "selective_adam":
+            try:
+                from gsplat.optimizers import SelectiveAdam
+            except Exception as exc:
+                raise RuntimeError(
+                    "--optimizer_type selective_adam requires gsplat.optimizers.SelectiveAdam "
+                    "inside the project container."
+                ) from exc
+            self.optimizer = SelectiveAdam(l, eps=1e-15, betas=(0.9, 0.999))
+        else:
+            raise ValueError(
+                f"Unsupported optimizer_type '{self.optimizer_type}'. "
+                "Expected 'adam' or 'selective_adam'."
+            )
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -176,6 +204,26 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
+
+    def normalize_rotation_params(self):
+        with torch.no_grad():
+            self._rotation.copy_(torch.nn.functional.normalize(self._rotation, dim=1))
+
+    def prepare_selective_adam_step(self):
+        for group in self.optimizer.param_groups:
+            param = group["params"][0]
+            if not param.is_contiguous():
+                param.data = param.data.contiguous()
+            if param.grad is not None:
+                if getattr(param.grad, "layout", torch.strided) != torch.strided:
+                    param.grad = param.grad.to_dense().contiguous()
+                elif not param.grad.is_contiguous():
+                    param.grad = param.grad.contiguous()
+            stored_state = self.optimizer.state.get(param, None)
+            if stored_state is not None:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in stored_state and not stored_state[key].is_contiguous():
+                        stored_state[key] = stored_state[key].contiguous()
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -642,6 +690,149 @@ class GaussianModel:
 
         return num_gs
 
+    def _sample_taming_indices(self, scores, candidate_mask, budget):
+        budget = int(max(0, budget))
+        if budget <= 0:
+            return torch.empty(0, device=self.get_xyz.device, dtype=torch.long)
 
+        candidate_indices = candidate_mask.nonzero(as_tuple=True)[0]
+        if candidate_indices.numel() == 0:
+            return candidate_indices
 
+        budget = min(budget, candidate_indices.numel())
+        candidate_scores = scores[candidate_indices].detach().float().clamp_min(0.0)
+        if not torch.any(candidate_scores > 0):
+            candidate_scores = torch.ones_like(candidate_scores)
+        sampled = torch.multinomial(candidate_scores, budget, replacement=False)
+        return candidate_indices[sampled]
 
+    def _densify_clone_indices(self, selected_indices):
+        if selected_indices.numel() == 0:
+            return 0
+
+        new_xyz = self._xyz[selected_indices]
+        new_features_dc = self._features_dc[selected_indices]
+        new_features_rest = self._features_rest[selected_indices]
+        new_opacities = self._opacity[selected_indices]
+        new_scaling = self._scaling[selected_indices]
+        new_rotation = self._rotation[selected_indices]
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            reset_params=True,
+        )
+        self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        return int(selected_indices.numel())
+
+    def _densify_split_indices(self, selected_indices, N=2):
+        if selected_indices.numel() == 0:
+            return 0
+
+        old_count = self.get_xyz.shape[0]
+        stds = self.get_scaling[selected_indices].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_indices]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_indices].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_indices].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[selected_indices].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_indices].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_indices].repeat(N, 1, 1)
+        new_opacity = self._opacity[selected_indices].repeat(N, 1)
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            reset_params=True,
+        )
+
+        prune_filter = torch.zeros(self.get_xyz.shape[0], device="cuda", dtype=bool)
+        prune_filter[selected_indices] = True
+        # Only original parents are pruned; appended children are kept.
+        prune_filter[old_count:] = False
+        self.prune_points(prune_filter)
+        self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        return int(selected_indices.numel())
+
+    def densify_with_taming_scores(
+        self,
+        scores,
+        target_count,
+        extent,
+        min_opacity=0.005,
+        max_screen_size=None,
+        iteration=None,
+        prune_stop_iter=3200,
+        grad_threshold=0.0002,
+        split_children=2,
+    ):
+        current_count = self.get_xyz.shape[0]
+        target_count = int(target_count)
+        if target_count <= current_count:
+            return {"cloned": 0, "split": 0, "pruned": 0, "target": target_count}
+
+        scores = scores.to(device=self.get_xyz.device, dtype=torch.float32)
+        if scores.shape[0] != current_count:
+            padded_scores = torch.zeros(current_count, device=self.get_xyz.device, dtype=torch.float32)
+            n = min(current_count, scores.shape[0])
+            padded_scores[:n] = scores[:n]
+            scores = padded_scores
+
+        grad_vars = self.xyz_gradient_accum / self.denom
+        grad_vars[grad_vars.isnan()] = 0.0
+        grad = _dense_grad(self._xyz.grad)
+        if not torch.any(torch.norm(grad_vars, dim=-1) > 0) and grad is not None:
+            grad_vars = grad.detach()
+        score_qualifiers = scores > 0
+        grad_qualifiers = torch.norm(grad_vars, dim=-1) >= grad_threshold
+        growth_qualifiers = score_qualifiers | grad_qualifiers
+        clone_qualifiers = self.get_scaling.max(dim=1).values <= self.percent_dense * extent
+        split_qualifiers = self.get_scaling.max(dim=1).values > self.percent_dense * extent
+
+        clone_candidates = clone_qualifiers & growth_qualifiers
+        split_candidates = split_qualifiers & growth_qualifiers
+        total_clones = int(clone_candidates.sum().item())
+        total_splits = int(split_candidates.sum().item())
+        total_candidates = total_clones + total_splits
+        if total_candidates <= 0:
+            return {"cloned": 0, "split": 0, "pruned": 0, "target": target_count}
+
+        growth_budget = min(target_count - current_count, total_candidates)
+        clone_budget = int(math.floor(growth_budget * total_clones / total_candidates))
+        split_budget = growth_budget - clone_budget
+        if split_budget > total_splits:
+            clone_budget += split_budget - total_splits
+            split_budget = total_splits
+        if clone_budget > total_clones:
+            split_budget += clone_budget - total_clones
+            clone_budget = total_clones
+
+        clone_indices = self._sample_taming_indices(scores, clone_candidates, clone_budget)
+        split_indices = self._sample_taming_indices(scores, split_candidates, split_budget)
+
+        cloned = self._densify_clone_indices(clone_indices)
+        split = self._densify_split_indices(split_indices, N=split_children)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        pruned = 0
+        if prune_mask.any() and (iteration is None or iteration < prune_stop_iter):
+            self.prune_points(prune_mask)
+            self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            pruned = int(prune_mask.sum().item())
+
+        torch.cuda.empty_cache()
+        return {"cloned": cloned, "split": split, "pruned": pruned, "target": target_count}

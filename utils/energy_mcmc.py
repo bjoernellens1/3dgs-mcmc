@@ -23,6 +23,14 @@ import torch
 import math
 
 
+def _dense_grad(grad):
+    if grad is None:
+        return None
+    if getattr(grad, "layout", torch.strided) != torch.strided:
+        return grad.to_dense()
+    return grad
+
+
 def compute_effective_count(opacities, dead_threshold=0.005, softness=0.002):
     """
     Compute soft effective Gaussian count.
@@ -80,7 +88,7 @@ def compute_effective_count_loss(
     N_target = cap_max * q
     
     loss = ((N_eff - N_target) / cap_max) ** 2
-    return loss
+    return loss, N_eff.detach(), N_target
 
 
 def compute_opacity_entropy_loss(opacities):
@@ -143,16 +151,19 @@ def compute_gaussian_utility(
     # Gradient term: norm of xyz gradient
     # NOTE: requires that loss.backward() has been called
     xyz_grad = torch.zeros(N, device=device)
-    if gaussians._xyz.grad is not None:
-        xyz_grad = gaussians._xyz.grad.norm(dim=1)
+    grad = _dense_grad(gaussians._xyz.grad)
+    if grad is not None:
+        xyz_grad = grad.norm(dim=1)
     
     opacity_grad = torch.zeros(N, device=device)
-    if gaussians._opacity.grad is not None:
-        opacity_grad = gaussians._opacity.grad.abs().squeeze(-1)
+    grad = _dense_grad(gaussians._opacity.grad)
+    if grad is not None:
+        opacity_grad = grad.abs().squeeze(-1)
     
     scale_grad = torch.zeros(N, device=device)
-    if gaussians._scaling.grad is not None:
-        scale_grad = gaussians._scaling.grad.norm(dim=1)
+    grad = _dense_grad(gaussians._scaling.grad)
+    if grad is not None:
+        scale_grad = grad.norm(dim=1)
     
     norm_grad = xyz_grad + beta_opacity * opacity_grad + beta_scale * scale_grad
     

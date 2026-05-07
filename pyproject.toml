@@ -11,6 +11,10 @@ dependencies = [
     "tqdm",
     "opencv-python",
     "amd-gsplat @ git+https://github.com/ROCm/gsplat.git@release/1.5.3b2",
+    # Live web viewer (optional; graceful fallback if missing)
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
 ]
 
 [build-system]
