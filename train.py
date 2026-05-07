@@ -377,8 +377,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if web_viewer is not None and web_viewer.image_interval > 0 and iteration % web_viewer_image_interval == 0:
             _viewer_cam = scene.getTrainCameras()[web_viewer.viewer_cam_idx]
             if viewpoint_cam is _viewer_cam:
-                # Training happened to render from the viewer's camera — reuse it
-                _viewer_pinned_buf = _web_viewer_mod.encode_render_image_async_start(image, _viewer_stream)
+                # Training happened to render from the viewer's camera — reuse it.
+                # Record a CUDA event so the viewer stream waits for the render to complete.
+                _render_ready = torch.cuda.Event()
+                _render_ready.record()
+                _viewer_pinned_buf = _web_viewer_mod.encode_render_image_async_start(
+                    image, _viewer_stream, wait_event=_render_ready,
+                )
             else:
                 # Do an extra render pass from the viewer's fixed camera
                 _viewer_render_start = torch.cuda.Event(enable_timing=True)
@@ -386,8 +391,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _viewer_render_start.record()
                 with torch.no_grad():
                     _viewer_pkg = render(_viewer_cam, gaussians, pipe, bg, update_sh_rest=update_sh_rest)
-                    # Start async GPU→CPU copy on viewer stream (non-blocking)
-                    _viewer_pinned_buf = _web_viewer_mod.encode_render_image_async_start(_viewer_pkg["render"], _viewer_stream)
+                    # Record event on default stream after render is queued
+                    _render_ready = torch.cuda.Event()
+                    _render_ready.record()
+                    # Start async GPU→CPU copy on viewer stream (waits for render first)
+                    _viewer_pinned_buf = _web_viewer_mod.encode_render_image_async_start(
+                        _viewer_pkg["render"], _viewer_stream, wait_event=_render_ready,
+                    )
                 _viewer_render_end.record()
                 _viewer_render_end.synchronize()
                 _viewer_render_time_ms = _viewer_render_start.elapsed_time(_viewer_render_end)

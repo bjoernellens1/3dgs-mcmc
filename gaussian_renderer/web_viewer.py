@@ -323,7 +323,7 @@ def encode_render_image(image_tensor) -> np.ndarray | None:
 
 _viewer_pinned_buf: Any = None  # torch.Tensor | None
 
-def encode_render_image_async_start(image_tensor, stream) -> Any:
+def encode_render_image_async_start(image_tensor, stream, wait_event=None) -> Any:
     """
     Start an async GPU→CPU copy of a render image using a pinned CPU buffer.
 
@@ -331,9 +331,16 @@ def encode_render_image_async_start(image_tensor, stream) -> Any:
     the calling thread.  Caller MUST synchronize the stream before reading
     the buffer (e.g. via ``encode_render_image_finish``).
 
+    If *wait_event* (a ``torch.cuda.Event`` recorded on another stream) is
+    provided, the copy will not begin until that event has completed on its
+    originating stream.  This prevents the async copy from reading the GPU
+    tensor before upstream rendering has finished writing to it.
+
     Args:
         image_tensor: GPU float tensor (3, H, W), values in [0, 1].
         stream: torch.cuda.Stream for the async copy.
+        wait_event: Optional ``torch.cuda.Event``.  If given, the copy
+            stream waits for this event before starting.
 
     Returns:
         The pinned CPU buffer (torch.Tensor, uint8 HWC).  The data is NOT
@@ -341,22 +348,27 @@ def encode_render_image_async_start(image_tensor, stream) -> Any:
     """
     global _viewer_pinned_buf
 
-    # Clamp + quantize + transpose on GPU first (no sync needed)
-    processed = (
-        (image_tensor.detach().clamp(0, 1) * 255)
-        .byte()
-        .permute(1, 2, 0)
-        .contiguous()  # (H, W, 3) uint8, contiguous
-    )
+    if wait_event is not None:
+        stream.wait_event(wait_event)
 
-    # Allocate or reuse a pinned CPU buffer of the same shape
-    if _viewer_pinned_buf is None or _viewer_pinned_buf.shape != processed.shape:
-        _viewer_pinned_buf = torch.empty(
-            processed.shape, dtype=processed.dtype, device="cpu", pin_memory=True
+    with torch.cuda.stream(stream):
+        # Clamp + quantize + transpose on the viewer stream (ensures
+        # correct cross-stream ordering with wait_event above).
+        processed = (
+            (image_tensor.detach().clamp(0, 1) * 255)
+            .byte()
+            .permute(1, 2, 0)
+            .contiguous()  # (H, W, 3) uint8, contiguous
         )
 
-    # Queue the async copy on the caller-provided stream
-    with torch.cuda.stream(stream):
+        # Allocate or reuse a pinned CPU buffer of the same shape
+        global _viewer_pinned_buf
+        if _viewer_pinned_buf is None or _viewer_pinned_buf.shape != processed.shape:
+            _viewer_pinned_buf = torch.empty(
+                processed.shape, dtype=processed.dtype, device="cpu", pin_memory=True
+            )
+
+        # Queue the async GPU→CPU copy on the provided stream
         _viewer_pinned_buf.copy_(processed, non_blocking=True)
 
     return _viewer_pinned_buf
