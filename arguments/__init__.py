@@ -157,10 +157,23 @@ class OptimizationParams(ParamGroup):
         self.taming_scale_importance = 25.0
         self.taming_count_importance = 0.1
         self.taming_blend_importance = 50.0
-        # Live web viewer (optional, set --web_viewer_port to enable)
-        self.web_viewer_port = 0
+        # Persistent web viewer. Default-on; use --no-web-viewer to disable.
+        self.web_viewer_enabled = True
+        self.web_viewer_port = 6010
+        self.web_viewer_host = "0.0.0.0"
+        self.web_viewer_backend = "process"
+        self.web_viewer_cache_dir = ""
         self.web_viewer_image_interval = 100
         self.web_viewer_fixed_camera = False
+        self.web_viewer_keep_alive = True
+        self.web_viewer_scene_cache_interval = 500
+        self.web_viewer_scene_cache_keep = 3
+        self.record_video = False
+        self.record_video_cameras = ""
+        self.record_video_interval = 100
+        self.record_video_fps = 30
+        self.record_video_crf = 23
+        self.record_video_preset = "veryfast"
         self.scalar_log_interval = 10
         self.geometry_log_interval = 500
         self.sfm_anchor_interval = 2000

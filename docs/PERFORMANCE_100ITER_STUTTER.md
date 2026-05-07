@@ -29,9 +29,10 @@ The non-quality-affecting expensive intervals are now configurable and the defau
 - `--geometry_log_interval 500`
 - `--sfm_anchor_interval 2000`
 - `--web_viewer_image_interval 100`
+- `--web_viewer_scene_cache_interval 500`
 - `--taming_cams 3`
 
-The live web viewer also reuses the current training render by default. A fixed-camera viewer render is available with `--web_viewer_fixed_camera`, but it intentionally adds an extra rasterization pass at each viewer image interval.
+The live web viewer is default-on, but it reuses the current training render by default. A fixed-camera viewer render is available with `--web_viewer_fixed_camera`, but it intentionally adds an extra rasterization pass at each viewer image interval. The direct browser PLY view is driven by bounded cached PLY snapshots, not per-iteration exports.
 
 Taming keeps the 100-iteration scoring cadence for quality, but now samples 3 scoring cameras by default. In an isolated 2.5k bicycle benchmark with `--taming_score_interval 100`, changing only `--taming_cams` from 10 to 3 reduced mean scoring-iteration wall time from about 1852 ms to 850 ms, while non-scoring iterations stayed around 34 ms. Raising `--taming_score_interval` to 500 is still a profiling option, but it changed the 6k bicycle metric in evaluation and is intentionally not the default.
 

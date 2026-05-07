@@ -57,6 +57,11 @@ from utils.taming_3dgs import (
     get_taming_score_weights,
     sample_taming_cameras,
 )
+from utils.web_viewer_media import (
+    MultiCameraVideoRecorder,
+    ScenePlyCacheWriter,
+    parse_video_camera_indices,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -291,19 +296,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         for cam in scene.getTrainCameras():
             taming_edge_maps[id(cam)] = compute_edge_map(cam.original_image).detach().cpu()
 
-    # Optional live web viewer
-    web_viewer = None
-    web_viewer_port = getattr(args, "web_viewer_port", 0)
+    # Persistent web viewer and media cache. The viewer may already be running
+    # from __main__ so users can connect while scene loading is still in flight.
+    web_viewer = _web_viewer_mod.get_web_viewer() if _web_viewer_mod is not None else None
+    web_viewer_enabled = bool(getattr(args, "web_viewer_enabled", True))
+    web_viewer_port = int(getattr(args, "web_viewer_port", 6010))
     web_viewer_image_interval = max(1, getattr(args, "web_viewer_image_interval", 100))
     web_viewer_fixed_camera = bool(getattr(args, "web_viewer_fixed_camera", False))
-    if web_viewer_port > 0 and _web_viewer_mod is not None:
+    web_viewer_cache_dir = getattr(args, "web_viewer_cache_dir", "") or os.path.join(scene.model_path, "web_viewer_cache")
+    web_viewer_backend = str(getattr(args, "web_viewer_backend", "process")).lower()
+    if (not web_viewer_enabled) or web_viewer_port <= 0:
+        web_viewer_backend = "off"
+    if web_viewer_backend != "off" and _web_viewer_mod is not None and web_viewer is None:
         _train_cams = scene.getTrainCameras()
         web_viewer = _web_viewer_mod.start_web_viewer(
             port=web_viewer_port,
+            host=getattr(args, "web_viewer_host", "0.0.0.0"),
             image_interval=web_viewer_image_interval,
             total_cams=len(_train_cams),
             viewer_cam_idx=0,
+            backend=web_viewer_backend,
+            cache_dir=web_viewer_cache_dir,
+            model_path=scene.model_path,
         )
+    elif web_viewer is not None:
+        web_viewer.update_camera_info(len(scene.getTrainCameras()), viewer_cam_idx=0)
+    elif web_viewer_backend != "off":
+        print("[web-viewer] Disabled - web viewer module failed to import.", flush=True)
+
+    scene_cache_writer = None
+    scene_cache_interval = max(0, int(getattr(args, "web_viewer_scene_cache_interval", 500)))
+    scene_cache_keep = max(0, int(getattr(args, "web_viewer_scene_cache_keep", 3)))
+    if web_viewer_enabled and scene_cache_interval > 0:
+        scene_cache_writer = ScenePlyCacheWriter(web_viewer_cache_dir, keep=scene_cache_keep, viewer=web_viewer)
+
+    video_recorder = None
+    video_camera_indices = []
+    if bool(getattr(args, "record_video", False)) and _web_viewer_mod is not None:
+        video_camera_indices = parse_video_camera_indices(
+            getattr(args, "record_video_cameras", ""),
+            len(scene.getTrainCameras()),
+        )
+        if video_camera_indices:
+            video_recorder = MultiCameraVideoRecorder(
+                cache_dir=web_viewer_cache_dir,
+                camera_indices=video_camera_indices,
+                fps=max(1, int(getattr(args, "record_video_fps", 30))),
+                crf=max(0, int(getattr(args, "record_video_crf", 23))),
+                preset=str(getattr(args, "record_video_preset", "veryfast")),
+                viewer=web_viewer,
+            )
+            print(
+                f"[web-viewer-video] recording cameras {video_camera_indices} "
+                f"every {max(1, int(getattr(args, 'record_video_interval', 100)))} iterations",
+                flush=True,
+            )
+    elif bool(getattr(args, "record_video", False)):
+        print("[web-viewer-video] Disabled - web viewer image helpers failed to import.", flush=True)
 
     _profile_path = getattr(run_args, "profile", None) if run_args else None
     if _profile_path:
@@ -322,6 +371,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Persistent CUDA stream for async GPU→CPU viewer image copies.
     # Keeps the copy from blocking the main training stream.
     _viewer_stream = torch.cuda.Stream() if web_viewer is not None else None
+    _video_stream = torch.cuda.Stream() if video_recorder is not None else None
 
     for iteration in range(first_iter, opt.iterations + 1):        
         stage_times, mark_stage, finish_stage = begin_stage_timer(sync=benchmark_sync)
@@ -382,6 +432,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _viewer_image_arr = None
         _viewer_render_time_ms = 0.0
         _viewer_pinned_buf = None  # non-None when async copy is in-flight
+        _video_frames = []
         if web_viewer is not None and web_viewer.image_interval > 0 and iteration % web_viewer_image_interval == 0:
             _viewer_cam = scene.getTrainCameras()[web_viewer.viewer_cam_idx]
             if viewpoint_cam is _viewer_cam or not web_viewer_fixed_camera:
@@ -411,6 +462,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _viewer_render_end.record()
                 _viewer_render_end.synchronize()
                 _viewer_render_time_ms = _viewer_render_start.elapsed_time(_viewer_render_end)
+        if video_recorder is not None and iteration % max(1, int(getattr(args, "record_video_interval", 100))) == 0:
+            for _video_cam_idx in video_camera_indices:
+                _video_cam = scene.getTrainCameras()[_video_cam_idx]
+                if viewpoint_cam is _video_cam:
+                    _render_ready = torch.cuda.Event()
+                    _render_ready.record()
+                    _video_buf = _web_viewer_mod.encode_render_image_async_start(
+                        image, _video_stream, wait_event=_render_ready, reuse_buffer=False,
+                    )
+                else:
+                    with torch.no_grad():
+                        _video_pkg = render(_video_cam, gaussians, pipe, bg, update_sh_rest=update_sh_rest)
+                        _render_ready = torch.cuda.Event()
+                        _render_ready.record()
+                        _video_buf = _web_viewer_mod.encode_render_image_async_start(
+                            _video_pkg["render"], _video_stream, wait_event=_render_ready, reuse_buffer=False,
+                        )
+                _video_stream.synchronize()
+                _video_frames.append((_video_cam_idx, _web_viewer_mod.encode_render_image_finish(_video_buf).copy()))
         mark_stage("forward")
 
         # Loss — capture intermediate values for logging (no recompute)
@@ -700,6 +770,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _viewer_pinned_buf = None
                 if _viewer_image_arr is not None:
                     web_viewer.push_image(_viewer_image_arr, iteration)
+        if video_recorder is not None and _video_frames:
+            for _video_cam_idx, _video_arr in _video_frames:
+                video_recorder.write(_video_cam_idx, _video_arr)
 
         # Compute MCMC schedule
         sched = get_mcmc_schedule(
@@ -875,6 +948,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
         mark_stage("mutation")
 
+        if scene_cache_writer is not None and scene_cache_interval > 0 and iteration % scene_cache_interval == 0:
+            _cache_start = time.perf_counter()
+            scene_cache_writer.save(gaussians, iteration, final=False)
+            stage_times["web_viewer_scene_cache"] = stage_times.get("web_viewer_scene_cache", 0.0) + (
+                time.perf_counter() - _cache_start
+            )
+
         if (iteration in checkpoint_iterations) or (args.checkpoint_interval > 0 and iteration % args.checkpoint_interval == 0):
             print("\n[ITER {}] Saving Checkpoint".format(iteration))
             torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
@@ -890,6 +970,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _prof.__exit__(None, None, None)
         _prof.export_chrome_trace(_profile_path)
         print(f"[profile] Trace saved to {_profile_path}.", flush=True)
+    if scene_cache_writer is not None:
+        scene_cache_writer.save(gaussians, opt.iterations, final=True)
+    if video_recorder is not None:
+        video_recorder.close()
+    if web_viewer is not None:
+        web_viewer.set_status("finished", "training complete")
+        web_viewer.close()
+        if bool(getattr(args, "web_viewer_keep_alive", True)) and web_viewer_backend == "process":
+            print(
+                f"[web-viewer] Training complete. Viewer remains available at "
+                f"http://127.0.0.1:{web_viewer_port}. Press Ctrl+C to stop this container/process.",
+                flush=True,
+            )
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                print("[web-viewer] Keep-alive stopped.", flush=True)
 
 def prepare_output_and_logger(args, run_args=None):
     ensure_model_path(args)
@@ -1018,6 +1116,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-energy_mcmc", "--no-energy-mcmc",
                         dest="energy_mcmc", action="store_false",
                         help="Disable energy-guided MCMC and use the legacy schedule-only path.")
+    parser.add_argument("--no-web-viewer", "--no-web_viewer",
+                        dest="web_viewer_enabled", action="store_false",
+                        help="Disable the default persistent web viewer.")
+    parser.add_argument("--no-web-viewer-keep-alive", "--no-web_viewer_keep_alive",
+                        dest="web_viewer_keep_alive", action="store_false",
+                        help="Let training exit after completion instead of holding the viewer process open.")
     args = parser.parse_args(sys.argv[1:])
     
     if args.config is not None:
@@ -1030,6 +1134,10 @@ if __name__ == "__main__":
     # Keep explicit negative CLI flags authoritative even when --config is used.
     if "--no-energy_mcmc" in sys.argv or "--no-energy-mcmc" in sys.argv:
         args.energy_mcmc = False
+    if "--no-web-viewer" in sys.argv or "--no-web_viewer" in sys.argv:
+        args.web_viewer_enabled = False
+    if "--no-web-viewer-keep-alive" in sys.argv or "--no-web_viewer_keep_alive" in sys.argv:
+        args.web_viewer_keep_alive = False
 
     apply_parallelism_profile(args)
 
@@ -1043,6 +1151,20 @@ if __name__ == "__main__":
     ensure_model_path(args)
     start_benchmark_log(args)
     start_output_log(args)
+    early_web_viewer = None
+    if bool(getattr(args, "web_viewer_enabled", True)) and int(getattr(args, "web_viewer_port", 6010)) > 0 and _web_viewer_mod is not None:
+        early_web_viewer = _web_viewer_mod.start_web_viewer(
+            port=int(getattr(args, "web_viewer_port", 6010)),
+            host=getattr(args, "web_viewer_host", "0.0.0.0"),
+            image_interval=max(1, int(getattr(args, "web_viewer_image_interval", 100))),
+            total_cams=1,
+            viewer_cam_idx=0,
+            backend=str(getattr(args, "web_viewer_backend", "process")).lower(),
+            cache_dir=getattr(args, "web_viewer_cache_dir", "") or os.path.join(args.model_path, "web_viewer_cache"),
+            model_path=args.model_path,
+        )
+        if early_web_viewer is not None:
+            early_web_viewer.set_status("loading", "loading scene and cameras")
     
     print("Optimizing " + args.model_path)
 
