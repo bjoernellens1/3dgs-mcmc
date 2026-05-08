@@ -190,19 +190,27 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     # -------------------------------------------------------------------------
     # Inria's codebase stores world_view_transform as the *transpose* of the
     # actual world-to-camera matrix. gsplat expects the actual W2C matrix.
-    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(device, non_blocking=True).contiguous()
-
-    # Build pinhole intrinsics from FoV
-    fx = _fov2focal(viewpoint_camera.FoVx, W)
-    fy = _fov2focal(viewpoint_camera.FoVy, H)
-    cx = W / 2.0
-    cy = H / 2.0
-    K = torch.tensor(
-        [[fx, 0.0, cx],
-         [0.0, fy, cy],
-         [0.0, 0.0, 1.0]],
-        device=device, dtype=torch.float32,
-    ).contiguous()
+    #
+    # Use cached tensors (prepare_camera_for_render) to avoid per-render
+    # DeviceCopy overhead. Fallback to on-the-fly construction if cache
+    # is not present (e.g. interactive viewer code paths).
+    if hasattr(viewpoint_camera, "_gsplat_viewmat"):
+        viewmat = viewpoint_camera._gsplat_viewmat
+        K = viewpoint_camera._gsplat_K
+        cam_center = viewpoint_camera._gsplat_camera_center
+    else:
+        viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(device, non_blocking=True).contiguous()
+        fx = _fov2focal(viewpoint_camera.FoVx, W)
+        fy = _fov2focal(viewpoint_camera.FoVy, H)
+        cx = W / 2.0
+        cy = H / 2.0
+        K = torch.tensor(
+            [[fx, 0.0, cx],
+             [0.0, fy, cy],
+             [0.0, 0.0, 1.0]],
+            device=device, dtype=torch.float32,
+        ).contiguous()
+        cam_center = viewpoint_camera.camera_center.to(device=device, dtype=torch.float32).view(1, 3).contiguous()
 
     viewmats = viewmat[None].contiguous()
     Ks = K[None].contiguous()
@@ -228,11 +236,12 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         if not update_sh_rest:
             features_rest = features_rest.detach()
 
-        cam_center = viewpoint_camera.camera_center.to(device=device, dtype=means.dtype).view(1, 3)
+        # Camera center is already cached in float32; cast to means dtype if needed
+        _cc = cam_center.to(dtype=means.dtype) if cam_center.dtype != means.dtype else cam_center
         # In sparse mode, detach means from direction to avoid dense position
         # gradients through the Python SH evaluation graph.
         dir_source = means.detach() if (sparse_grad and getattr(pipe, "sparse_mode_detach_sh_dir", True)) else means
-        dir_pp = dir_source - cam_center
+        dir_pp = dir_source - _cc
         dir_pp_normalized = torch.nn.functional.normalize(dir_pp, dim=1, eps=1e-8)
 
         colors = sh_to_rgb(

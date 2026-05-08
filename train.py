@@ -216,6 +216,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # Preload camera tensors to GPU to avoid per-render DeviceCopy overhead.
+    from scene.cameras import prepare_camera_for_render
+    for cam in scene.getTrainCameras():
+        prepare_camera_for_render(cam, device="cuda")
+    for cam in scene.getTestCameras():
+        prepare_camera_for_render(cam, device="cuda")
     mcmc_cfg = MCMCScheduleConfig(
         start_iter=opt.densify_from_iter,
         stop_growth_iter=getattr(opt, "mcmc_stop_growth_iter", 12_000),
@@ -275,6 +282,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
     elif optimizer_type == "selective_adam" and allow_dense_grads:
         print("[sparse] selective_adam with dense grads fallback (allow_dense_grads=True)", flush=True)
+
+    # Growth-aware compile activation: never compile while N is still changing.
+    if getattr(args, "compile_mode", "off") != "off":
+        growth_stop = max(
+            int(getattr(opt, "mcmc_stop_growth_iter", 0)),
+            int(getattr(opt, "densify_until_iter", 0)),
+        )
+        margin = int(getattr(args, "compile_growth_margin", 500))
+        old_after = int(getattr(args, "compile_after_iter", 0))
+        args.compile_after_iter = max(old_after, growth_stop + margin)
+        print(
+            f"[compiled-kernels] growth-aware compile_after_iter={args.compile_after_iter} "
+            f"(growth_stop={growth_stop}, margin={margin})",
+            flush=True,
+        )
+
     configure_torch_compile(args)
     taming_enabled = densification_strategy in {"taming", "hybrid"}
     use_energy_mcmc = args.energy_mcmc and densification_strategy in {"mcmc", "hybrid"}
@@ -500,7 +523,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         mark_stage("forward")
 
         # Loss — capture intermediate values for logging (no recompute)
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image
         Ll1 = l1_loss(image, gt_image)
         _ssim_val = ssim(image, gt_image)  # capture for logging (already computed for loss)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - _ssim_val)

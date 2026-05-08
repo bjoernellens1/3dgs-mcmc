@@ -163,8 +163,9 @@ class OptimizationParams(ParamGroup):
         self.taming_blend_importance = 50.0
         # torch.compile configuration (off by default — only opt-in for ablation)
         self.compile_mode = "off"
-        self.compile_dynamic = True
+        self.compile_dynamic = False
         self.compile_after_iter = 12000
+        self.compile_growth_margin = 500
         self.compile_sh = False
         self.compile_energy = False
         self.compile_utility = False

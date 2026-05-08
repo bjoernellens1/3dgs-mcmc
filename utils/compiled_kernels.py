@@ -276,7 +276,8 @@ def utility_core(
 
 
 def active_reg_core(opacity, scaling, w_opacity=0.01, w_scale=0.01):
-    return REGISTRY("active_reg_core", opacity, scaling, w_opacity, w_scale)
+    """Active-set L1 regularizer — always eager (shape changes every iteration)."""
+    return _active_reg_core(opacity, scaling, w_opacity, w_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +324,6 @@ def configure_torch_compile(args):
         "utility_core", _utility_core,
         enabled=bool(getattr(args, "compile_utility", False)),
     )
-    # active_reg always eager — shape changes every iteration
-    REGISTRY.register("active_reg_core", _active_reg_core, enabled=False)
 
     mode = getattr(args, "compile_mode", "off")
     if mode == "off":

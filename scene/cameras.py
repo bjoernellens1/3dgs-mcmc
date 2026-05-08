@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import torch
 from torch import nn
 import numpy as np
@@ -68,4 +69,55 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
+
+
+def prepare_camera_for_render(cam, device="cuda"):
+    """
+    Pre-compute and cache gsplat-compatible tensors on the camera object.
+
+    This avoids per-render DeviceCopy / tensor-construction overhead that
+    triggers torch._inductor warnings and costs host→device transfer time.
+    Call once per camera after scene load (before training starts).
+    """
+    if hasattr(cam, "_gsplat_ready") and cam._gsplat_ready:
+        return
+
+    # View matrix: Inria stores transpose of W2C; gsplat expects actual W2C.
+    cam._gsplat_viewmat = (
+        cam.world_view_transform
+        .transpose(0, 1)
+        .to(device=device, dtype=torch.float32)
+        .contiguous()
+    )
+
+    # Intrinsics matrix K
+    W = int(cam.image_width)
+    H = int(cam.image_height)
+    fx = W / (2.0 * math.tan(cam.FoVx / 2.0))
+    fy = H / (2.0 * math.tan(cam.FoVy / 2.0))
+    cx = W / 2.0
+    cy = H / 2.0
+
+    cam._gsplat_K = torch.empty((3, 3), device=device, dtype=torch.float32)
+    cam._gsplat_K.zero_()
+    cam._gsplat_K[0, 0] = fx
+    cam._gsplat_K[1, 1] = fy
+    cam._gsplat_K[0, 2] = cx
+    cam._gsplat_K[1, 2] = cy
+    cam._gsplat_K[2, 2] = 1.0
+    cam._gsplat_K = cam._gsplat_K.contiguous()
+
+    # Camera center (float32, same dtype as means)
+    cam._gsplat_camera_center = (
+        cam.camera_center
+        .to(device=device, dtype=torch.float32)
+        .view(1, 3)
+        .contiguous()
+    )
+
+    # Ensure original image is on GPU (noop if already there)
+    if hasattr(cam, "original_image") and cam.original_image.device.type != device:
+        cam.original_image = cam.original_image.to(device=device).contiguous()
+
+    cam._gsplat_ready = True
 
