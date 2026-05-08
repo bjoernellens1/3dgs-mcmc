@@ -94,10 +94,8 @@ def compute_effective_count_loss(
     q = q_start + (q_end - q_start) * alpha_q
 
     N_target = target_scale * q
-    loss = effective_count_loss_core(opacities, N_target, target_scale, dead_threshold, softness)
-    # Recompute N_eff for logging (detached)
-    N_eff = compute_effective_count(opacities, dead_threshold, softness).detach()
-    return loss, N_eff, N_target
+    loss, N_eff = effective_count_loss_core(opacities, N_target, target_scale, dead_threshold, softness)
+    return loss, N_eff.detach(), N_target
 
 
 def compute_opacity_entropy_loss(opacities):

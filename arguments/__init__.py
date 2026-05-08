@@ -161,14 +161,14 @@ class OptimizationParams(ParamGroup):
         self.taming_scale_importance = 25.0
         self.taming_count_importance = 0.1
         self.taming_blend_importance = 50.0
-        # torch.compile configuration
-        self.compile_mode = "reduce-overhead"
+        # torch.compile configuration (off by default — only opt-in for ablation)
+        self.compile_mode = "off"
         self.compile_dynamic = True
-        self.compile_after_iter = 500
-        self.compile_sh = True
-        self.compile_energy = True
-        self.compile_utility = True
-        self.compile_reg = True
+        self.compile_after_iter = 12000
+        self.compile_sh = False
+        self.compile_energy = False
+        self.compile_utility = False
+        self.compile_reg = False
         # Persistent web viewer. Default-on; use --no-web-viewer to disable.
         self.web_viewer_enabled = True
         self.web_viewer_port = 6010
