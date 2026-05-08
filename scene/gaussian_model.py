@@ -205,17 +205,54 @@ class GaussianModel:
                 param_group['lr'] = lr
                 return lr
 
-    def normalize_rotation_params(self):
+    def normalize_rotation_params(self, mask=None):
         with torch.no_grad():
-            self._rotation.copy_(torch.nn.functional.normalize(self._rotation, dim=1))
+            if mask is None:
+                self._rotation.copy_(torch.nn.functional.normalize(self._rotation, dim=1, eps=1e-8))
+            else:
+                self._rotation[mask] = torch.nn.functional.normalize(
+                    self._rotation[mask], dim=1, eps=1e-8
+                )
 
-    def prepare_selective_adam_step(self):
+    def prepare_selective_adam_step(self, allow_dense_grads=False):
+        """
+        Prepare gradients and state tensors for SelectiveAdam step.
+
+        IMPORTANT — sparse tensor semantics:
+            gsplat's ``sparse_grad=True`` returns sparse COO gradients for
+            visible Gaussians. However, SelectiveAdam's fused CUDA ``adam()``
+            kernel requires strided (dense) gradient tensors — it accesses
+            per-row gradients via direct pointer arithmetic. Therefore this
+            method **always** converts sparse COO grads to dense strided
+            before the optimizer step.
+
+        This means the training profile is:
+            **active-set / visible-row selective updates**
+        NOT:
+            fully end-to-end sparse tensor training
+
+        The active-set benefit still comes from:
+        1. Sparse rasterizer backward  → fewer grad entries computed
+        2. Active-set regularizers     → O(visible) compute
+        3. Active-set energy losses    → O(visible) compute (or periodic global)
+        4. SelectiveAdam step          → only visible rows updated
+        5. Post-backward masking       → invisible rows explicitly zeroed
+
+        Args:
+            allow_dense_grads: kept for API compatibility; dense conversion
+                is always required by the CUDA kernel regardless of this flag.
+        """
         for group in self.optimizer.param_groups:
             param = group["params"][0]
             if not param.is_contiguous():
                 param.data = param.data.contiguous()
             if param.grad is not None:
-                if getattr(param.grad, "layout", torch.strided) != torch.strided:
+                g_layout = getattr(param.grad, "layout", torch.strided)
+                if g_layout != torch.strided:
+                    # SelectiveAdam CUDA kernel requires strided (dense) grads.
+                    # Always convert — the post-backward masking in train.py
+                    # already zeros invisible rows in strided grads, and
+                    # sparse→dense naturally produces zeros for invisible rows.
                     param.grad = param.grad.to_dense().contiguous()
                 elif not param.grad.is_contiguous():
                     param.grad = param.grad.contiguous()

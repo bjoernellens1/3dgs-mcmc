@@ -45,6 +45,7 @@ from utils.energy_mcmc import (
     compute_gaussian_utility,
     compute_dead_mask,
 )
+from utils.compiled_kernels import configure_torch_compile, set_compile_iteration
 from utils.geometry_metrics import (
     update_visibility_ema,
     compute_geometry_dashboard,
@@ -176,7 +177,7 @@ def begin_stage_timer(sync=False):
     return stage_times, mark, finish
 
 
-def log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, scene, densification_strategy):
+def log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, scene, densification_strategy, num_visible=0):
     scalar_log_interval = max(1, int(getattr(args, "scalar_log_interval", 10)))
     if tb_writer and (iteration % scalar_log_interval == 0 or iteration == getattr(args, "iterations", iteration)):
         for name, seconds in stage_times.items():
@@ -200,6 +201,9 @@ def log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, sce
             "git_commit": getattr(args, "git_commit", "unknown"),
             "timing_ms": {name: seconds * 1000.0 for name, seconds in stage_times.items()},
         }
+        if num_visible > 0:
+            row["num_visible"] = num_visible
+            row["active_fraction"] = num_visible / max(row["num_gaussians"], 1)
         benchmark_file.write(json.dumps(row) + "\n")
 
 
@@ -261,6 +265,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         f"sh_update_interval={sh_update_interval}",
         flush=True,
     )
+    allow_dense_grads = bool(getattr(args, "selective_adam_allow_dense_grads", False))
+    sparse_active_set = optimizer_type == "selective_adam" and not allow_dense_grads
+    if sparse_active_set:
+        print(
+            "[sparse] active-set training enabled: sparse grads preserved, "
+            "active-set regularizers, active-set energy losses, active-set MCMC noise",
+            flush=True,
+        )
+    elif optimizer_type == "selective_adam" and allow_dense_grads:
+        print("[sparse] selective_adam with dense grads fallback (allow_dense_grads=True)", flush=True)
+    configure_torch_compile(args)
     taming_enabled = densification_strategy in {"taming", "hybrid"}
     use_energy_mcmc = args.energy_mcmc and densification_strategy in {"mcmc", "hybrid"}
     taming_weights = get_taming_score_weights(args) if taming_enabled else None
@@ -373,7 +388,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     _viewer_stream = torch.cuda.Stream() if web_viewer is not None else None
     _video_stream = torch.cuda.Stream() if video_recorder is not None else None
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
+        set_compile_iteration(iteration)
         stage_times, mark_stage, finish_stage = begin_stage_timer(sync=benchmark_sync)
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -489,29 +505,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _ssim_val = ssim(image, gt_image)  # capture for logging (already computed for loss)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - _ssim_val)
 
-        _opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
-        _scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
-        loss = loss + _opacity_reg + _scale_reg
+        # Active-set regularization: in sparse mode, only regularize visible Gaussians.
+        # This avoids dense all-Gaussian gradient traffic that defeats sparse training.
+        from utils.compiled_kernels import active_reg_core
+        if sparse_active_set:
+            _active_reg = render_pkg["visibility_filter"].detach()
+            _reg_loss = active_reg_core(
+                gaussians.get_opacity[_active_reg],
+                gaussians.get_scaling[_active_reg],
+                w_opacity=args.opacity_reg,
+                w_scale=args.scale_reg,
+            )
+        else:
+            _reg_loss = active_reg_core(
+                gaussians.get_opacity,
+                gaussians.get_scaling,
+                w_opacity=args.opacity_reg,
+                w_scale=args.scale_reg,
+            )
+        loss = loss + _reg_loss
 
         # Energy-guided MCMC losses (Stage A: soft loss steering)
         # Backward compatibility: only active when --energy_mcmc is enabled (default)
         if use_energy_mcmc:
-            # Effective count loss: steer toward target population curve
-            L_eff, N_eff, N_target = compute_effective_count_loss(
-                gaussians._opacity,  # raw, not activated (loss needs differentiable raw params)
-                iteration=iteration,
-                cap_max=args.cap_max,
-                max_iterations=opt.iterations,
-                target_splat_end=getattr(args, "mcmc_target_splat_end", None),
-                q_start=getattr(args, "mcmc_target_q_start", 0.05),
-                q_end=getattr(args, "mcmc_target_q_end", 0.85),
-                tau_N=getattr(args, "mcmc_target_tau", 0.45),
-            )
-            loss = loss + args.lambda_eff_count * L_eff
+            # In sparse mode, run differentiable energy losses only periodically as
+            # global maintenance steps. Normal sparse steps skip them to preserve
+            # the active-set profile (dense global opacity gradients defeat the
+            # selective-optimizer benefit). When they do run, they operate on the
+            # FULL opacity tensor (dense, all Gaussians) since they are global
+            # population-control signals, not per-view losses.
+            _energy_global_interval = getattr(args, "sparse_energy_global_interval", 500)
+            _run_energy = True
+            if sparse_active_set and _energy_global_interval > 0:
+                _run_energy = iteration % _energy_global_interval == 0
 
-            # Opacity entropy loss: encourage decisive alive/dead opacities
-            L_entropy = compute_opacity_entropy_loss(gaussians._opacity)  # raw, not activated
-            loss = loss + args.lambda_opacity_entropy * L_entropy
+            if _run_energy:
+                # Effective count loss: steer toward target population curve
+                L_eff, N_eff, N_target = compute_effective_count_loss(
+                    gaussians._opacity,  # raw, full (global maintenance)
+                    iteration=iteration,
+                    cap_max=args.cap_max,
+                    max_iterations=opt.iterations,
+                    target_splat_end=getattr(args, "mcmc_target_splat_end", None),
+                    q_start=getattr(args, "mcmc_target_q_start", 0.05),
+                    q_end=getattr(args, "mcmc_target_q_end", 0.85),
+                    tau_N=getattr(args, "mcmc_target_tau", 0.45),
+                )
+                loss = loss + args.lambda_eff_count * L_eff
+
+                # Opacity entropy loss: encourage decisive alive/dead opacities
+                L_entropy = compute_opacity_entropy_loss(gaussians._opacity)  # raw, full
+                loss = loss + args.lambda_opacity_entropy * L_entropy
+            else:
+                # Normal sparse step: skip differentiable energy losses
+                L_eff = None
+                L_entropy = None
+                N_eff = None
+                N_target = None
         else:
             L_eff = None
             L_entropy = None
@@ -523,6 +573,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         should_log_scalars = tb_writer and (iteration % scalar_log_interval == 0 or iteration == opt.iterations)
         if should_log_scalars:
             tb_writer.add_scalar('train_loss_patches/ssim_loss', (1.0 - _ssim_val).item(), iteration)
+            # Recompute separate reg terms for logging (no graph cost — not in backward path)
+            with torch.no_grad():
+                if sparse_active_set:
+                    _active_reg = render_pkg["visibility_filter"].detach()
+                    _opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity[_active_reg]).mean()
+                    _scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling[_active_reg]).mean()
+                else:
+                    _opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+                    _scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
             tb_writer.add_scalar('train_loss_patches/opacity_reg_term', _opacity_reg.item(), iteration)
             tb_writer.add_scalar('train_loss_patches/scale_reg_term', _scale_reg.item(), iteration)
             if use_energy_mcmc and L_eff is not None:
@@ -533,6 +592,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         mark_stage("loss")
         loss.backward()
+        # Sparse safety: zero invisible rows in strided grads so SelectiveAdam
+        # never sees stale non-zero values for invisible Gaussians.
+        # (Active-set regularizers / energy losses produce strided grads;
+        #  PyTorch autograd converts sparse + strided → strided in accumulation.)
+        if sparse_active_set and getattr(args, "selective_adam_zero_invisible_grads", True):
+            _mask_grad = render_pkg["visibility_filter"].detach()
+            for group in gaussians.optimizer.param_groups:
+                p = group["params"][0]
+                if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
+                    p.grad[~_mask_grad] = 0.0
+        # One-line gradient-layout snapshot at first iteration
+        if sparse_active_set and iteration == first_iter:
+            _layouts = {
+                group["name"]: str(getattr(group["params"][0].grad, "layout", "None"))
+                for group in gaussians.optimizer.param_groups
+            }
+            print(f"[sparse] first-iter grad layouts: {_layouts}", flush=True)
         mark_stage("backward")
 
         # Update visibility EMA for geometry dashboard
@@ -579,6 +655,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             utility = None
             temperature = 1.0
+
+        # Mask utility to active set: non-visible Gaussians keep only their
+        # opacity-based score so MCMC decisions are driven by visible Gaussians.
+        if sparse_active_set and utility is not None:
+            _active_util = render_pkg["visibility_filter"].detach()
+            utility[~_active_util] = (
+                getattr(args, "energy_w_alpha", 1.0)
+                * gaussians.get_opacity.squeeze(-1)[~_active_util]
+            )
         mark_stage("utility")
 
         taming_scores = None
@@ -631,26 +716,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration < opt.iterations:
             if optimizer_type == "selective_adam":
                 visible = render_pkg["visibility_filter"].detach().to(dtype=torch.bool).contiguous()
-                gaussians.prepare_selective_adam_step()
+                gaussians.prepare_selective_adam_step(allow_dense_grads=allow_dense_grads)
+                mark_stage("selective_adam_prepare")
                 gaussians.optimizer.step(visibility=visible)
+                mark_stage("selective_adam_step")
             else:
                 gaussians.optimizer.step()
             if pipe.gsplat_sparse_grad:
-                gaussians.normalize_rotation_params()
+                if sparse_active_set:
+                    gaussians.normalize_rotation_params(mask=visible)
+                else:
+                    gaussians.normalize_rotation_params()
+                mark_stage("rotation_normalize")
             gaussians.optimizer.zero_grad(set_to_none=True)
 
             if densification_strategy in {"mcmc", "hybrid"}:
                 with torch.no_grad():
-                    L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
+                    # Active-set MCMC noise: in sparse mode, apply noise only to
+                    # visible Gaussians to preserve the sparse profile.
+                    if sparse_active_set:
+                        _noise_idx = visible.nonzero(as_tuple=True)[0]
+                    else:
+                        _noise_idx = torch.arange(gaussians.get_xyz.shape[0], device="cuda")
+
+                    L = build_scaling_rotation(
+                        gaussians.get_scaling[_noise_idx],
+                        gaussians.get_rotation[_noise_idx],
+                    )
                     actual_covariance = L @ L.transpose(1, 2)
 
                     def op_sigmoid(x, k=100, x0=0.995):
                         return 1 / (1 + torch.exp(-k * (x - x0)))
 
-                    noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1 - gaussians.get_opacity)) * args.noise_lr * xyz_lr
+                    noise = torch.randn_like(gaussians._xyz[_noise_idx]) * (
+                        op_sigmoid(1 - gaussians.get_opacity[_noise_idx])
+                    ) * args.noise_lr * xyz_lr
                     noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-                    gaussians._xyz.add_(noise)
+                    gaussians._xyz[_noise_idx].add_(noise)
         mark_stage("optimizer")
+
+        # Track active-set statistics
+        _num_visible = int(render_pkg["visibility_filter"].sum().item())
+        _active_fraction = _num_visible / max(gaussians.get_xyz.shape[0], 1)
 
         # Progress bar, logging, geometry dashboard
         with torch.no_grad():
@@ -693,6 +800,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if should_log_scalars:
                     tb_writer.add_scalar('iterations_per_sec', it_s, iteration)
                     tb_writer.add_scalar('total_points', gaussians.get_xyz.shape[0], iteration)
+                    if optimizer_type == "selective_adam":
+                        tb_writer.add_scalar('active_set/num_visible', _num_visible, iteration)
+                        tb_writer.add_scalar('active_set/active_fraction', _active_fraction, iteration)
+                        # Periodic grad-layout dashboard: track which parameters retain
+                        # sparse COO layouts vs. dense strided after backward.
+                        _sparse_count = 0
+                        _none_count = 0
+                        for group in gaussians.optimizer.param_groups:
+                            name = group["name"]
+                            p = group["params"][0]
+                            g = p.grad
+                            if g is None:
+                                _none_count += 1
+                                tb_writer.add_scalar(f"grad_layout/{name}", -1.0, iteration)
+                            elif getattr(g, "layout", torch.strided) != torch.strided:
+                                _sparse_count += 1
+                                tb_writer.add_scalar(f"grad_layout/{name}", 1.0, iteration)
+                            else:
+                                tb_writer.add_scalar(f"grad_layout/{name}", 0.0, iteration)
+                        tb_writer.add_scalar("grad_layout/sparse_count", _sparse_count, iteration)
+                        tb_writer.add_scalar("grad_layout/none_count", _none_count, iteration)
                     tb_writer.add_scalar('train_loss_patches/psnr', psnr(image, gt_image).mean().item(), iteration)
             if (iteration in saving_iterations) or (args.save_interval > 0 and iteration % args.save_interval == 0):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -960,7 +1088,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
         mark_stage("checkpoint")
         finish_stage()
-        log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, scene, densification_strategy)
+        log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, scene, densification_strategy, num_visible=_num_visible)
 
         if _prof is not None:
             _prof.step()

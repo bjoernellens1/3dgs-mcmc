@@ -94,6 +94,10 @@ class OptimizationParams(ParamGroup):
         self.gsplat_sparse_grad = False
         self.sh_update_interval = 1
         self.parallelism_profile = "off"
+        self.selective_adam_allow_dense_grads = False
+        self.sparse_mode_detach_sh_dir = True
+        self.selective_adam_zero_invisible_grads = True
+        self.sparse_energy_global_interval = 500
         self.benchmark_dir = ""
         self.noise_lr = 5e5
         self.scale_reg = 0.01
@@ -157,6 +161,14 @@ class OptimizationParams(ParamGroup):
         self.taming_scale_importance = 25.0
         self.taming_count_importance = 0.1
         self.taming_blend_importance = 50.0
+        # torch.compile configuration
+        self.compile_mode = "reduce-overhead"
+        self.compile_dynamic = True
+        self.compile_after_iter = 500
+        self.compile_sh = True
+        self.compile_energy = True
+        self.compile_utility = True
+        self.compile_reg = True
         # Persistent web viewer. Default-on; use --no-web-viewer to disable.
         self.web_viewer_enabled = True
         self.web_viewer_port = 6010

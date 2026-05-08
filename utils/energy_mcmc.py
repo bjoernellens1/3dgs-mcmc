@@ -34,9 +34,9 @@ def _dense_grad(grad):
 def compute_effective_count(opacities, dead_threshold=0.005, softness=0.002):
     """
     Compute soft effective Gaussian count.
-    
+
     N_eff = sum_j sigmoid((alpha_j - alpha_dead) / s)
-    
+
     Args:
         opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
                    because this function participates in the loss graph and
@@ -46,8 +46,8 @@ def compute_effective_count(opacities, dead_threshold=0.005, softness=0.002):
     Returns:
         N_eff scalar tensor
     """
-    alpha = torch.sigmoid(opacities).squeeze(-1)
-    return torch.sigmoid((alpha - dead_threshold) / softness).sum()
+    from utils.compiled_kernels import effective_count_core
+    return effective_count_core(opacities, dead_threshold, softness)
 
 
 def compute_effective_count_loss(
@@ -58,9 +58,9 @@ def compute_effective_count_loss(
 ):
     """
     Loss that steers the effective Gaussian count toward a target curve.
-    
+
     L_eff = ((N_eff - N_target) / cap_max)^2
-    
+
     Args:
         opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
                    because this function participates in the loss graph.
@@ -74,46 +74,46 @@ def compute_effective_count_loss(
     Returns:
         scalar loss tensor
     """
+    from utils.compiled_kernels import effective_count_loss_core
+
     if cap_max <= 0:
         zero = torch.tensor(0.0, device=opacities.device)
         return zero, zero.detach(), 0.0
-    
+
     target_scale = target_splat_end if target_splat_end is not None and target_splat_end > 0 else cap_max
     if target_scale <= 0:
         zero = torch.tensor(0.0, device=opacities.device)
         return zero, zero.detach(), 0.0
 
     u = min(iteration / float(max(1, max_iterations)), 1.0)
-    
+
     # Exponential interpolation for q
     tau = max(tau_N, 1e-6)
     denom = 1.0 - math.exp(-1.0 / tau)
     alpha_q = (1.0 - math.exp(-u / tau)) / denom
     q = q_start + (q_end - q_start) * alpha_q
-    
-    N_eff = compute_effective_count(opacities, dead_threshold, softness)
+
     N_target = target_scale * q
-    
-    loss = ((N_eff - N_target) / target_scale) ** 2
-    return loss, N_eff.detach(), N_target
+    loss = effective_count_loss_core(opacities, N_target, target_scale, dead_threshold, softness)
+    # Recompute N_eff for logging (detached)
+    N_eff = compute_effective_count(opacities, dead_threshold, softness).detach()
+    return loss, N_eff, N_target
 
 
 def compute_opacity_entropy_loss(opacities):
     """
     Opacity entropy loss: pushes opacities toward 0 or 1 (decisive).
-    
+
     L_entropy = mean(-a log(a) - (1-a) log(1-a))
-    
+
     Minimizing entropy makes MCMC dead/alive decisions cleaner.
-    
+
     Args:
         opacities: [N, 1] raw opacity parameters (gaussians._opacity, before sigmoid)
                    because this function participates in the loss graph.
     """
-    alpha = torch.sigmoid(opacities).squeeze(-1)
-    eps = 1e-6
-    entropy = -alpha * torch.log(alpha + eps) - (1.0 - alpha) * torch.log(1.0 - alpha + eps)
-    return entropy.mean()
+    from utils.compiled_kernels import opacity_entropy_core
+    return opacity_entropy_core(opacities)
 
 
 def compute_gaussian_utility(
@@ -126,14 +126,14 @@ def compute_gaussian_utility(
 ):
     """
     Compute per-Gaussian utility score for MCMC birth/death decisions.
-    
+
     U_j = w_alpha * alpha_j
         + w_vis * v_j (single-frame visibility)
         + w_support * support_j (multi-view EMA visibility)
         + w_grad * norm_grad_j
         - w_scale * scale_penalty_j
         - w_dead * dead_penalty_j
-    
+
     Args:
         gaussians: GaussianModel instance
         render_pkg: dict from render() containing visibility info
@@ -142,55 +142,47 @@ def compute_gaussian_utility(
     Returns:
         [N] utility scores tensor
     """
+    from utils.compiled_kernels import utility_core
+
     device = gaussians.get_xyz.device
     N = gaussians.get_xyz.shape[0]
-    
+
     # Opacity term: get_opacity is already activated (sigmoid applied)
     alpha = gaussians.get_opacity.squeeze(-1)
-    
+
     # Visibility term (current frame)
     visibility = render_pkg.get("visibility_filter", torch.ones(N, device=device, dtype=torch.bool))
     v = visibility.float()
-    
+
     # Support EMA term (multi-view visibility, not just current frame)
     support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else v
-    
+
     # Gradient term: norm of xyz gradient
     # NOTE: requires that loss.backward() has been called
     xyz_grad = torch.zeros(N, device=device)
     grad = _dense_grad(gaussians._xyz.grad)
     if grad is not None:
         xyz_grad = grad.norm(dim=1)
-    
+
     opacity_grad = torch.zeros(N, device=device)
     grad = _dense_grad(gaussians._opacity.grad)
     if grad is not None:
         opacity_grad = grad.abs().squeeze(-1)
-    
+
     scale_grad = torch.zeros(N, device=device)
     grad = _dense_grad(gaussians._scaling.grad)
     if grad is not None:
         scale_grad = grad.norm(dim=1)
-    
-    norm_grad = xyz_grad + beta_opacity * opacity_grad + beta_scale * scale_grad
-    
+
     # Scale penalty: penalize oversized Gaussians
     max_scale = gaussians.get_scaling.max(dim=1).values
-    scale_penalty = torch.clamp(max_scale - 0.1, min=0.0) ** 2
-    
-    # Dead penalty
-    dead_penalty = (alpha < alpha_dead).float()
-    
-    utility = (
-        w_alpha * alpha
-        + w_vis * v
-        + w_support * support
-        + w_grad * norm_grad
-        - w_scale * scale_penalty
-        - w_dead * dead_penalty
+
+    return utility_core(
+        alpha, v, support, xyz_grad, opacity_grad, scale_grad, max_scale,
+        w_alpha=w_alpha, w_vis=w_vis, w_support=w_support, w_grad=w_grad,
+        w_scale=w_scale, w_dead=w_dead, beta_opacity=beta_opacity,
+        beta_scale=beta_scale, alpha_dead=alpha_dead,
     )
-    
-    return utility
 
 
 def compute_dead_mask(

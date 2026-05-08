@@ -215,7 +215,7 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     # Python-side SH evaluation to bypass gsplat ROCm SH backward kernel.
     # Optimized: avoid pc.get_features round-trip, slice only active coeffs,
     # and special-case degree 0 to skip eval_sh entirely.
-    from utils.sh_utils import eval_sh
+    from utils.compiled_kernels import eval_sh_rgb
 
     if pc.active_sh_degree == 0:
         colors = torch.clamp(pc._features_dc[:, 0, :] + 0.5, 0.0, 1.0).contiguous()
@@ -228,11 +228,14 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         shs_view = torch.cat((features_dc, features_rest), dim=2).contiguous()
 
         cam_center = viewpoint_camera.camera_center.to(device=device, dtype=means.dtype).view(1, 3)
-        dir_pp = means - cam_center
+        # In sparse mode, detach means from direction to avoid dense position
+        # gradients through the Python SH evaluation graph.
+        dir_source = means.detach() if (sparse_grad and getattr(pipe, "sparse_mode_detach_sh_dir", True)) else means
+        dir_pp = dir_source - cam_center
         dir_pp_normalized = torch.nn.functional.normalize(dir_pp, dim=1, eps=1e-8)
 
         colors = torch.clamp(
-            eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5,
+            eval_sh_rgb(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5,
             0.0,
             1.0,
         ).contiguous()
