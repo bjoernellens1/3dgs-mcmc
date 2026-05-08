@@ -314,7 +314,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         return iteration % strategy_log_interval == 0 or iteration == opt.iterations
 
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
