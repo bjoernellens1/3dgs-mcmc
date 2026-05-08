@@ -284,17 +284,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("[sparse] selective_adam with dense grads fallback (allow_dense_grads=True)", flush=True)
 
     # Growth-aware compile activation: never compile while N is still changing.
+    # MCMC stops growth at mcmc_stop_growth_iter; taming/hybrid at densify_until_iter.
     if getattr(args, "compile_mode", "off") != "off":
-        growth_stop = max(
-            int(getattr(opt, "mcmc_stop_growth_iter", 0)),
-            int(getattr(opt, "densify_until_iter", 0)),
-        )
+        if densification_strategy == "mcmc":
+            growth_stop = int(getattr(opt, "mcmc_stop_growth_iter", 12000))
+        else:
+            growth_stop = int(getattr(opt, "densify_until_iter", 25000))
         margin = int(getattr(args, "compile_growth_margin", 500))
         old_after = int(getattr(args, "compile_after_iter", 0))
         args.compile_after_iter = max(old_after, growth_stop + margin)
         print(
             f"[compiled-kernels] growth-aware compile_after_iter={args.compile_after_iter} "
-            f"(growth_stop={growth_stop}, margin={margin})",
+            f"(strategy={densification_strategy}, growth_stop={growth_stop}, margin={margin})",
             flush=True,
         )
 
