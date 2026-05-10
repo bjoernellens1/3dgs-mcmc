@@ -10,10 +10,20 @@
 #
 
 import math
+from dataclasses import dataclass
 import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+
+
+@dataclass
+class GsplatCameraTensors:
+    viewmat: torch.Tensor
+    K: torch.Tensor
+    camera_center: torch.Tensor
+    width: int
+    height: int
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -71,6 +81,45 @@ class MiniCam:
         self.camera_center = view_inv[3][:3]
 
 
+def make_gsplat_camera_tensors(cam, device="cuda"):
+    target = torch.device(device)
+    width = int(cam.image_width)
+    height = int(cam.image_height)
+
+    viewmat = (
+        cam.world_view_transform
+        .transpose(0, 1)
+        .to(device=target, dtype=torch.float32)
+        .contiguous()
+    )
+
+    fx = width / (2.0 * math.tan(cam.FoVx / 2.0))
+    fy = height / (2.0 * math.tan(cam.FoVy / 2.0))
+    cx = width / 2.0
+    cy = height / 2.0
+    K = torch.zeros((3, 3), device=target, dtype=torch.float32)
+    K[0, 0] = fx
+    K[1, 1] = fy
+    K[0, 2] = cx
+    K[1, 2] = cy
+    K[2, 2] = 1.0
+
+    camera_center = (
+        cam.camera_center
+        .to(device=target, dtype=torch.float32)
+        .view(1, 3)
+        .contiguous()
+    )
+
+    return GsplatCameraTensors(
+        viewmat=viewmat,
+        K=K.contiguous(),
+        camera_center=camera_center,
+        width=width,
+        height=height,
+    )
+
+
 def prepare_camera_for_render(cam, device="cuda"):
     """
     Pre-compute and cache gsplat-compatible tensors on the camera object.
@@ -79,45 +128,11 @@ def prepare_camera_for_render(cam, device="cuda"):
     triggers torch._inductor warnings and costs host→device transfer time.
     Call once per camera after scene load (before training starts).
     """
-    if hasattr(cam, "_gsplat_ready") and cam._gsplat_ready:
-        return
-
-    # View matrix: Inria stores transpose of W2C; gsplat expects actual W2C.
-    cam._gsplat_viewmat = (
-        cam.world_view_transform
-        .transpose(0, 1)
-        .to(device=device, dtype=torch.float32)
-        .contiguous()
-    )
-
-    # Intrinsics matrix K
-    W = int(cam.image_width)
-    H = int(cam.image_height)
-    fx = W / (2.0 * math.tan(cam.FoVx / 2.0))
-    fy = H / (2.0 * math.tan(cam.FoVy / 2.0))
-    cx = W / 2.0
-    cy = H / 2.0
-
-    cam._gsplat_K = torch.empty((3, 3), device=device, dtype=torch.float32)
-    cam._gsplat_K.zero_()
-    cam._gsplat_K[0, 0] = fx
-    cam._gsplat_K[1, 1] = fy
-    cam._gsplat_K[0, 2] = cx
-    cam._gsplat_K[1, 2] = cy
-    cam._gsplat_K[2, 2] = 1.0
-    cam._gsplat_K = cam._gsplat_K.contiguous()
-
-    # Camera center (float32, same dtype as means)
-    cam._gsplat_camera_center = (
-        cam.camera_center
-        .to(device=device, dtype=torch.float32)
-        .view(1, 3)
-        .contiguous()
-    )
+    target = torch.device(device)
+    gsplat = getattr(cam, "gsplat", None)
+    if gsplat is None or gsplat.viewmat.device != target:
+        cam.gsplat = make_gsplat_camera_tensors(cam, device=target)
 
     # Ensure original image is on GPU (noop if already there)
-    if hasattr(cam, "original_image") and cam.original_image.device.type != device:
-        cam.original_image = cam.original_image.to(device=device).contiguous()
-
-    cam._gsplat_ready = True
-
+    if hasattr(cam, "original_image") and cam.original_image.device != target:
+        cam.original_image = cam.original_image.to(device=target).contiguous()

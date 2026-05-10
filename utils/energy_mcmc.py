@@ -31,6 +31,15 @@ def _dense_grad(grad):
     return grad
 
 
+def _named_grad(gaussians, legacy_attr, gsplat_key=None):
+    params = getattr(gaussians, "params", None)
+    if params is not None and gsplat_key is not None and gsplat_key in params:
+        grad = _dense_grad(params[gsplat_key].grad)
+        if grad is not None:
+            return grad
+    return _dense_grad(getattr(gaussians, legacy_attr).grad)
+
+
 def compute_effective_count(opacities, dead_threshold=0.005, softness=0.002):
     """
     Compute soft effective Gaussian count.
@@ -158,17 +167,17 @@ def compute_gaussian_utility(
     # Gradient term: norm of xyz gradient
     # NOTE: requires that loss.backward() has been called
     xyz_grad = torch.zeros(N, device=device)
-    grad = _dense_grad(gaussians._xyz.grad)
+    grad = _named_grad(gaussians, "_xyz", "means")
     if grad is not None:
         xyz_grad = grad.norm(dim=1)
 
     opacity_grad = torch.zeros(N, device=device)
-    grad = _dense_grad(gaussians._opacity.grad)
+    grad = _named_grad(gaussians, "_opacity", "opacities")
     if grad is not None:
-        opacity_grad = grad.abs().squeeze(-1)
+        opacity_grad = grad.abs().flatten()
 
     scale_grad = torch.zeros(N, device=device)
-    grad = _dense_grad(gaussians._scaling.grad)
+    grad = _named_grad(gaussians, "_scaling", "scales")
     if grad is not None:
         scale_grad = grad.norm(dim=1)
 

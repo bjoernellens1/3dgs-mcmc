@@ -126,6 +126,31 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    def as_gsplat_params(self, activated=True):
+        """
+        Return an upstream-style splat parameter mapping.
+
+        activated=True is intended for rasterization/viewer code. activated=False
+        exposes raw trainable tensors for checkpoint/export/strategy adapters.
+        """
+        if activated:
+            scales = self.get_scaling
+            quats = self.get_rotation
+            opacities = self.get_opacity.squeeze(-1)
+        else:
+            scales = self._scaling
+            quats = self._rotation
+            opacities = self._opacity.squeeze(-1)
+
+        return {
+            "means": self._xyz,
+            "scales": scales,
+            "quats": quats,
+            "opacities": opacities,
+            "sh0": self._features_dc,
+            "shN": self._features_rest,
+        }
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)

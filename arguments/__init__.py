@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.cap_max = -1
         self.init_type = "sfm"
+        self.model_layout = "gsplat"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -69,6 +70,14 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.tile_size = 16
+        self.sh_backend = "python"
+        self.near_plane = 0.01
+        self.far_plane = 1e10
+        self.radius_clip = 0.0
+        self.eps2d = 0.3
+        self.render_mode = "RGB"
+        self.absgrad = False
+        self.rasterize_mode = "classic"
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -92,6 +101,7 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "adam"
         self.gsplat_sparse_grad = False
+        self.sparse_policy = "active_set"
         self.sh_update_interval = 1
         self.parallelism_profile = "off"
         self.selective_adam_allow_dense_grads = False
@@ -100,9 +110,10 @@ class OptimizationParams(ParamGroup):
         self.sparse_energy_global_interval = 500
         self.benchmark_dir = ""
         self.noise_lr = 5e5
+        self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
-        self.densification_strategy = "mcmc"
+        self.densification_strategy = "gsplat_mcmc"
         self.mcmc_stop_growth_iter = 12000
         self.mcmc_growth_factor_start = 1.05
         self.mcmc_growth_factor_min = 1.002
@@ -169,7 +180,6 @@ class OptimizationParams(ParamGroup):
         self.compile_sh = False
         self.compile_energy = False
         self.compile_utility = False
-        self.compile_reg = False
         # Persistent web viewer. Default-on; use --no-web-viewer to disable.
         self.web_viewer_enabled = True
         self.web_viewer_port = 6010

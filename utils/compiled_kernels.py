@@ -247,6 +247,23 @@ def sh_to_rgb(deg, features_dc, features_rest, dir_pp_normalized):
         raise ValueError(f"Unsupported SH degree for compiled path: {deg}")
 
 
+def sh_to_rgb_eager(deg, features_dc, features_rest, dir_pp_normalized):
+    if deg == 1:
+        if "sh_to_rgb_deg1" in REGISTRY._eager:
+            return REGISTRY.eager("sh_to_rgb_deg1", features_dc, features_rest, dir_pp_normalized)
+        return _sh_to_rgb_deg1(features_dc, features_rest, dir_pp_normalized)
+    elif deg == 2:
+        if "sh_to_rgb_deg2" in REGISTRY._eager:
+            return REGISTRY.eager("sh_to_rgb_deg2", features_dc, features_rest, dir_pp_normalized)
+        return _sh_to_rgb_deg2(features_dc, features_rest, dir_pp_normalized)
+    elif deg == 3:
+        if "sh_to_rgb_deg3" in REGISTRY._eager:
+            return REGISTRY.eager("sh_to_rgb_deg3", features_dc, features_rest, dir_pp_normalized)
+        return _sh_to_rgb_deg3(features_dc, features_rest, dir_pp_normalized)
+    else:
+        raise ValueError(f"Unsupported SH degree for eager path: {deg}")
+
+
 def effective_count_core(opacities, dead_threshold=0.005, softness=0.002):
     return REGISTRY("effective_count_core", opacities, dead_threshold, softness)
 
@@ -295,17 +312,18 @@ def configure_torch_compile(args):
     when ``compile_mode=off``.
     """
     # --- Register all kernels (eager fallback always needed) ---
+    compile_sh = bool(getattr(args, "compile_sh", False)) or getattr(args, "sh_backend", "") == "compiled_python"
     REGISTRY.register(
         "sh_to_rgb_deg1", _sh_to_rgb_deg1,
-        enabled=bool(getattr(args, "compile_sh", False)),
+        enabled=compile_sh,
     )
     REGISTRY.register(
         "sh_to_rgb_deg2", _sh_to_rgb_deg2,
-        enabled=bool(getattr(args, "compile_sh", False)),
+        enabled=compile_sh,
     )
     REGISTRY.register(
         "sh_to_rgb_deg3", _sh_to_rgb_deg3,
-        enabled=bool(getattr(args, "compile_sh", False)),
+        enabled=compile_sh,
     )
     # Tiny helpers — default-off, opt-in for ablation
     REGISTRY.register(

@@ -30,20 +30,18 @@ except Exception:
     _web_viewer_mod = None
 
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene, GaussianModel, GsplatGaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from scene.gaussian_model import build_scaling_rotation
 from utils.mcmc_schedule import MCMCScheduleConfig, get_mcmc_schedule
 from utils.energy_mcmc import (
     compute_effective_count_loss,
     compute_opacity_entropy_loss,
     compute_gaussian_utility,
-    compute_dead_mask,
 )
 from utils.compiled_kernels import configure_torch_compile, set_compile_iteration
 from utils.geometry_metrics import (
@@ -63,6 +61,7 @@ from utils.web_viewer_media import (
     ScenePlyCacheWriter,
     parse_video_camera_indices,
 )
+from utils.strategies import make_mcmc_strategy
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -134,6 +133,37 @@ def apply_parallelism_profile(args):
         )
     if args.optimizer_type == "selective_adam":
         args.gsplat_sparse_grad = True
+
+    args.sparse_policy = getattr(args, "sparse_policy", "active_set").lower()
+    if args.sparse_policy != "active_set":
+        raise ValueError(
+            f"Unsupported --sparse_policy '{args.sparse_policy}'. Expected 'active_set'."
+        )
+
+    args.sh_backend = getattr(args, "sh_backend", "python").lower()
+    if args.sh_backend not in {"python", "compiled_python", "gsplat"}:
+        raise ValueError(
+            f"Unsupported --sh_backend '{args.sh_backend}'. "
+            "Expected 'python', 'compiled_python', or 'gsplat'."
+        )
+
+    args.model_layout = getattr(args, "model_layout", "gsplat").lower()
+    if args.model_layout not in {"gsplat", "legacy"}:
+        raise ValueError(
+            f"Unsupported --model_layout '{args.model_layout}'. Expected 'gsplat' or 'legacy'."
+        )
+    args.densification_strategy = getattr(args, "densification_strategy", "gsplat_mcmc").lower()
+    gsplat_strategies = {"gsplat_mcmc", "gsplat_energy_mcmc"}
+    if args.model_layout == "gsplat" and args.densification_strategy not in gsplat_strategies:
+        raise ValueError(
+            "--model_layout gsplat currently supports only --densification_strategy "
+            "gsplat_mcmc or gsplat_energy_mcmc. "
+            "Use --model_layout legacy for mcmc, hybrid, or taming."
+        )
+    if args.model_layout == "legacy" and args.densification_strategy in gsplat_strategies:
+        raise ValueError(
+            f"--densification_strategy {args.densification_strategy} requires --model_layout gsplat."
+        )
 
     args.sh_update_interval = max(1, int(getattr(args, "sh_update_interval", 1)))
     args.parallelism_profile = profile
@@ -213,7 +243,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     args = run_args
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, run_args=run_args)
-    gaussians = GaussianModel(dataset.sh_degree)
+    model_layout = getattr(args, "model_layout", getattr(dataset, "model_layout", "gsplat")).lower()
+    model_cls = GsplatGaussianModel if model_layout == "gsplat" else GaussianModel
+    gaussians = model_cls(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
@@ -250,7 +282,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         target_tau=getattr(opt, "mcmc_target_tau", 0.45),
     )
     densification_strategy = getattr(opt, "densification_strategy", "mcmc").lower()
-    valid_strategies = {"mcmc", "taming", "hybrid"}
+    valid_strategies = {"mcmc", "taming", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}
     if densification_strategy not in valid_strategies:
         raise ValueError(
             f"Unsupported --densification_strategy '{densification_strategy}'. "
@@ -262,13 +294,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("Please specify the maximum number of Gaussians using --cap_max.")
         exit()
     pipe.gsplat_sparse_grad = bool(getattr(opt, "gsplat_sparse_grad", False))
+    mcmc_strategy = make_mcmc_strategy(densification_strategy, gaussians=gaussians, args=args)
     optimizer_type = getattr(opt, "optimizer_type", "adam").lower()
     sh_update_interval = max(1, int(getattr(opt, "sh_update_interval", 1)))
     benchmark_file = getattr(args, "_benchmark_file", None)
     benchmark_sync = benchmark_file is not None
     print(
         f"[parallelism] profile={getattr(opt, 'parallelism_profile', 'off')} "
+        f"model_layout={model_layout} "
         f"optimizer={optimizer_type} sparse_grad={pipe.gsplat_sparse_grad} "
+        f"sparse_policy={getattr(args, 'sparse_policy', 'active_set')} "
+        f"sh_backend={getattr(pipe, 'sh_backend', 'python')} "
         f"sh_update_interval={sh_update_interval}",
         flush=True,
     )
@@ -286,7 +322,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Growth-aware compile activation: never compile while N is still changing.
     # MCMC stops growth at mcmc_stop_growth_iter; taming/hybrid at densify_until_iter.
     if getattr(args, "compile_mode", "off") != "off":
-        if densification_strategy == "mcmc":
+        if densification_strategy in {"mcmc", "gsplat_mcmc", "gsplat_energy_mcmc"}:
             growth_stop = int(getattr(opt, "mcmc_stop_growth_iter", 12000))
         else:
             growth_stop = int(getattr(opt, "densify_until_iter", 25000))
@@ -301,7 +337,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     configure_torch_compile(args)
     taming_enabled = densification_strategy in {"taming", "hybrid"}
-    use_energy_mcmc = args.energy_mcmc and densification_strategy in {"mcmc", "hybrid"}
+    use_energy_mcmc = args.energy_mcmc and densification_strategy in {"mcmc", "hybrid", "gsplat_energy_mcmc"}
     taming_weights = get_taming_score_weights(args) if taming_enabled else None
     taming_counts = None
     taming_densify_step = 0
@@ -316,6 +352,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+    mcmc_strategy.initialize_state(gaussians=gaussians, args=args)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -615,6 +652,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_count/target_count_N', int(N_target), iteration)
 
         mark_stage("loss")
+        mcmc_strategy.step_pre_backward(
+            gaussians=gaussians,
+            args=args,
+            iteration=iteration,
+            render_pkg=render_pkg,
+            loss=loss,
+        )
         loss.backward()
         # Sparse safety: zero invisible rows in strided grads so SelectiveAdam
         # never sees stale non-zero values for invisible Gaussians.
@@ -754,29 +798,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 mark_stage("rotation_normalize")
             gaussians.optimizer.zero_grad(set_to_none=True)
 
-            if densification_strategy in {"mcmc", "hybrid"}:
-                with torch.no_grad():
-                    # Active-set MCMC noise: in sparse mode, apply noise only to
-                    # visible Gaussians to preserve the sparse profile.
-                    if sparse_active_set:
-                        _noise_idx = visible.nonzero(as_tuple=True)[0]
-                    else:
-                        _noise_idx = torch.arange(gaussians.get_xyz.shape[0], device="cuda")
-
-                    L = build_scaling_rotation(
-                        gaussians.get_scaling[_noise_idx],
-                        gaussians.get_rotation[_noise_idx],
-                    )
-                    actual_covariance = L @ L.transpose(1, 2)
-
-                    def op_sigmoid(x, k=100, x0=0.995):
-                        return 1 / (1 + torch.exp(-k * (x - x0)))
-
-                    noise = torch.randn_like(gaussians._xyz[_noise_idx]) * (
-                        op_sigmoid(1 - gaussians.get_opacity[_noise_idx])
-                    ) * args.noise_lr * xyz_lr
-                    noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-                    gaussians._xyz[_noise_idx].add_(noise)
+            if densification_strategy in {"mcmc", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}:
+                mcmc_strategy.inject_noise(
+                    gaussians=gaussians,
+                    args=args,
+                    xyz_lr=xyz_lr,
+                    visible=visible if optimizer_type == "selective_adam" else None,
+                    sparse_active_set=sparse_active_set,
+                    iteration=iteration,
+                )
         mark_stage("optimizer")
 
         # Track active-set statistics
@@ -957,112 +987,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print(f"[mcmc-control] LSOM={lsom:.3f} > 0.15, suppressing growth", flush=True)
         mark_stage("schedule")
 
-        # -----------------------------------------------------------------
-        # Strategy mutation phase (AFTER optimizer step, inside no_grad)
-        # mcmc keeps the previous relocation/growth path.
-        # taming uses score-guided constructive growth only.
-        # hybrid keeps MCMC relocation and uses Taming score-guided growth.
-        # -----------------------------------------------------------------
-        if densification_strategy in {"mcmc", "hybrid"}:
-            if use_energy_mcmc:
-                with torch.no_grad():
-                    if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
-                        dead_mask = compute_dead_mask(
-                            gaussians=gaussians,
-                            utility=utility,
-                            opacity_threshold=sched["dead_opacity_threshold"],
-                            utility_quantile=0.05,
-                        )
-
-                        dead_count = int(dead_mask.sum().item())
-                        gaussians.relocate_gs_energy_guided(
-                            dead_mask=dead_mask,
-                            parent_scores=utility,
-                            temperature=temperature,
-                        )
-                        if tb_writer:
-                            tb_writer.add_scalar('mcmc/dead_count', dead_count, iteration)
-
-                        if should_log_strategy(iteration):
-                            print(
-                                f"[mcmc-reloc] iter={iteration} "
-                                f"dead={dead_count} "
-                                f"thr={sched['dead_opacity_threshold']:.5f} "
-                                f"reloc_int={sched['relocate_interval']} "
-                                f"rho={sched['rho']:.3f} "
-                                f"N={gaussians.get_xyz.shape[0]}",
-                                flush=True,
-                            )
-
-                    if densification_strategy == "mcmc" and sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
-                        before = gaussians.get_xyz.shape[0]
-                        added = gaussians.add_new_gs_energy_guided(
-                            cap_max=args.cap_max,
-                            growth_factor=sched["growth_factor"],
-                            parent_scores=utility,
-                            temperature=temperature,
-                        )
-                        after = gaussians.get_xyz.shape[0]
-                        if tb_writer:
-                            tb_writer.add_scalar('mcmc/added_count', added, iteration)
-                            tb_writer.add_scalar('mcmc/growth_delta_N', after - before, iteration)
-
-                        if should_log_strategy(iteration):
-                            print(
-                                f"[mcmc-grow] iter={iteration} "
-                                f"added={added} "
-                                f"N={before}->{after} "
-                                f"factor={sched['growth_factor']:.4f} "
-                                f"grow_int={sched['grow_interval']} "
-                                f"rho={sched['rho']:.3f}",
-                                flush=True,
-                            )
-            else:
-                # LEGACY PATH: schedule-only MCMC (no energy guidance)
-                # Kept for reproducibility and backward compatibility.
-                with torch.no_grad():
-                    if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
-                        dead_mask = (
-                            gaussians.get_opacity <= sched["dead_opacity_threshold"]
-                        ).squeeze(-1)
-
-                        dead_count = int(dead_mask.sum().item())
-                        gaussians.relocate_gs(dead_mask=dead_mask)
-                        if tb_writer:
-                            tb_writer.add_scalar('mcmc/dead_count', dead_count, iteration)
-
-                        if should_log_strategy(iteration):
-                            print(
-                                f"[mcmc-reloc] iter={iteration} "
-                                f"dead={dead_count} "
-                                f"thr={sched['dead_opacity_threshold']:.5f} "
-                                f"reloc_int={sched['relocate_interval']} "
-                                f"rho={sched['rho']:.3f} "
-                                f"N={gaussians.get_xyz.shape[0]}",
-                                flush=True,
-                            )
-
-                    if densification_strategy == "mcmc" and sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
-                        before = gaussians.get_xyz.shape[0]
-                        added = gaussians.add_new_gs(
-                            cap_max=args.cap_max,
-                            growth_factor=sched["growth_factor"],
-                        )
-                        after = gaussians.get_xyz.shape[0]
-                        if tb_writer:
-                            tb_writer.add_scalar('mcmc/added_count', added, iteration)
-                            tb_writer.add_scalar('mcmc/growth_delta_N', after - before, iteration)
-
-                        if should_log_strategy(iteration):
-                            print(
-                                f"[mcmc-grow] iter={iteration} "
-                                f"added={added} "
-                                f"N={before}->{after} "
-                                f"factor={sched['growth_factor']:.4f} "
-                                f"grow_int={sched['grow_interval']} "
-                                f"rho={sched['rho']:.3f}",
-                                flush=True,
-                            )
+        # Strategy mutation phase. The adapter shape mirrors gsplat Strategy:
+        # training owns loss/backward/optimizer, strategy owns population edits.
+        mcmc_strategy.step_post_backward(
+            gaussians=gaussians,
+            args=args,
+            sched=sched,
+            iteration=iteration,
+            utility=utility,
+            temperature=temperature,
+            use_energy_mcmc=use_energy_mcmc,
+            tb_writer=tb_writer,
+            should_log_strategy=should_log_strategy,
+            render_pkg=render_pkg,
+            lr=xyz_lr,
+        )
 
         if taming_enabled and run_taming_growth and taming_scores is not None:
             with torch.no_grad():

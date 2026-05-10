@@ -1,30 +1,15 @@
 import math
 import torch
 from gsplat.rendering import rasterization
-try:
-    from gsplat.cuda._wrapper import rasterize_to_indices_in_range
-    HAS_EXACT_TAMING_STATS = True
-except Exception:
-    rasterize_to_indices_in_range = None
-    HAS_EXACT_TAMING_STATS = False
+from utils.taming_stats import (
+    TAMING_STATS_BACKEND,
+    compute_camera_depths,
+    compute_exact_taming_stats,
+)
 
 
 def _fov2focal(fov, pixels):
     return pixels / (2.0 * math.tan(fov / 2.0))
-
-
-def _prepare_pixel_weights(pixel_weights, width, height, device):
-    weights = pixel_weights.detach()
-    if weights.dim() == 3:
-        weights = weights.mean(dim=0)
-    elif weights.dim() == 4:
-        weights = weights.mean(dim=(0, 1))
-    if weights.shape != (height, width):
-        raise ValueError(
-            f"Expected pixel_weights with spatial shape {(height, width)}, "
-            f"got {tuple(weights.shape)}"
-        )
-    return weights.to(device=device, dtype=torch.float32).contiguous()
 
 
 def _expand_packed_stat(meta, key, ids, num_points, device, dtype=torch.float32, reduce_radii=False):
@@ -38,128 +23,59 @@ def _expand_packed_stat(meta, key, ids, num_points, device, dtype=torch.float32,
     out[ids] = values.to(device=device, dtype=dtype)
     return out
 
+def _camera_tensors(viewpoint_camera, device):
+    gsplat = getattr(viewpoint_camera, "gsplat", None)
+    if gsplat is not None:
+        viewmat = gsplat.viewmat.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        K = gsplat.K.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        cam_center = gsplat.camera_center.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        return viewmat, K, cam_center
 
-def _compute_camera_depths(means, viewmat):
-    ones = torch.ones((means.shape[0], 1), device=means.device, dtype=means.dtype)
-    homog = torch.cat((means, ones), dim=1)
-    camera_space = homog @ viewmat.transpose(0, 1)
-    return camera_space[:, 2]
+    if hasattr(viewpoint_camera, "_gsplat_viewmat"):
+        viewmat = viewpoint_camera._gsplat_viewmat.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        K = viewpoint_camera._gsplat_K.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        cam_center = viewpoint_camera._gsplat_camera_center.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        return viewmat, K, cam_center
+
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(device, non_blocking=True).contiguous()
+    W = int(viewpoint_camera.image_width)
+    H = int(viewpoint_camera.image_height)
+    fx = _fov2focal(viewpoint_camera.FoVx, W)
+    fy = _fov2focal(viewpoint_camera.FoVy, H)
+    cx = W / 2.0
+    cy = H / 2.0
+    K = torch.tensor(
+        [[fx, 0.0, cx],
+         [0.0, fy, cy],
+         [0.0, 0.0, 1.0]],
+        device=device, dtype=torch.float32,
+    ).contiguous()
+    cam_center = viewpoint_camera.camera_center.to(device=device, dtype=torch.float32).view(1, 3).contiguous()
+    return viewmat, K, cam_center
 
 
-def _compute_exact_taming_stats(meta, pixel_weights, num_points, width, height, device):
-    if not HAS_EXACT_TAMING_STATS:
-        raise RuntimeError(
-            "Exact Taming stats require gsplat.cuda._wrapper.rasterize_to_indices_in_range, "
-            "which is unavailable in this gsplat build. Disable Taming scoring or install "
-            "a gsplat build that exposes this private wrapper."
-        )
+def _python_sh_colors(pc, means, cam_center, sparse_grad, pipe, update_sh_rest, compiled):
+    if pc.active_sh_degree == 0:
+        return torch.clamp(pc._features_dc[:, 0, :] + 0.5, 0.0, 1.0).contiguous()
 
-    if pixel_weights is None:
-        return {
-            "accum_weights": torch.zeros(num_points, device=device, dtype=torch.float32),
-            "accum_count": torch.zeros(num_points, device=device, dtype=torch.int32),
-            "accum_blend": torch.zeros(num_points, device=device, dtype=torch.float32),
-            "accum_dist": torch.zeros(num_points, device=device, dtype=torch.float32),
-        }
+    features_rest = pc._features_rest
+    if not update_sh_rest:
+        features_rest = features_rest.detach()
 
-    required = ("means2d", "conics", "opacities", "isect_offsets", "flatten_ids")
-    missing = [key for key in required if key not in meta or meta[key] is None]
-    if missing:
-        raise RuntimeError(
-            "Exact Taming stats require gsplat intersection metadata; "
-            f"missing keys: {missing}"
-        )
+    _cc = cam_center.to(dtype=means.dtype) if cam_center.dtype != means.dtype else cam_center
+    dir_source = means.detach() if (sparse_grad and getattr(pipe, "sparse_mode_detach_sh_dir", True)) else means
+    dir_pp = dir_source - _cc
+    dir_pp_normalized = torch.nn.functional.normalize(dir_pp, dim=1, eps=1e-8)
 
-    packed_ids = meta.get("gaussian_ids", None)
-    if packed_ids is None:
-        raise RuntimeError("Exact Taming stats currently require gsplat packed metadata.")
+    from utils.compiled_kernels import sh_to_rgb, sh_to_rgb_eager
+    if compiled:
+        return sh_to_rgb(pc.active_sh_degree, pc._features_dc, features_rest, dir_pp_normalized)
+    return sh_to_rgb_eager(pc.active_sh_degree, pc._features_dc, features_rest, dir_pp_normalized)
 
-    weights = _prepare_pixel_weights(pixel_weights, width, height, device)
-    means2d = meta["means2d"].detach().to(device=device, dtype=torch.float32).contiguous()
-    conics = meta["conics"].detach().to(device=device, dtype=torch.float32).contiguous()
-    opacities = meta["opacities"].detach().to(device=device, dtype=torch.float32).contiguous()
-    isect_offsets = meta["isect_offsets"].detach().contiguous()
-    flatten_ids = meta["flatten_ids"].detach().contiguous()
 
-    if means2d.numel() == 0 or flatten_ids.numel() == 0:
-        return {
-            "accum_weights": torch.zeros(num_points, device=device, dtype=torch.float32),
-            "accum_count": torch.zeros(num_points, device=device, dtype=torch.int32),
-            "accum_blend": torch.zeros(num_points, device=device, dtype=torch.float32),
-            "accum_dist": torch.zeros(num_points, device=device, dtype=torch.float32),
-        }
-
-    transmittances = torch.ones((1, height, width), device=device, dtype=torch.float32)
-    local_ids, pixel_ids, image_ids = rasterize_to_indices_in_range(
-        0,
-        2**31 - 1,
-        transmittances,
-        means2d[None],
-        conics[None],
-        opacities[None],
-        width,
-        height,
-        int(meta["tile_size"]),
-        isect_offsets,
-        flatten_ids,
-    )
-    if local_ids.numel() == 0:
-        return {
-            "accum_weights": torch.zeros(num_points, device=device, dtype=torch.float32),
-            "accum_count": torch.zeros(num_points, device=device, dtype=torch.int32),
-            "accum_blend": torch.zeros(num_points, device=device, dtype=torch.float32),
-            "accum_dist": torch.zeros(num_points, device=device, dtype=torch.float32),
-        }
-    if torch.any(image_ids != 0):
-        raise RuntimeError("Exact Taming stats expected a single rendered camera.")
-
-    pixel_ids = pixel_ids.long()
-    local_ids = local_ids.long()
-
-    pix_x = (pixel_ids % width).to(dtype=torch.float32)
-    pix_y = torch.div(pixel_ids, width, rounding_mode="floor").to(dtype=torch.float32)
-    xy = means2d[local_ids]
-    d_x = xy[:, 0] - pix_x
-    d_y = xy[:, 1] - pix_y
-    con = conics[local_ids]
-    power = -0.5 * (con[:, 0] * d_x.square() + con[:, 2] * d_y.square()) - con[:, 1] * d_x * d_y
-    alpha = torch.clamp(opacities[local_ids] * torch.exp(power), max=0.99)
-
-    # rasterize_to_indices_in_range returns the same accepted Gaussian/pixel
-    # intersections used by gsplat rasterization. Reconstruct the pre-hit
-    # transmittance per pixel in raster order to match Taming's T * alpha blend.
-    order = torch.argsort(pixel_ids, stable=True)
-    pixel_sorted = pixel_ids[order]
-    alpha_sorted = alpha[order]
-    log_survival = torch.log1p(-alpha_sorted.clamp(max=0.999999))
-    cumulative = torch.cumsum(log_survival, dim=0)
-    group_start = torch.ones_like(pixel_sorted, dtype=torch.bool)
-    group_start[1:] = pixel_sorted[1:] != pixel_sorted[:-1]
-    group_ids = torch.cumsum(group_start.to(torch.int64), dim=0) - 1
-    start_positions = torch.nonzero(group_start, as_tuple=False).squeeze(-1)
-    start_cum_before = cumulative[start_positions] - log_survival[start_positions]
-    exclusive = cumulative - start_cum_before[group_ids] - log_survival
-    trans_sorted = torch.exp(exclusive)
-    trans = torch.empty_like(trans_sorted)
-    trans[order] = trans_sorted
-    blend = trans * alpha
-
-    global_ids = packed_ids[local_ids].long()
-    accum_weights = torch.zeros(num_points, device=device, dtype=torch.float32)
-    accum_weights.scatter_add_(0, global_ids, weights.flatten()[pixel_ids])
-    accum_count = torch.zeros(num_points, device=device, dtype=torch.int32)
-    accum_count.scatter_add_(0, global_ids, torch.ones_like(global_ids, dtype=torch.int32))
-    accum_blend = torch.zeros(num_points, device=device, dtype=torch.float32)
-    accum_blend.scatter_add_(0, global_ids, blend.to(dtype=torch.float32))
-    accum_dist = torch.zeros(num_points, device=device, dtype=torch.float32)
-    accum_dist.scatter_add_(0, global_ids, torch.sqrt(d_x.square() + d_y.square()).to(dtype=torch.float32))
-
-    return {
-        "accum_weights": accum_weights,
-        "accum_count": accum_count,
-        "accum_blend": accum_blend,
-        "accum_dist": accum_dist,
-    }
+def _gsplat_sh_coeffs(pc, update_sh_rest):
+    features_rest = pc._features_rest if update_sh_rest else pc._features_rest.detach()
+    return torch.cat((pc._features_dc, features_rest), dim=1).contiguous()
 
 
 def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
@@ -191,26 +107,9 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     # Inria's codebase stores world_view_transform as the *transpose* of the
     # actual world-to-camera matrix. gsplat expects the actual W2C matrix.
     #
-    # Use cached tensors (prepare_camera_for_render) to avoid per-render
-    # DeviceCopy overhead. Fallback to on-the-fly construction if cache
-    # is not present (e.g. interactive viewer code paths).
-    if hasattr(viewpoint_camera, "_gsplat_viewmat"):
-        viewmat = viewpoint_camera._gsplat_viewmat
-        K = viewpoint_camera._gsplat_K
-        cam_center = viewpoint_camera._gsplat_camera_center
-    else:
-        viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(device, non_blocking=True).contiguous()
-        fx = _fov2focal(viewpoint_camera.FoVx, W)
-        fy = _fov2focal(viewpoint_camera.FoVy, H)
-        cx = W / 2.0
-        cy = H / 2.0
-        K = torch.tensor(
-            [[fx, 0.0, cx],
-             [0.0, fy, cy],
-             [0.0, 0.0, 1.0]],
-            device=device, dtype=torch.float32,
-        ).contiguous()
-        cam_center = viewpoint_camera.camera_center.to(device=device, dtype=torch.float32).view(1, 3).contiguous()
+    # Use cached camera tensors prepared by scene.cameras.prepare_camera_for_render
+    # and keep a fallback for MiniCam / interactive paths.
+    viewmat, K, cam_center = _camera_tensors(viewpoint_camera, device)
 
     viewmats = viewmat[None].contiguous()
     Ks = K[None].contiguous()
@@ -227,32 +126,29 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     # registry (utils.compiled_kernels.sh_to_rgb) for potential torch.compile
     # acceleration. Features rest is passed as full [N, 15, 3] so that function
     # input shapes remain stable across SH degree changes.
-    from utils.compiled_kernels import sh_to_rgb
-
-    if pc.active_sh_degree == 0:
-        colors = torch.clamp(pc._features_dc[:, 0, :] + 0.5, 0.0, 1.0).contiguous()
+    sh_backend = str(getattr(pipe, "sh_backend", "python")).lower()
+    if override_color is not None:
+        colors = override_color.contiguous()
+        sh_degree = None
+    elif sh_backend == "gsplat":
+        colors = _gsplat_sh_coeffs(pc, update_sh_rest=update_sh_rest)
+        sh_degree = pc.active_sh_degree
     else:
-        features_rest = pc._features_rest
-        if not update_sh_rest:
-            features_rest = features_rest.detach()
-
-        # Camera center is already cached in float32; cast to means dtype if needed
-        _cc = cam_center.to(dtype=means.dtype) if cam_center.dtype != means.dtype else cam_center
-        # In sparse mode, detach means from direction to avoid dense position
-        # gradients through the Python SH evaluation graph.
-        dir_source = means.detach() if (sparse_grad and getattr(pipe, "sparse_mode_detach_sh_dir", True)) else means
-        dir_pp = dir_source - _cc
-        dir_pp_normalized = torch.nn.functional.normalize(dir_pp, dim=1, eps=1e-8)
-
-        colors = sh_to_rgb(
-            pc.active_sh_degree, pc._features_dc, features_rest, dir_pp_normalized,
+        if sh_backend not in {"python", "compiled_python"}:
+            raise ValueError(
+                f"Unsupported SH backend '{sh_backend}'. "
+                "Expected 'python', 'compiled_python', or 'gsplat'."
+            )
+        colors = _python_sh_colors(
+            pc, means, cam_center, sparse_grad, pipe, update_sh_rest,
+            compiled=sh_backend == "compiled_python",
         )
-
-    sh_degree = None
+        sh_degree = None
 
     # tile_size=8 causes NaN gradients on ROCm/gfx1151 with wave32-patched gsplat.
     # Default is 16. See docs/ROCM_PODMAN.md.
     tile_size = getattr(pipe, "tile_size", 16)
+    render_mode = getattr(pipe, "render_mode", "RGB")
     render_colors, render_alphas, meta = rasterization(
         means=means,
         quats=quats,
@@ -263,18 +159,23 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         Ks=Ks,
         width=W,
         height=H,
-        sh_degree=None,
+        near_plane=getattr(pipe, "near_plane", 0.01),
+        far_plane=getattr(pipe, "far_plane", 1e10),
+        radius_clip=getattr(pipe, "radius_clip", 0.0),
+        eps2d=getattr(pipe, "eps2d", 0.3),
+        sh_degree=sh_degree,
         packed=True,
         tile_size=tile_size,
         backgrounds=bg,
-        render_mode="RGB",
+        render_mode=render_mode,
         sparse_grad=sparse_grad,
-        absgrad=False,
-        rasterize_mode="classic",
+        absgrad=getattr(pipe, "absgrad", False),
+        rasterize_mode=getattr(pipe, "rasterize_mode", "classic"),
     )
 
     # gsplat returns [C, H, W, 3]; Inria backend returns [3, H, W]
-    image = render_colors[0].permute(2, 0, 1).contiguous()
+    rendered = render_colors[0].permute(2, 0, 1).contiguous()
+    image = rendered[:3] if rendered.shape[0] >= 3 else rendered
 
     # Expand packed metadata back to full [N] arrays for compatibility
     N = means.shape[0]
@@ -307,6 +208,7 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
 
     result = {
         "render": image,
+        "render_full": rendered,
         "viewspace_points": screenspace_points,
         "visibility_filter": visibility_filter,
         "radii": radii,
@@ -327,17 +229,17 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
                 full_depths[meta["gaussian_ids"]] = depths.detach().to(dtype=torch.float32)
             depths = full_depths
         elif depths is None:
-            depths = _compute_camera_depths(means.detach(), viewmat.detach()).to(dtype=torch.float32)
+            depths = compute_camera_depths(means.detach(), viewmat.detach()).to(dtype=torch.float32)
         else:
             depths = depths.detach().to(dtype=torch.float32)
 
-        exact_stats = _compute_exact_taming_stats(meta, pixel_weights, N, W, H, device)
+        exact_stats = compute_exact_taming_stats(meta, pixel_weights, N, W, H, device)
         result.update({
             "gaussian_depths": depths,
             "gaussian_radii": radii_float,
             **exact_stats,
             "taming_stats_exact": True,
-            "taming_stats_backend": "gsplat_intersections",
+            "taming_stats_backend": TAMING_STATS_BACKEND,
             "taming_stats_approximation": None,
         })
 
