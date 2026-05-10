@@ -92,6 +92,24 @@ The output folder still stores only aligned-to-color depth images. The original
 topic names, frame names, and reprojection setting are recorded in
 `metadata.json`.
 
+## Camera Model Safety
+
+The extractor expects a rectified pinhole color stream. It stores the chosen
+intrinsics source in `intrinsics.json` and prefers `CameraInfo.P` when present,
+falling back to `K` otherwise.
+
+If `CameraInfo.D` contains nonzero distortion, extraction fails by default.
+Use a rectified image topic, or pass `--assume-rectified` only when the topic is
+already rectified despite nonzero distortion metadata. For inspection-only
+conversion, `--no-fail-on-distortion` downgrades this to a warning.
+
+If a color image topic uses ambiguous `8UC3`, pass
+`--rgb-encoding-override rgb8` or `--rgb-encoding-override bgr8`.
+
+For pose or odometry topics, pass `--pose-frame` unless the pose already
+publishes `world_T_camera_color_optical`. If it already is the color optical
+camera pose, pass `--pose-is-camera-frame`.
+
 ## ROS2 Live or Replay Capture
 
 Run a replay or live camera in one terminal:

@@ -26,6 +26,19 @@ def _expand_packed_stat(meta, key, ids, num_points, device, dtype=torch.float32,
 def _camera_tensors(viewpoint_camera, device):
     gsplat = getattr(viewpoint_camera, "gsplat", None)
     if gsplat is not None:
+        target = torch.device(device)
+        if (
+            gsplat.viewmat.device == target
+            and gsplat.K.device == target
+            and gsplat.camera_center.device == target
+            and gsplat.viewmat.dtype == torch.float32
+            and gsplat.K.dtype == torch.float32
+            and gsplat.camera_center.dtype == torch.float32
+            and gsplat.viewmat.is_contiguous()
+            and gsplat.K.is_contiguous()
+            and gsplat.camera_center.is_contiguous()
+        ):
+            return gsplat.viewmat, gsplat.K, gsplat.camera_center
         viewmat = gsplat.viewmat.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
         K = gsplat.K.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
         cam_center = gsplat.camera_center.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()

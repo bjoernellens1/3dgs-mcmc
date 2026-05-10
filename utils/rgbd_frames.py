@@ -20,6 +20,9 @@ class CameraIntrinsics:
     depth_scale: float = 1000.0
     camera_frame: str = ""
     world_frame: str = ""
+    distortion_model: str = ""
+    D: Optional[list] = None
+    intrinsics_source: str = "K"
 
 
 @dataclass
@@ -42,6 +45,7 @@ class RGBDFrameSource:
 def read_intrinsics(path):
     with open(path, "r") as f:
         data = json.load(f)
+    distortion = data.get("D", [])
     return CameraIntrinsics(
         width=int(data["width"]),
         height=int(data["height"]),
@@ -52,6 +56,9 @@ def read_intrinsics(path):
         depth_scale=float(data.get("depth_scale", 1000.0)),
         camera_frame=str(data.get("camera_frame", "")),
         world_frame=str(data.get("world_frame", "")),
+        distortion_model=str(data.get("distortion_model", "")),
+        D=list(distortion) if distortion is not None else [],
+        intrinsics_source=str(data.get("intrinsics_source", "K")),
     )
 
 
@@ -119,10 +126,16 @@ def write_sequence_frame(root, frame, depth_scale=None):
     return record
 
 
-def decode_color_image(data, encoding):
+def decode_color_image(data, encoding, encoding_override=None):
     enc = str(encoding).lower()
+    if encoding_override:
+        enc = str(encoding_override).lower()
     arr = np.asarray(data)
-    if enc in {"rgb8", "8uc3"}:
+    if str(encoding).lower() == "8uc3" and not encoding_override:
+        raise ValueError(
+            "Ambiguous RGB image encoding 8UC3. Pass --rgb-encoding-override rgb8 or bgr8."
+        )
+    if enc == "rgb8":
         rgb = arr
     elif enc == "bgr8":
         rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
@@ -224,12 +237,79 @@ def reproject_depth_to_color(
     v = v[inside]
     z_c = z_c[inside]
     flat_idx = v * color_intrinsics.width + u
-    order = np.argsort(z_c)
+    order = np.lexsort((z_c, flat_idx))
+    flat_sorted = flat_idx[order]
+    z_sorted = z_c[order]
+    unique_first = np.unique(flat_sorted, return_index=True)[1]
     flat = aligned.reshape(-1)
-    for idx, depth_value in zip(flat_idx[order], z_c[order]):
-        if flat[idx] == 0.0:
-            flat[idx] = depth_value
+    flat[flat_sorted[unique_first]] = z_sorted[unique_first]
     return aligned
+
+
+def depth_sanity(depth, intrinsics, min_depth=0.1, max_depth=8.0):
+    z = depth_to_meters(depth, intrinsics.depth_scale)
+    finite = np.isfinite(z)
+    valid = finite & (z > float(min_depth)) & (z < float(max_depth))
+    if valid.any():
+        vals = z[valid]
+        return {
+            "valid_ratio": float(valid.mean()),
+            "median_m": float(np.median(vals)),
+            "min_m": float(vals.min()),
+            "max_m": float(vals.max()),
+        }
+    return {
+        "valid_ratio": 0.0,
+        "median_m": 0.0,
+        "min_m": 0.0,
+        "max_m": 0.0,
+    }
+
+
+def pointcloud_sanity(points, records):
+    points = np.asarray(points, dtype=np.float32)
+    if points.size == 0:
+        return {
+            "num_points": 0,
+            "bbox_min": [0.0, 0.0, 0.0],
+            "bbox_max": [0.0, 0.0, 0.0],
+            "camera_bbox_min": [0.0, 0.0, 0.0],
+            "camera_bbox_max": [0.0, 0.0, 0.0],
+            "median_camera_distance": 0.0,
+            "behind_camera_ratio": 1.0,
+        }
+
+    cams = []
+    behind = []
+    dists = []
+    sample = points
+    if points.shape[0] > 200000:
+        rng = np.random.default_rng(7)
+        sample = points[rng.choice(points.shape[0], size=200000, replace=False)]
+
+    for record in records:
+        c2w = np.asarray(record.get("c2w"), dtype=np.float32)
+        if c2w.shape != (4, 4) or not np.isfinite(c2w).all():
+            continue
+        center = c2w[:3, 3]
+        cams.append(center)
+        w2c = np.linalg.inv(c2w)
+        pts_cam = (w2c[:3, :3] @ sample.T).T + w2c[:3, 3]
+        behind.append(pts_cam[:, 2] <= 0.0)
+        dists.append(np.linalg.norm(sample - center[None, :], axis=1))
+
+    cam_arr = np.asarray(cams, dtype=np.float32) if cams else np.zeros((0, 3), dtype=np.float32)
+    behind_ratio = float(np.concatenate(behind).mean()) if behind else 0.0
+    median_dist = float(np.median(np.concatenate(dists))) if dists else 0.0
+    return {
+        "num_points": int(points.shape[0]),
+        "bbox_min": points.min(axis=0).astype(float).tolist(),
+        "bbox_max": points.max(axis=0).astype(float).tolist(),
+        "camera_bbox_min": (cam_arr.min(axis=0).astype(float).tolist() if len(cam_arr) else [0.0, 0.0, 0.0]),
+        "camera_bbox_max": (cam_arr.max(axis=0).astype(float).tolist() if len(cam_arr) else [0.0, 0.0, 0.0]),
+        "median_camera_distance": median_dist,
+        "behind_camera_ratio": behind_ratio,
+    }
 
 
 def rgbd_pointcloud_from_records(

@@ -56,7 +56,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.cap_max = -1
         self.init_type = "sfm"
-        self.model_layout = "gsplat"
+        self.model_layout = "legacy"
         self.scannet_frame_stride = 10
         self.scannet_max_frames = 0
         self.scannet_eval_hold = 20
@@ -140,13 +140,13 @@ class OptimizationParams(ParamGroup):
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
-        self.densification_strategy = "gsplat_energy_mcmc"
+        self.densification_strategy = "mcmc"
         self.mcmc_stop_growth_iter = 12000
         self.mcmc_growth_factor_start = 1.05
-        self.mcmc_growth_factor_min = 1.05
+        self.mcmc_growth_factor_min = 1.002
         self.mcmc_growth_factor_tau = 0.35
         self.mcmc_grow_interval_min = 100
-        self.mcmc_grow_interval_max = 100
+        self.mcmc_grow_interval_max = 2000
         self.mcmc_grow_tau = 0.35
         self.energy_mcmc = True
         self.lambda_eff_count = 0.1

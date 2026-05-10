@@ -1,3 +1,4 @@
+from bisect import bisect_left
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -92,18 +93,49 @@ def _pose_to_matrix(pose):
     return mat
 
 
-def _camera_info_to_intrinsics(msg, depth_scale, camera_frame="", world_frame=""):
+def _camera_info_to_intrinsics(
+    msg,
+    depth_scale,
+    camera_frame="",
+    world_frame="",
+    assume_rectified=False,
+    fail_on_distortion=True,
+):
     k = list(_field(msg, "k", "K"))
+    p = list(_field(msg, "p", "P", default=[]))
+    d = list(_field(msg, "d", "D", default=[]))
+    distortion_model = str(_field(msg, "distortion_model", default=""))
+    has_distortion = any(abs(float(v)) > 1e-12 for v in d)
+    if has_distortion and not assume_rectified:
+        message = (
+            f"CameraInfo on frame '{_frame_id(msg)}' reports nonzero distortion "
+            f"({distortion_model}, D={d}). Use a rectified image topic or pass "
+            "--assume-rectified only if the stream is already rectified."
+        )
+        if fail_on_distortion:
+            raise RuntimeError(message)
+        print(f"[RGBD] Warning: {message}")
+
+    intrinsics_source = "K"
+    if len(p) >= 12 and abs(float(p[0])) > 1e-12 and abs(float(p[5])) > 1e-12:
+        fx, fy, cx, cy = float(p[0]), float(p[5]), float(p[2]), float(p[6])
+        intrinsics_source = "P_rectified"
+    else:
+        fx, fy, cx, cy = float(k[0]), float(k[4]), float(k[2]), float(k[5])
+
     return CameraIntrinsics(
         width=int(msg.width),
         height=int(msg.height),
-        fx=float(k[0]),
-        fy=float(k[4]),
-        cx=float(k[2]),
-        cy=float(k[5]),
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
         depth_scale=float(depth_scale),
         camera_frame=camera_frame or _frame_id(msg),
         world_frame=world_frame,
+        distortion_model=distortion_model,
+        D=[float(v) for v in d],
+        intrinsics_source=intrinsics_source,
     )
 
 
@@ -139,24 +171,52 @@ def _image_msg_to_array(msg):
 
 class _TfGraph:
     def __init__(self):
-        self.transforms: List[Tuple[float, str, str, np.ndarray]] = []
+        self.transforms_by_edge: Dict[Tuple[str, str], List[Tuple[float, np.ndarray]]] = {}
+        self.static_transforms: Dict[Tuple[str, str], np.ndarray] = {}
+        self._sorted_edges = set()
+        self._stamp_cache: Dict[Tuple[str, str], List[float]] = {}
 
-    def add(self, stamp, parent, child, matrix):
+    def add(self, stamp, parent, child, matrix, is_static=False):
         if parent and child:
-            self.transforms.append((float(stamp), str(parent), str(child), np.asarray(matrix, dtype=np.float32)))
+            key = (str(parent), str(child))
+            mat = np.asarray(matrix, dtype=np.float32)
+            if is_static:
+                self.static_transforms[key] = mat
+                return
+            self.transforms_by_edge.setdefault(key, []).append((float(stamp), mat))
+            self._sorted_edges.discard(key)
+            self._stamp_cache.pop(key, None)
+
+    def _nearest_dynamic(self, key, timestamp, tolerance):
+        entries = self.transforms_by_edge.get(key)
+        if not entries:
+            return None
+        if key not in self._sorted_edges:
+            entries.sort(key=lambda item: item[0])
+            self._sorted_edges.add(key)
+            self._stamp_cache[key] = [stamp for stamp, _ in entries]
+        stamps = self._stamp_cache[key]
+        idx = bisect_left(stamps, timestamp)
+        candidates = []
+        if idx < len(entries):
+            candidates.append(entries[idx])
+        if idx > 0:
+            candidates.append(entries[idx - 1])
+        if not candidates:
+            return None
+        stamp, mat = min(candidates, key=lambda item: abs(item[0] - timestamp))
+        if tolerance is not None and abs(stamp - timestamp) > tolerance:
+            return None
+        return mat
 
     def _nearest_edges(self, timestamp, tolerance):
-        best: Dict[Tuple[str, str], Tuple[float, np.ndarray]] = {}
-        for stamp, parent, child, mat in self.transforms:
-            dt = abs(stamp - timestamp)
-            # /tf_static is commonly stamped at zero and should remain valid.
-            if stamp != 0.0 and tolerance is not None and dt > tolerance:
-                continue
-            key = (parent, child)
-            if key not in best or dt < best[key][0]:
-                best[key] = (dt, mat)
+        best: Dict[Tuple[str, str], np.ndarray] = dict(self.static_transforms)
+        for key in self.transforms_by_edge.keys():
+            mat = self._nearest_dynamic(key, timestamp, tolerance)
+            if mat is not None:
+                best[key] = mat
         graph: Dict[str, List[Tuple[str, np.ndarray]]] = {}
-        for (parent, child), (_, mat) in best.items():
+        for (parent, child), mat in best.items():
             graph.setdefault(parent, []).append((child, mat))
             graph.setdefault(child, []).append((parent, np.linalg.inv(mat)))
         return graph
@@ -190,6 +250,8 @@ class RosbagFileRGBDSource(RGBDFrameSource):
         pose_source="tf",
         world_frame="map",
         camera_frame="camera_color_optical_frame",
+        pose_frame="",
+        pose_is_camera_frame=False,
         tf_topic="/tf",
         tf_static_topic="/tf_static",
         pose_topic="",
@@ -204,6 +266,9 @@ class RosbagFileRGBDSource(RGBDFrameSource):
         depth_scale=1000.0,
         min_depth=0.1,
         max_depth=8.0,
+        assume_rectified=False,
+        fail_on_distortion=True,
+        rgb_encoding_override="",
     ):
         self.bag = Path(bag)
         self.rgb_topic = rgb_topic
@@ -212,6 +277,8 @@ class RosbagFileRGBDSource(RGBDFrameSource):
         self.pose_source = pose_source
         self.world_frame = world_frame
         self.camera_frame = camera_frame
+        self.pose_frame = pose_frame
+        self.pose_is_camera_frame = bool(pose_is_camera_frame)
         self.tf_topic = tf_topic
         self.tf_static_topic = tf_static_topic
         self.pose_topic = pose_topic
@@ -226,15 +293,20 @@ class RosbagFileRGBDSource(RGBDFrameSource):
         self.depth_scale = float(depth_scale)
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
+        self.assume_rectified = bool(assume_rectified)
+        self.fail_on_distortion = bool(fail_on_distortion)
+        self.rgb_encoding_override = rgb_encoding_override
 
     def __iter__(self):
         AnyReader = _optional_rosbags()
-        rgb_msgs = []
+        pending_rgb = []
         depth_msgs = []
         pose_msgs = []
         color_intrinsics = None
         depth_intrinsics = None
         tf_graph = _TfGraph()
+        emitted = 0
+        rgb_seen = 0
 
         topics = {
             self.rgb_topic,
@@ -248,6 +320,118 @@ class RosbagFileRGBDSource(RGBDFrameSource):
         if self.depth_camera_info_topic:
             topics.add(self.depth_camera_info_topic)
 
+        def nearest(buffer, timestamp):
+            if not buffer:
+                return None, None
+            times = np.array([item[0] for item in buffer], dtype=np.float64)
+            idx = int(np.argmin(np.abs(times - timestamp)))
+            return idx, buffer[idx]
+
+        def trim_buffers(current_time):
+            cutoff = float(current_time) - max(self.max_association_dt, self.tf_tolerance) * 8.0
+            depth_msgs[:] = [item for item in depth_msgs if item[0] >= cutoff]
+            pose_msgs[:] = [item for item in pose_msgs if item[0] >= cutoff]
+            pending_rgb[:] = [item for item in pending_rgb if item[0] >= cutoff]
+
+        def pose_to_camera_c2w(pose_mat, timestamp):
+            if self.pose_source == "tf" or self.pose_is_camera_frame:
+                return pose_mat
+            pose_frame = self.pose_frame
+            if not pose_frame:
+                raise RuntimeError(
+                    "pose_source is pose/odom but --pose-frame was not provided. "
+                    "Pass --pose-is-camera-frame only if the pose topic already publishes world_T_camera."
+                )
+            if pose_frame == self.camera_frame:
+                return pose_mat
+            pose_to_camera = tf_graph.lookup(
+                pose_frame,
+                self.camera_frame,
+                timestamp,
+                tolerance=self.tf_tolerance,
+            )
+            if pose_to_camera is None:
+                return None
+            return pose_mat @ pose_to_camera
+
+        def try_emit_ready():
+            nonlocal emitted
+            made_progress = True
+            while made_progress and pending_rgb:
+                made_progress = False
+                rgb_time, rgb_raw, rgb_encoding = pending_rgb[0]
+                if color_intrinsics is None or not depth_msgs:
+                    return
+                depth_idx, depth_item = nearest(depth_msgs, rgb_time)
+                if depth_item is None:
+                    return
+                if abs(depth_item[0] - rgb_time) > self.max_association_dt:
+                    if depth_item[0] < rgb_time:
+                        pending_rgb.pop(0)
+                        made_progress = True
+                    return
+
+                if self.pose_source == "tf":
+                    c2w = tf_graph.lookup(
+                        self.world_frame,
+                        self.camera_frame,
+                        rgb_time,
+                        tolerance=self.tf_tolerance,
+                    )
+                    if c2w is None:
+                        return
+                else:
+                    if not pose_msgs:
+                        return
+                    _, pose_item = nearest(pose_msgs, rgb_time)
+                    if pose_item is None:
+                        return
+                    if abs(pose_item[0] - rgb_time) > self.max_association_dt:
+                        if pose_item[0] < rgb_time:
+                            pending_rgb.pop(0)
+                            made_progress = True
+                        return
+                    c2w = pose_to_camera_c2w(pose_item[1], rgb_time)
+                    if c2w is None:
+                        return
+
+                depth_raw, depth_encoding = depth_item[1], depth_item[2]
+                rgb = decode_color_image(rgb_raw, rgb_encoding, encoding_override=self.rgb_encoding_override)
+                depth = decode_depth_image(depth_raw, depth_encoding)
+
+                if not self.depth_is_aligned_to_color:
+                    if depth_intrinsics is None or not self.depth_frame:
+                        return
+                    depth_to_color = tf_graph.lookup(
+                        self.color_frame,
+                        self.depth_frame,
+                        rgb_time,
+                        tolerance=self.tf_tolerance,
+                    )
+                    if depth_to_color is None:
+                        return
+                    depth = reproject_depth_to_color(
+                        depth,
+                        depth_intrinsics,
+                        color_intrinsics,
+                        depth_to_color,
+                        min_depth=self.min_depth,
+                        max_depth=self.max_depth,
+                    )
+
+                pending_rgb.pop(0)
+                emitted_frame = RGBDFrame(
+                    index=emitted,
+                    timestamp=rgb_time,
+                    rgb=rgb,
+                    depth=depth,
+                    intrinsics=color_intrinsics,
+                    c2w=c2w,
+                )
+                emitted += 1
+                made_progress = True
+                yield emitted_frame
+
         with AnyReader([self.bag]) as reader:
             connections = [c for c in reader.connections if c.topic in topics]
             if not connections:
@@ -256,8 +440,10 @@ class RosbagFileRGBDSource(RGBDFrameSource):
                 msg = reader.deserialize(rawdata, conn.msgtype)
                 timestamp = _msg_time(msg, timestamp_ns)
                 if conn.topic == self.rgb_topic:
-                    arr, enc = _image_msg_to_array(msg)
-                    rgb_msgs.append((timestamp, arr, enc))
+                    if rgb_seen % self.frame_stride == 0:
+                        arr, enc = _image_msg_to_array(msg)
+                        pending_rgb.append((timestamp, arr, enc))
+                    rgb_seen += 1
                 elif conn.topic == self.depth_topic:
                     arr, enc = _image_msg_to_array(msg)
                     depth_msgs.append((timestamp, arr, enc))
@@ -267,6 +453,8 @@ class RosbagFileRGBDSource(RGBDFrameSource):
                         depth_scale=self.depth_scale,
                         camera_frame=self.camera_frame,
                         world_frame=self.world_frame,
+                        assume_rectified=self.assume_rectified,
+                        fail_on_distortion=self.fail_on_distortion,
                     )
                 elif conn.topic == self.depth_camera_info_topic:
                     depth_intrinsics = _camera_info_to_intrinsics(
@@ -274,18 +462,31 @@ class RosbagFileRGBDSource(RGBDFrameSource):
                         depth_scale=self.depth_scale,
                         camera_frame=self.depth_frame,
                         world_frame=self.world_frame,
+                        assume_rectified=self.assume_rectified,
+                        fail_on_distortion=self.fail_on_distortion,
                     )
                 elif conn.topic in {self.tf_topic, self.tf_static_topic}:
                     for t in getattr(msg, "transforms", []):
                         tf_stamp = _stamp_to_sec(getattr(t.header, "stamp", None))
                         if tf_stamp is None or (tf_stamp == 0.0 and conn.topic != self.tf_static_topic):
                             tf_stamp = timestamp
-                        tf_graph.add(tf_stamp, str(t.header.frame_id), str(t.child_frame_id), _transform_to_matrix(t.transform))
+                        tf_graph.add(
+                            tf_stamp,
+                            str(t.header.frame_id),
+                            str(t.child_frame_id),
+                            _transform_to_matrix(t.transform),
+                            is_static=(conn.topic == self.tf_static_topic),
+                        )
                 elif conn.topic == self.pose_topic:
                     pose = _field(msg, "pose")
                     if hasattr(pose, "pose"):
                         pose = pose.pose
                     pose_msgs.append((timestamp, _pose_to_matrix(pose)))
+                trim_buffers(timestamp)
+                for frame in try_emit_ready():
+                    yield frame
+                    if self.max_frames and emitted >= self.max_frames:
+                        return
 
         if color_intrinsics is None:
             raise RuntimeError(f"No CameraInfo found on topic {self.camera_info_topic}")
@@ -295,72 +496,7 @@ class RosbagFileRGBDSource(RGBDFrameSource):
                 "Pass --depth-camera-info-topic and --depth-frame."
             )
 
-        depth_times = np.array([t for t, _, _ in depth_msgs], dtype=np.float64)
-        pose_times = np.array([t for t, _ in pose_msgs], dtype=np.float64) if pose_msgs else np.array([], dtype=np.float64)
-        emitted = 0
-        source_idx = 0
-        for rgb_time, rgb_raw, rgb_encoding in rgb_msgs:
-            if source_idx % self.frame_stride != 0:
-                source_idx += 1
-                continue
-            source_idx += 1
-            if len(depth_times) == 0:
-                break
-            depth_idx = int(np.argmin(np.abs(depth_times - rgb_time)))
-            if abs(depth_times[depth_idx] - rgb_time) > self.max_association_dt:
-                continue
-
-            if self.pose_source == "tf":
-                c2w = tf_graph.lookup(
-                    self.world_frame,
-                    self.camera_frame,
-                    rgb_time,
-                    tolerance=self.tf_tolerance,
-                )
-                if c2w is None:
-                    continue
-            else:
-                if len(pose_times) == 0:
-                    raise RuntimeError("pose_source is not tf, but no pose messages were loaded.")
-                pose_idx = int(np.argmin(np.abs(pose_times - rgb_time)))
-                if abs(pose_times[pose_idx] - rgb_time) > self.max_association_dt:
-                    continue
-                c2w = pose_msgs[pose_idx][1]
-
-            depth_raw, depth_encoding = depth_msgs[depth_idx][1], depth_msgs[depth_idx][2]
-            rgb = decode_color_image(rgb_raw, rgb_encoding)
-            depth = decode_depth_image(depth_raw, depth_encoding)
-
-            if not self.depth_is_aligned_to_color:
-                if not self.depth_frame:
-                    raise RuntimeError("Unaligned depth requested, but --depth-frame was not provided.")
-                depth_to_color = tf_graph.lookup(
-                    self.color_frame,
-                    self.depth_frame,
-                    rgb_time,
-                    tolerance=self.tf_tolerance,
-                )
-                if depth_to_color is None:
-                    raise RuntimeError(
-                        f"Could not resolve TF transform {self.color_frame} <- {self.depth_frame}."
-                    )
-                depth = reproject_depth_to_color(
-                    depth,
-                    depth_intrinsics,
-                    color_intrinsics,
-                    depth_to_color,
-                    min_depth=self.min_depth,
-                    max_depth=self.max_depth,
-                )
-
-            yield RGBDFrame(
-                index=emitted,
-                timestamp=rgb_time,
-                rgb=rgb,
-                depth=depth,
-                intrinsics=color_intrinsics,
-                c2w=c2w,
-            )
-            emitted += 1
+        for frame in try_emit_ready():
+            yield frame
             if self.max_frames and emitted >= self.max_frames:
-                break
+                return

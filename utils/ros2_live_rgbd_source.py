@@ -39,6 +39,8 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
         pose_source="tf",
         world_frame="map",
         camera_frame="camera_color_optical_frame",
+        pose_frame="",
+        pose_is_camera_frame=False,
         tf_topic="/tf",
         tf_static_topic="/tf_static",
         pose_topic="",
@@ -54,6 +56,9 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
         depth_scale=1000.0,
         min_depth=0.1,
         max_depth=8.0,
+        assume_rectified=False,
+        fail_on_distortion=True,
+        rgb_encoding_override="",
     ):
         self.rgb_topic = rgb_topic
         self.depth_topic = depth_topic
@@ -61,6 +66,8 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
         self.pose_source = pose_source
         self.world_frame = world_frame
         self.camera_frame = camera_frame
+        self.pose_frame = pose_frame
+        self.pose_is_camera_frame = bool(pose_is_camera_frame)
         self.tf_topic = tf_topic
         self.tf_static_topic = tf_static_topic
         self.pose_topic = pose_topic
@@ -76,6 +83,9 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
         self.depth_scale = float(depth_scale)
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
+        self.assume_rectified = bool(assume_rectified)
+        self.fail_on_distortion = bool(fail_on_distortion)
+        self.rgb_encoding_override = rgb_encoding_override
 
     def __iter__(self):
         rclpy, CvBridge, CameraInfo, Image, TFMessage, PoseStamped, Odometry = _optional_ros2()
@@ -101,6 +111,8 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
                 depth_scale=self.depth_scale,
                 camera_frame=self.camera_frame,
                 world_frame=self.world_frame,
+                assume_rectified=self.assume_rectified,
+                fail_on_distortion=self.fail_on_distortion,
             )
 
         def on_depth_info(msg):
@@ -109,6 +121,8 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
                 depth_scale=self.depth_scale,
                 camera_frame=self.depth_frame,
                 world_frame=self.world_frame,
+                assume_rectified=self.assume_rectified,
+                fail_on_distortion=self.fail_on_distortion,
             )
 
         def on_depth(msg):
@@ -156,9 +170,19 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
                 if abs(pose_times[pose_idx] - rgb_time) > self.max_association_dt:
                     return
                 c2w = state["pose_msgs"][pose_idx][1]
+                if not self.pose_is_camera_frame and self.pose_frame and self.pose_frame != self.camera_frame:
+                    pose_to_camera = tf_graph.lookup(self.pose_frame, self.camera_frame, rgb_time, tolerance=self.tf_tolerance)
+                    if pose_to_camera is None:
+                        return
+                    c2w = c2w @ pose_to_camera
+                elif not self.pose_is_camera_frame and not self.pose_frame:
+                    raise RuntimeError(
+                        "pose_source is pose/odom but --pose-frame was not provided. "
+                        "Pass --pose-is-camera-frame only if the pose topic already publishes world_T_camera."
+                    )
 
             rgb_raw = bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-            rgb = decode_color_image(rgb_raw, msg.encoding)
+            rgb = decode_color_image(rgb_raw, msg.encoding, encoding_override=self.rgb_encoding_override)
             depth_raw, depth_encoding = state["depth_msgs"][depth_idx][1], state["depth_msgs"][depth_idx][2]
             depth = decode_depth_image(depth_raw, depth_encoding)
 
@@ -193,8 +217,14 @@ class ROS2LiveRGBDSource(RGBDFrameSource):
         if self.depth_camera_info_topic:
             node.create_subscription(CameraInfo, self.depth_camera_info_topic, on_depth_info, 10)
         node.create_subscription(Image, self.depth_topic, on_depth, 10)
-        node.create_subscription(TFMessage, self.tf_topic, on_tf, 50)
-        node.create_subscription(TFMessage, self.tf_static_topic, on_tf, 10)
+        node.create_subscription(TFMessage, self.tf_topic, lambda msg: on_tf(msg), 50)
+        node.create_subscription(TFMessage, self.tf_static_topic, lambda msg: [tf_graph.add(
+            float(getattr(t.header.stamp, "sec", 0)) + float(getattr(t.header.stamp, "nanosec", 0)) * 1e-9,
+            str(t.header.frame_id),
+            str(t.child_frame_id),
+            _transform_to_matrix(t.transform),
+            is_static=True,
+        ) for t in msg.transforms], 10)
         if self.pose_topic:
             msg_type = Odometry if self.pose_source == "odom" else PoseStamped
             node.create_subscription(msg_type, self.pose_topic, on_pose, 50)
