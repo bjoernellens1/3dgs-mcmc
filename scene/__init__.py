@@ -43,6 +43,25 @@ class Scene:
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, init_type=args.init_type)
+        elif (
+            os.path.exists(os.path.join(args.source_path, "color"))
+            and os.path.exists(os.path.join(args.source_path, "pose"))
+            and os.path.exists(os.path.join(args.source_path, "intrinsic"))
+        ):
+            print("Found ScanNet RGB-D scene layout.")
+            scene_info = sceneLoadTypeCallbacks["ScanNet"](
+                args.source_path,
+                args.eval,
+                frame_stride=args.scannet_frame_stride,
+                max_frames=args.scannet_max_frames,
+                eval_hold=args.scannet_eval_hold,
+                init_type=args.scannet_init,
+                depth_stride=args.scannet_depth_stride,
+                init_frames=args.scannet_init_frames,
+                max_init_points=args.scannet_max_init_points,
+                depth_scale=args.scannet_depth_scale,
+                num_pts=100000,
+            )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)

@@ -57,6 +57,14 @@ class ModelParams(ParamGroup):
         self.cap_max = -1
         self.init_type = "sfm"
         self.model_layout = "gsplat"
+        self.scannet_frame_stride = 10
+        self.scannet_max_frames = 0
+        self.scannet_eval_hold = 20
+        self.scannet_init = "rgbd"
+        self.scannet_depth_stride = 8
+        self.scannet_init_frames = 200
+        self.scannet_max_init_points = 250000
+        self.scannet_depth_scale = 1000.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

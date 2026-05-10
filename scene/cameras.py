@@ -28,7 +28,8 @@ class GsplatCameraTensors:
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 fx=None, fy=None, cx=None, cy=None,
                  ):
         super(Camera, self).__init__()
 
@@ -39,6 +40,10 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
 
         try:
             self.data_device = torch.device(data_device)
@@ -50,6 +55,8 @@ class Camera(nn.Module):
         self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+        self.width = self.image_width
+        self.height = self.image_height
 
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -93,10 +100,14 @@ def make_gsplat_camera_tensors(cam, device="cuda"):
         .contiguous()
     )
 
-    fx = width / (2.0 * math.tan(cam.FoVx / 2.0))
-    fy = height / (2.0 * math.tan(cam.FoVy / 2.0))
-    cx = width / 2.0
-    cy = height / 2.0
+    fx = getattr(cam, "fx", None)
+    fy = getattr(cam, "fy", None)
+    cx = getattr(cam, "cx", None)
+    cy = getattr(cam, "cy", None)
+    fx = float(fx) if fx is not None else width / (2.0 * math.tan(cam.FoVx / 2.0))
+    fy = float(fy) if fy is not None else height / (2.0 * math.tan(cam.FoVy / 2.0))
+    cx = float(cx) if cx is not None else width / 2.0
+    cy = float(cy) if cy is not None else height / 2.0
     K = torch.zeros((3, 3), device=target, dtype=torch.float32)
     K[0, 0] = fx
     K[1, 1] = fy

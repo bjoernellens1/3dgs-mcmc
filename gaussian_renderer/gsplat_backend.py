@@ -40,10 +40,14 @@ def _camera_tensors(viewpoint_camera, device):
     viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(device, non_blocking=True).contiguous()
     W = int(viewpoint_camera.image_width)
     H = int(viewpoint_camera.image_height)
-    fx = _fov2focal(viewpoint_camera.FoVx, W)
-    fy = _fov2focal(viewpoint_camera.FoVy, H)
-    cx = W / 2.0
-    cy = H / 2.0
+    fx = getattr(viewpoint_camera, "fx", None)
+    fy = getattr(viewpoint_camera, "fy", None)
+    cx = getattr(viewpoint_camera, "cx", None)
+    cy = getattr(viewpoint_camera, "cy", None)
+    fx = float(fx) if fx is not None else _fov2focal(viewpoint_camera.FoVx, W)
+    fy = float(fy) if fy is not None else _fov2focal(viewpoint_camera.FoVy, H)
+    cx = float(cx) if cx is not None else W / 2.0
+    cy = float(cy) if cy is not None else H / 2.0
     K = torch.tensor(
         [[fx, 0.0, cx],
          [0.0, fy, cy],
