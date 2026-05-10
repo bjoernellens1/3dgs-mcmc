@@ -65,6 +65,16 @@ class ModelParams(ParamGroup):
         self.scannet_init_frames = 200
         self.scannet_max_init_points = 250000
         self.scannet_depth_scale = 1000.0
+        self.tum_frame_stride = 1
+        self.tum_max_frames = 0
+        self.tum_eval_hold = 8
+        self.tum_init = "rgbd"
+        self.tum_depth_stride = 4
+        self.tum_init_frames = 300
+        self.tum_max_init_points = 250000
+        self.tum_depth_scale = 5000.0
+        self.tum_association_max_dt = 0.03
+        self.tum_sequence = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

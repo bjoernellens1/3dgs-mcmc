@@ -44,6 +44,27 @@ class Scene:
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, init_type=args.init_type)
         elif (
+            os.path.exists(os.path.join(args.source_path, "rgb.txt"))
+            and os.path.exists(os.path.join(args.source_path, "depth.txt"))
+            and os.path.exists(os.path.join(args.source_path, "groundtruth.txt"))
+        ):
+            print("Found TUM RGB-D dataset layout.")
+            scene_info = sceneLoadTypeCallbacks["TUM"](
+                args.source_path,
+                args.eval,
+                frame_stride=args.tum_frame_stride,
+                max_frames=args.tum_max_frames,
+                eval_hold=args.tum_eval_hold,
+                init_type=args.tum_init,
+                depth_stride=args.tum_depth_stride,
+                init_frames=args.tum_init_frames,
+                max_init_points=args.tum_max_init_points,
+                depth_scale=args.tum_depth_scale,
+                association_max_dt=args.tum_association_max_dt,
+                sequence=args.tum_sequence,
+                num_pts=100000,
+            )
+        elif (
             os.path.exists(os.path.join(args.source_path, "color"))
             and os.path.exists(os.path.join(args.source_path, "pose"))
             and os.path.exists(os.path.join(args.source_path, "intrinsic"))
