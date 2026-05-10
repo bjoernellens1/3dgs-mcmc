@@ -65,6 +65,23 @@ class Scene:
                 num_pts=100000,
             )
         elif (
+            os.path.exists(os.path.join(args.source_path, "frames.jsonl"))
+            and os.path.exists(os.path.join(args.source_path, "intrinsics.json"))
+        ):
+            print("Found generic RGB-D sequence layout.")
+            scene_info = sceneLoadTypeCallbacks["RGBDSequence"](
+                args.source_path,
+                args.eval,
+                eval_hold=args.rgbd_eval_hold,
+                init_type=args.init_type,
+                depth_stride=args.rgbd_depth_stride,
+                init_frames=args.rgbd_init_frames,
+                max_init_points=args.rgbd_max_init_points,
+                min_depth=args.rgbd_min_depth,
+                max_depth=args.rgbd_max_depth,
+                num_pts=100000,
+            )
+        elif (
             os.path.exists(os.path.join(args.source_path, "color"))
             and os.path.exists(os.path.join(args.source_path, "pose"))
             and os.path.exists(os.path.join(args.source_path, "intrinsic"))

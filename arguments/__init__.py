@@ -75,6 +75,12 @@ class ModelParams(ParamGroup):
         self.tum_depth_scale = 5000.0
         self.tum_association_max_dt = 0.03
         self.tum_sequence = ""
+        self.rgbd_eval_hold = 8
+        self.rgbd_depth_stride = 4
+        self.rgbd_init_frames = 300
+        self.rgbd_max_init_points = 250000
+        self.rgbd_min_depth = 0.1
+        self.rgbd_max_depth = 8.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
