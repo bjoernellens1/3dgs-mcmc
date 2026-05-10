@@ -11,12 +11,25 @@ class ScheduledMCMCStrategy:
 
     def __init__(self, name):
         self.name = name
+        self._next_reloc_iter = None
+        self._next_grow_iter = None
 
     def initialize_state(self, **_kwargs):
         return {}
 
     def step_pre_backward(self, **_kwargs):
         return None
+
+    def _due(self, name, iteration, interval, start_iter):
+        attr = f"_next_{name}_iter"
+        next_iter = getattr(self, attr, None)
+        if next_iter is None:
+            next_iter = int(start_iter) + max(1, int(interval))
+            setattr(self, attr, next_iter)
+        if int(iteration) < next_iter:
+            return False
+        setattr(self, attr, int(iteration) + max(1, int(interval)))
+        return True
 
     def inject_noise(self, gaussians, args, xyz_lr, visible=None, sparse_active_set=False, iteration=0):
         if iteration > int(getattr(args, "mcmc_noise_stop_iter", getattr(args, "iterations", 30_000))):
@@ -64,7 +77,9 @@ class ScheduledMCMCStrategy:
         should_log = should_log_strategy or (lambda _iteration: False)
         if use_energy_mcmc:
             with torch.no_grad():
-                if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
+                if sched["allow_relocation"] and self._due(
+                    "reloc", iteration, sched["relocate_interval"], getattr(args, "densify_from_iter", 500)
+                ):
                     dead_mask = compute_dead_mask(
                         gaussians=gaussians,
                         utility=utility,
@@ -82,7 +97,9 @@ class ScheduledMCMCStrategy:
                         gaussians.get_xyz.shape[0],
                     )
 
-                if self.name == "mcmc" and sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
+                if self.name == "mcmc" and sched["allow_growth"] and self._due(
+                    "grow", iteration, sched["grow_interval"], getattr(args, "densify_from_iter", 500)
+                ):
                     before = gaussians.get_xyz.shape[0]
                     added = gaussians.add_new_gs_energy_guided(
                         cap_max=args.cap_max,
@@ -94,13 +111,17 @@ class ScheduledMCMCStrategy:
             return
 
         with torch.no_grad():
-            if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
+            if sched["allow_relocation"] and self._due(
+                "reloc", iteration, sched["relocate_interval"], getattr(args, "densify_from_iter", 500)
+            ):
                 dead_mask = (gaussians.get_opacity <= sched["dead_opacity_threshold"]).squeeze(-1)
                 dead_count = int(dead_mask.sum().item())
                 gaussians.relocate_gs(dead_mask=dead_mask)
                 self._log_reloc(tb_writer, should_log, iteration, dead_count, sched, gaussians.get_xyz.shape[0])
 
-            if self.name == "mcmc" and sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
+            if self.name == "mcmc" and sched["allow_growth"] and self._due(
+                "grow", iteration, sched["grow_interval"], getattr(args, "densify_from_iter", 500)
+            ):
                 before = gaussians.get_xyz.shape[0]
                 added = gaussians.add_new_gs(
                     cap_max=args.cap_max,
@@ -285,6 +306,8 @@ class GsplatEnergyMCMCStrategy:
         self.strategy = None
         self.state = None
         self.noise_stop_iter = None
+        self._next_reloc_iter = None
+        self._next_grow_iter = None
 
     def initialize_state(self, gaussians, args, **_kwargs):
         from gsplat.strategy import MCMCStrategy
@@ -317,6 +340,17 @@ class GsplatEnergyMCMCStrategy:
         # Like upstream MCMCStrategy, this strategy injects noise in step_post_backward.
         return None
 
+    def _due(self, name, iteration, interval, start_iter):
+        attr = f"_next_{name}_iter"
+        next_iter = getattr(self, attr, None)
+        if next_iter is None:
+            next_iter = int(start_iter) + max(1, int(interval))
+            setattr(self, attr, next_iter)
+        if int(iteration) < next_iter:
+            return False
+        setattr(self, attr, int(iteration) + max(1, int(interval)))
+        return True
+
     def step_post_backward(
         self,
         gaussians,
@@ -343,7 +377,9 @@ class GsplatEnergyMCMCStrategy:
         n_added = 0
 
         with torch.no_grad():
-            if sched["allow_relocation"] and iteration % sched["relocate_interval"] == 0:
+            if sched["allow_relocation"] and self._due(
+                "reloc", iteration, sched["relocate_interval"], getattr(args, "densify_from_iter", 500)
+            ):
                 if use_energy_mcmc and utility is not None:
                     dead_mask = compute_dead_mask(
                         gaussians=gaussians,
@@ -366,7 +402,9 @@ class GsplatEnergyMCMCStrategy:
                     min_opacity=max(float(sched["dead_opacity_threshold"]), self.strategy.min_opacity),
                 )
 
-            if sched["allow_growth"] and iteration % sched["grow_interval"] == 0:
+            if sched["allow_growth"] and self._due(
+                "grow", iteration, sched["grow_interval"], getattr(args, "densify_from_iter", 500)
+            ):
                 n_added = self._add_energy_guided(
                     gaussians=gaussians,
                     utility=utility if use_energy_mcmc else None,

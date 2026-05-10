@@ -65,6 +65,7 @@ class ModelParams(ParamGroup):
         self.scannet_init_frames = 200
         self.scannet_max_init_points = 250000
         self.scannet_depth_scale = 1000.0
+        self.scannet_random_num_pts = 250000
         self.tum_frame_stride = 1
         self.tum_max_frames = 0
         self.tum_eval_hold = 8
@@ -75,12 +76,14 @@ class ModelParams(ParamGroup):
         self.tum_depth_scale = 5000.0
         self.tum_association_max_dt = 0.03
         self.tum_sequence = ""
+        self.tum_random_num_pts = 250000
         self.rgbd_eval_hold = 8
         self.rgbd_depth_stride = 4
         self.rgbd_init_frames = 300
         self.rgbd_max_init_points = 250000
         self.rgbd_min_depth = 0.1
         self.rgbd_max_depth = 8.0
+        self.rgbd_random_num_pts = 250000
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -137,13 +140,13 @@ class OptimizationParams(ParamGroup):
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
-        self.densification_strategy = "gsplat_mcmc"
+        self.densification_strategy = "gsplat_energy_mcmc"
         self.mcmc_stop_growth_iter = 12000
         self.mcmc_growth_factor_start = 1.05
-        self.mcmc_growth_factor_min = 1.002
+        self.mcmc_growth_factor_min = 1.05
         self.mcmc_growth_factor_tau = 0.35
         self.mcmc_grow_interval_min = 100
-        self.mcmc_grow_interval_max = 2000
+        self.mcmc_grow_interval_max = 100
         self.mcmc_grow_tau = 0.35
         self.energy_mcmc = True
         self.lambda_eff_count = 0.1

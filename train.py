@@ -152,7 +152,7 @@ def apply_parallelism_profile(args):
         raise ValueError(
             f"Unsupported --model_layout '{args.model_layout}'. Expected 'gsplat' or 'legacy'."
         )
-    args.densification_strategy = getattr(args, "densification_strategy", "gsplat_mcmc").lower()
+    args.densification_strategy = getattr(args, "densification_strategy", "gsplat_energy_mcmc").lower()
     gsplat_strategies = {"gsplat_mcmc", "gsplat_energy_mcmc"}
     if args.model_layout == "gsplat" and args.densification_strategy not in gsplat_strategies:
         raise ValueError(
@@ -281,7 +281,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         target_q_end=getattr(opt, "mcmc_target_q_end", 0.85),
         target_tau=getattr(opt, "mcmc_target_tau", 0.45),
     )
-    densification_strategy = getattr(opt, "densification_strategy", "mcmc").lower()
+    densification_strategy = getattr(opt, "densification_strategy", "gsplat_energy_mcmc").lower()
     valid_strategies = {"mcmc", "taming", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}
     if densification_strategy not in valid_strategies:
         raise ValueError(

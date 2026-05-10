@@ -47,6 +47,8 @@ class Scene:
             os.path.exists(os.path.join(args.source_path, "rgb.txt"))
             and os.path.exists(os.path.join(args.source_path, "depth.txt"))
             and os.path.exists(os.path.join(args.source_path, "groundtruth.txt"))
+            and os.path.isdir(os.path.join(args.source_path, "rgb"))
+            and os.path.isdir(os.path.join(args.source_path, "depth"))
         ):
             print("Found TUM RGB-D dataset layout.")
             scene_info = sceneLoadTypeCallbacks["TUM"](
@@ -62,7 +64,7 @@ class Scene:
                 depth_scale=args.tum_depth_scale,
                 association_max_dt=args.tum_association_max_dt,
                 sequence=args.tum_sequence,
-                num_pts=100000,
+                num_pts=args.tum_random_num_pts,
             )
         elif (
             os.path.exists(os.path.join(args.source_path, "frames.jsonl"))
@@ -79,7 +81,7 @@ class Scene:
                 max_init_points=args.rgbd_max_init_points,
                 min_depth=args.rgbd_min_depth,
                 max_depth=args.rgbd_max_depth,
-                num_pts=100000,
+                num_pts=args.rgbd_random_num_pts,
             )
         elif (
             os.path.exists(os.path.join(args.source_path, "color"))
@@ -98,7 +100,7 @@ class Scene:
                 init_frames=args.scannet_init_frames,
                 max_init_points=args.scannet_max_init_points,
                 depth_scale=args.scannet_depth_scale,
-                num_pts=100000,
+                num_pts=args.scannet_random_num_pts,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
