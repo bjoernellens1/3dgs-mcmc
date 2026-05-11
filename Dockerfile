@@ -137,7 +137,8 @@ RUN uv pip install --no-cache \
     opencv-python-headless \
     rich \
     jaxtyping \
-    tensorboard
+    tensorboard \
+    open3d
 
 # --- gsplat wheel from builder ----------------------------------------------
 RUN --mount=from=builder,source=/tmp/gsplat/dist,target=/gsplat-dist \

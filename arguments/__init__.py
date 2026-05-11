@@ -54,9 +54,9 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
-        self.cap_max = -1
+        self.cap_max = 15000000
         self.init_type = "sfm"
-        self.model_layout = "legacy"
+        self.model_layout = "gsplat"
         self.scannet_frame_stride = 10
         self.scannet_max_frames = 0
         self.scannet_eval_hold = 20
@@ -84,7 +84,7 @@ class ModelParams(ParamGroup):
         self.rgbd_min_depth = 0.1
         self.rgbd_max_depth = 8.0
         self.rgbd_random_num_pts = 250000
-        self.pointcloud_preprocess = "none"
+        self.pointcloud_preprocess = "open3d"
         self.pcd_voxel_size = 0.0
         self.pcd_outlier_filter = "none"
         self.pcd_stat_nb_neighbors = 20
@@ -159,7 +159,7 @@ class OptimizationParams(ParamGroup):
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
-        self.densification_strategy = "mcmc"
+        self.densification_strategy = "gsplat_energy_mcmc"
         self.mcmc_stop_growth_iter = 12000
         self.mcmc_growth_factor_start = 1.05
         self.mcmc_growth_factor_min = 1.002

@@ -14,6 +14,8 @@ import json
 import math
 import time
 import warnings
+import threading
+import queue
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -106,6 +108,119 @@ def start_output_log(args):
     args.run_log_path = log_path
     # Keep the file alive for the process lifetime.
     args._run_log_file = log_file
+
+
+class AsyncSaveWorker:
+    """Offloads checkpoint & PLY file writes to a background thread.
+
+    The main loop must pass CPU-captured snapshots (no GPU data sharing) to
+    avoid data races with concurrent ``optimizer.step()``.
+    """
+
+    def __init__(self, maxsize=2):
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            task = self._queue.get()
+            if task is None:
+                break
+            try:
+                task()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                self._queue.task_done()
+
+    def enqueue(self, fn):
+        """Enqueue a save task (callable with no args). Blocks if queue full."""
+        self._queue.put(fn)
+
+    def shutdown(self):
+        """Drain queued saves and stop the background thread."""
+        self._queue.put(None)
+        self._thread.join(timeout=120)
+
+
+def _capture_checkpoint(gaussians):
+    """Snapshot gaussian state as CPU tensors for safe async checkpoint saving."""
+    state = gaussians.capture()
+    if isinstance(state, dict):
+        return {k: _cpu_deep(v) for k, v in state.items()}
+    # Legacy layout — state is a tuple of tensors + misc scalars
+    return tuple(
+        v.detach().cpu() if isinstance(v, torch.Tensor) else v
+        for v in state
+    )
+
+
+def _cpu_deep(v):
+    """Recursively move tensors to CPU; leave non-tensors as-is."""
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu()
+    elif isinstance(v, dict):
+        return {k: _cpu_deep(val) for k, val in v.items()}
+    elif isinstance(v, (list, tuple)):
+        return type(v)(_cpu_deep(x) for x in v)
+    return v
+
+
+def _snapshot_gaussians_for_ply(gaussians):
+    """Capture gaussian parameters as CPU tensors (safe, no GPU sharing).
+
+    Called in the training loop before handing off to the background save
+    worker, avoiding data races with concurrent ``optimizer.step()``.
+    """
+    from collections import OrderedDict
+
+    if hasattr(gaussians, "params") and isinstance(gaussians.params, (dict, OrderedDict)):
+        # gsplat layout: params["opacities"] is (N,) → unsqueeze to (N, 1)
+        params = gaussians.params
+        return {
+            "attrs": gaussians.construct_list_of_attributes(),
+            "means": params["means"].detach().contiguous().cpu(),
+            "sh0": params["sh0"].detach().contiguous().cpu(),
+            "shN": params["shN"].detach().contiguous().cpu(),
+            "opacities": params["opacities"].detach().unsqueeze(-1).contiguous().cpu(),
+            "scales": params["scales"].detach().contiguous().cpu(),
+            "quats": params["quats"].detach().contiguous().cpu(),
+        }
+    else:
+        # legacy layout: _opacity is already (N, 1)
+        return {
+            "attrs": gaussians.construct_list_of_attributes(),
+            "means": gaussians._xyz.detach().contiguous().cpu(),
+            "sh0": gaussians._features_dc.detach().contiguous().cpu(),
+            "shN": gaussians._features_rest.detach().contiguous().cpu(),
+            "opacities": gaussians._opacity.detach().contiguous().cpu(),
+            "scales": gaussians._scaling.detach().contiguous().cpu(),
+            "quats": gaussians._rotation.detach().contiguous().cpu(),
+        }
+
+
+def _write_ply_from_snapshot(snap, out_path):
+    """Build and write a PLY file from a CPU snapshot (worker thread)."""
+    from plyfile import PlyData, PlyElement
+    import numpy as np
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    xyz = snap["means"].numpy()
+    normals = np.zeros_like(xyz)
+    f_dc = snap["sh0"].transpose(1, 2).flatten(start_dim=1).contiguous().numpy()
+    f_rest = snap["shN"].transpose(1, 2).flatten(start_dim=1).contiguous().numpy()
+    opacities = snap["opacities"].numpy()
+    scale = snap["scales"].numpy()
+    rotation = snap["quats"].numpy()
+
+    dtype_full = [(attr, "f4") for attr in snap["attrs"]]
+    elements = np.empty(xyz.shape[0], dtype=dtype_full)
+    attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+    elements[:] = list(map(tuple, attributes))
+    PlyData([PlyElement.describe(elements, "vertex")]).write(out_path)
 
 
 def public_namespace(args):
@@ -248,6 +363,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = model_cls(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    save_worker = AsyncSaveWorker()
 
     # Preload camera tensors to GPU to avoid per-render DeviceCopy overhead.
     from scene.cameras import prepare_camera_for_render
@@ -877,8 +993,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         tb_writer.add_scalar("grad_layout/none_count", _none_count, iteration)
                     tb_writer.add_scalar('train_loss_patches/psnr', psnr(image, gt_image).mean().item(), iteration)
             if (iteration in saving_iterations) or (args.save_interval > 0 and iteration % args.save_interval == 0):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+                print("\n[ITER {}] Saving Gaussians".format(iteration), flush=True)
+                _snap = _snapshot_gaussians_for_ply(gaussians)
+                _ply_path = os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration), "point_cloud.ply")
+                save_worker.enqueue(lambda s=_snap, p=_ply_path: _write_ply_from_snapshot(s, p))
 
             # Geometry failure dashboard — configurable to avoid sync collisions.
             geometry_log_interval = max(1, int(getattr(args, "geometry_log_interval", 500)))
@@ -1047,8 +1165,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
 
         if (iteration in checkpoint_iterations) or (args.checkpoint_interval > 0 and iteration % args.checkpoint_interval == 0):
-            print("\n[ITER {}] Saving Checkpoint".format(iteration))
-            torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            print("\n[ITER {}] Saving Checkpoint".format(iteration), flush=True)
+            _chk_state = _capture_checkpoint(gaussians)
+            _chk_iter = iteration
+            _chk_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
+            save_worker.enqueue(lambda s=_chk_state, i=_chk_iter, p=_chk_path: torch.save((s, i), p))
         mark_stage("checkpoint")
         finish_stage()
         log_stage_times(tb_writer, benchmark_file, iteration, stage_times, args, scene, densification_strategy, num_visible=_num_visible)
@@ -1063,6 +1184,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[profile] Trace saved to {_profile_path}.", flush=True)
     if scene_cache_writer is not None:
         scene_cache_writer.save(gaussians, opt.iterations, final=True)
+    save_worker.shutdown()
     if video_recorder is not None:
         video_recorder.close()
     if web_viewer is not None:
