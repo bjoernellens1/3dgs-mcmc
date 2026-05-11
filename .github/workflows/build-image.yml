@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - rocm-port
+      - feature/open3d-pointcloud-preprocess
   pull_request:
     branches:
       - main
@@ -17,17 +18,29 @@ permissions:
   contents: read
   packages: write
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: bjoernellens1/3dgs-mcmc
+
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Self-hosted runner with ROCm and enough disk (~40 GB needed during build).
+    # See docs/ROCM_GITHUB_RUNNER.md for setup instructions.
+    runs-on: [self-hosted, linux, amd64, rocm]
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Free up disk space
+        run: |
+          df -h /
+          docker system prune -af --volumes 2>/dev/null || true
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,13 +48,17 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/bjoernellens1/3dgs-mcmc
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=rocm-port,enable=${{ github.ref == 'refs/heads/rocm-port' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/feature/open3d-pointcloud-preprocess' }}
             type=sha,prefix=sha-,format=short
 
-      - name: Build and push Docker image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -49,3 +66,36 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  smoke-test:
+    # Quick validation on any runner (no GPU needed for imports).
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Pull image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+      - name: Test core imports
+        run: |
+          docker run --rm \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} \
+            python3 -c "
+          import torch
+          import gsplat
+          import numpy
+          import cv2
+          import plyfile
+          import tqdm
+          import rich
+          from jaxtyping import Float
+          from torch.utils.tensorboard import SummaryWriter
+          print('All imports OK')
+          print('PyTorch:', torch.__version__)
+          print('gsplat:', gsplat.__version__)
+          print('numpy:', numpy.__version__)
+          print('cv2:', cv2.__version__)
+          "

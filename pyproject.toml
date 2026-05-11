@@ -4,17 +4,25 @@ version = "0.1.0"
 description = "3D Gaussian Splatting with MCMC - ROCm port"
 requires-python = ">=3.10"
 dependencies = [
-    # torch and torchvision are provided by the rocm/pytorch base image.
-    # If installing outside Docker, install ROCm PyTorch wheels first.
     "numpy",
     "plyfile",
     "tqdm",
-    "opencv-python",
-    "amd-gsplat @ git+https://github.com/ROCm/gsplat.git@release/1.5.3b2",
-    # Live web viewer (optional; graceful fallback if missing)
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+dev = [
+    "rich",
+    "jaxtyping",
+    "tensorboard",
+]
+viewer = [
     "fastapi",
     "uvicorn[standard]",
     "websockets",
+]
+preprocess = [
+    "open3d",
 ]
 
 [build-system]
