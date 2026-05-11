@@ -5,6 +5,11 @@ from PIL import Image
 
 from scene.readers.common import CameraInfo, SceneInfo, fetchPlyFlexible, getNerfppNorm, storePly
 from utils.graphics_utils import focal2fov
+from utils.pointcloud_preprocess import (
+    pointcloud_cache_suffix,
+    pointcloud_preprocess_config,
+    preprocess_pointcloud,
+)
 from utils.rgbd_frames import c2w_to_camera_rt, read_frame_records, read_intrinsics, read_metadata, rgbd_pointcloud_from_records
 from utils.sh_utils import SH2RGB
 
@@ -19,6 +24,15 @@ def readRGBDSequenceSceneInfo(
     min_depth=0.1,
     max_depth=8.0,
     num_pts=100000,
+    pointcloud_preprocess="none",
+    pcd_voxel_size=0.0,
+    pcd_outlier_filter="none",
+    pcd_stat_nb_neighbors=20,
+    pcd_stat_std_ratio=2.0,
+    pcd_radius=0.05,
+    pcd_min_neighbors=4,
+    pcd_estimate_normals=False,
+    pcd_force_regenerate=False,
 ):
     intr = read_intrinsics(os.path.join(path, "intrinsics.json"))
     records = read_frame_records(os.path.join(path, "frames.jsonl"))
@@ -86,13 +100,24 @@ def readRGBDSequenceSceneInfo(
         init_type = "rgbd"
 
     if init_type == "rgbd":
-        ply_path = os.path.join(path, "init_rgbd.ply")
-        if not os.path.exists(ply_path):
+        preprocess_cfg = pointcloud_preprocess_config(
+            pointcloud_preprocess=pointcloud_preprocess,
+            pcd_voxel_size=pcd_voxel_size,
+            pcd_outlier_filter=pcd_outlier_filter,
+            pcd_stat_nb_neighbors=pcd_stat_nb_neighbors,
+            pcd_stat_std_ratio=pcd_stat_std_ratio,
+            pcd_radius=pcd_radius,
+            pcd_min_neighbors=pcd_min_neighbors,
+            pcd_estimate_normals=pcd_estimate_normals,
+            pcd_force_regenerate=pcd_force_regenerate,
+        )
+        ply_path = os.path.join(path, f"init_rgbd{pointcloud_cache_suffix(preprocess_cfg)}.ply")
+        if preprocess_cfg.force_regenerate or not os.path.exists(ply_path):
             print(
                 f"Generating RGB-D init point cloud "
                 f"(stride={depth_stride}, frames={init_frames}, max={max_init_points})..."
             )
-            points, colors, _ = rgbd_pointcloud_from_records(
+            points, colors, normals = rgbd_pointcloud_from_records(
                 root=path,
                 records=train_records,
                 intrinsics=intr,
@@ -102,7 +127,14 @@ def readRGBDSequenceSceneInfo(
                 min_depth=min_depth,
                 max_depth=max_depth,
             )
-            storePly(ply_path, points, np.clip(colors * 255.0, 0, 255))
+            points, colors, normals, _ = preprocess_pointcloud(
+                points,
+                colors,
+                normals,
+                config=preprocess_cfg,
+                label="rgbd_sequence_init",
+            )
+            storePly(ply_path, points, np.clip(colors * 255.0, 0, 255), normals=normals)
     elif init_type == "random":
         ply_path = os.path.join(path, "rgbd_random.ply")
         print(f"Generating random RGB-D sequence point cloud ({num_pts})...")

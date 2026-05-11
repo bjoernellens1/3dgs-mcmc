@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from scene.readers.common import storePly
+from utils.pointcloud_preprocess import pointcloud_preprocess_config, preprocess_pointcloud
 from utils.rgbd_frames import (
     depth_sanity,
     pointcloud_sanity,
@@ -48,7 +49,7 @@ def write_rgbd_sequence_from_source(source, out, args, metadata):
         raise RuntimeError("No RGB-D frames were written.")
 
     records = read_frame_records(out / "frames.jsonl")
-    points, colors, _ = rgbd_pointcloud_from_records(
+    points, colors, normals = rgbd_pointcloud_from_records(
         root=out,
         records=records,
         intrinsics=intrinsics,
@@ -58,7 +59,24 @@ def write_rgbd_sequence_from_source(source, out, args, metadata):
         min_depth=args.min_depth,
         max_depth=args.max_depth,
     )
-    storePly(out / "init_rgbd.ply", points, np.clip(colors * 255.0, 0, 255))
+    preprocess_cfg = pointcloud_preprocess_config(
+        pointcloud_preprocess=getattr(args, "pointcloud_preprocess", "none"),
+        pcd_voxel_size=getattr(args, "pcd_voxel_size", 0.0),
+        pcd_outlier_filter=getattr(args, "pcd_outlier_filter", "none"),
+        pcd_stat_nb_neighbors=getattr(args, "pcd_stat_nb_neighbors", 20),
+        pcd_stat_std_ratio=getattr(args, "pcd_stat_std_ratio", 2.0),
+        pcd_radius=getattr(args, "pcd_radius", 0.05),
+        pcd_min_neighbors=getattr(args, "pcd_min_neighbors", 4),
+        pcd_estimate_normals=getattr(args, "pcd_estimate_normals", False),
+    )
+    points, colors, normals, preprocess_summary = preprocess_pointcloud(
+        points,
+        colors,
+        normals,
+        config=preprocess_cfg,
+        label="rgbd_sequence_export_init",
+    )
+    storePly(out / "init_rgbd.ply", points, np.clip(colors * 255.0, 0, 255), normals=normals)
 
     depth_summary = _summarize_depth(depth_reports)
     pcd_summary = pointcloud_sanity(points, records[: args.init_frames] if args.init_frames else records)
@@ -69,6 +87,7 @@ def write_rgbd_sequence_from_source(source, out, args, metadata):
         "depth_scale": args.depth_scale,
         "depth_sanity": depth_summary,
         "pointcloud_sanity": pcd_summary,
+        "pointcloud_preprocess": preprocess_summary,
     }
     write_metadata(out / "metadata.json", final_metadata)
     metadata_tmp.unlink(missing_ok=True)

@@ -86,13 +86,13 @@ def fetchPlyFlexible(path):
 
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
-def storePly(path, xyz, rgb):
+def storePly(path, xyz, rgb, normals=None):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
     
-    normals = np.zeros_like(xyz)
+    normals = np.zeros_like(xyz) if normals is None else np.asarray(normals, dtype=np.float32)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
     attributes = np.concatenate((xyz, normals, rgb), axis=1)
@@ -102,4 +102,3 @@ def storePly(path, xyz, rgb):
     vertex_element = PlyElement.describe(elements, 'vertex')
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
-

@@ -65,6 +65,15 @@ class Scene:
                 association_max_dt=args.tum_association_max_dt,
                 sequence=args.tum_sequence,
                 num_pts=args.tum_random_num_pts,
+                pointcloud_preprocess=args.pointcloud_preprocess,
+                pcd_voxel_size=args.pcd_voxel_size,
+                pcd_outlier_filter=args.pcd_outlier_filter,
+                pcd_stat_nb_neighbors=args.pcd_stat_nb_neighbors,
+                pcd_stat_std_ratio=args.pcd_stat_std_ratio,
+                pcd_radius=args.pcd_radius,
+                pcd_min_neighbors=args.pcd_min_neighbors,
+                pcd_estimate_normals=args.pcd_estimate_normals,
+                pcd_force_regenerate=args.pcd_force_regenerate,
             )
         elif (
             os.path.exists(os.path.join(args.source_path, "frames.jsonl"))
@@ -82,6 +91,15 @@ class Scene:
                 min_depth=args.rgbd_min_depth,
                 max_depth=args.rgbd_max_depth,
                 num_pts=args.rgbd_random_num_pts,
+                pointcloud_preprocess=args.pointcloud_preprocess,
+                pcd_voxel_size=args.pcd_voxel_size,
+                pcd_outlier_filter=args.pcd_outlier_filter,
+                pcd_stat_nb_neighbors=args.pcd_stat_nb_neighbors,
+                pcd_stat_std_ratio=args.pcd_stat_std_ratio,
+                pcd_radius=args.pcd_radius,
+                pcd_min_neighbors=args.pcd_min_neighbors,
+                pcd_estimate_normals=args.pcd_estimate_normals,
+                pcd_force_regenerate=args.pcd_force_regenerate,
             )
         elif (
             (
@@ -104,6 +122,15 @@ class Scene:
                 max_init_points=args.scannet_max_init_points,
                 depth_scale=args.scannet_depth_scale,
                 num_pts=args.scannet_random_num_pts,
+                pointcloud_preprocess=args.pointcloud_preprocess,
+                pcd_voxel_size=args.pcd_voxel_size,
+                pcd_outlier_filter=args.pcd_outlier_filter,
+                pcd_stat_nb_neighbors=args.pcd_stat_nb_neighbors,
+                pcd_stat_std_ratio=args.pcd_stat_std_ratio,
+                pcd_radius=args.pcd_radius,
+                pcd_min_neighbors=args.pcd_min_neighbors,
+                pcd_estimate_normals=args.pcd_estimate_normals,
+                pcd_force_regenerate=args.pcd_force_regenerate,
             )
         elif (
             os.path.exists(os.path.join(args.source_path, "mesh.ply"))
@@ -127,6 +154,15 @@ class Scene:
                 render_points=args.replica_render_points,
                 splat_radius=args.replica_splat_radius,
                 num_pts=args.replica_random_num_pts,
+                pointcloud_preprocess=args.pointcloud_preprocess,
+                pcd_voxel_size=args.pcd_voxel_size,
+                pcd_outlier_filter=args.pcd_outlier_filter,
+                pcd_stat_nb_neighbors=args.pcd_stat_nb_neighbors,
+                pcd_stat_std_ratio=args.pcd_stat_std_ratio,
+                pcd_radius=args.pcd_radius,
+                pcd_min_neighbors=args.pcd_min_neighbors,
+                pcd_estimate_normals=args.pcd_estimate_normals,
+                pcd_force_regenerate=args.pcd_force_regenerate,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

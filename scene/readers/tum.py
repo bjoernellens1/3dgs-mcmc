@@ -1,10 +1,16 @@
 import os
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from scene.readers.common import BasicPointCloud, CameraInfo, SceneInfo, fetchPlyFlexible, getNerfppNorm, storePly
 from utils.graphics_utils import getWorld2View2, focal2fov
+from utils.pointcloud_preprocess import (
+    pointcloud_cache_suffix,
+    pointcloud_preprocess_config,
+    preprocess_pointcloud,
+)
 from utils.sh_utils import SH2RGB
 
 def _tum_default_intrinsics(path, sequence=""):
@@ -303,6 +309,15 @@ def readTUMSceneInfo(
     association_max_dt=0.03,
     sequence="",
     num_pts=100000,
+    pointcloud_preprocess="none",
+    pcd_voxel_size=0.0,
+    pcd_outlier_filter="none",
+    pcd_stat_nb_neighbors=20,
+    pcd_stat_std_ratio=2.0,
+    pcd_radius=0.05,
+    pcd_min_neighbors=4,
+    pcd_estimate_normals=False,
+    pcd_force_regenerate=False,
 ):
     train_cam_infos, test_cam_infos, associations = readTUMCameras(
         path=path,
@@ -321,8 +336,19 @@ def readTUMSceneInfo(
     init_type = init_type.lower()
 
     if init_type == "rgbd":
-        ply_path = os.path.join(path, "tum_rgbd_init.ply")
-        if not os.path.exists(ply_path):
+        preprocess_cfg = pointcloud_preprocess_config(
+            pointcloud_preprocess=pointcloud_preprocess,
+            pcd_voxel_size=pcd_voxel_size,
+            pcd_outlier_filter=pcd_outlier_filter,
+            pcd_stat_nb_neighbors=pcd_stat_nb_neighbors,
+            pcd_stat_std_ratio=pcd_stat_std_ratio,
+            pcd_radius=pcd_radius,
+            pcd_min_neighbors=pcd_min_neighbors,
+            pcd_estimate_normals=pcd_estimate_normals,
+            pcd_force_regenerate=pcd_force_regenerate,
+        )
+        ply_path = os.path.join(path, f"tum_rgbd_init{pointcloud_cache_suffix(preprocess_cfg)}.ply")
+        if preprocess_cfg.force_regenerate or not os.path.exists(ply_path):
             print(
                 f"Generating TUM RGB-D init point cloud "
                 f"(stride={depth_stride}, frames={init_frames}, max={max_init_points})..."
@@ -337,7 +363,14 @@ def readTUMSceneInfo(
                 depth_scale=depth_scale,
                 sequence=sequence,
             )
-            storePly(ply_path, pcd.points, np.clip(pcd.colors * 255.0, 0, 255))
+            points, colors, normals, _ = preprocess_pointcloud(
+                pcd.points,
+                pcd.colors,
+                pcd.normals,
+                config=preprocess_cfg,
+                label="tum_rgbd_init",
+            )
+            storePly(ply_path, points, np.clip(colors * 255.0, 0, 255), normals=normals)
     elif init_type == "random":
         ply_path = os.path.join(path, "tum_random.ply")
         print(f"Generating random TUM point cloud ({num_pts})...")
@@ -360,4 +393,3 @@ def readTUMSceneInfo(
         nerf_normalization=nerf_normalization,
         ply_path=ply_path,
     )
-

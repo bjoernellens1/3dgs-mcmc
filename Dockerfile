@@ -29,7 +29,7 @@ ENV VIRTUAL_ENV=/opt/venv
 
 # Install Python dependencies (torch/torchvision are pre-installed in the base image)
 COPY pyproject.toml ./
-RUN uv pip install numpy plyfile tqdm opencv-python rich jaxtyping tensorboard fastapi "uvicorn[standard]" websockets
+RUN uv pip install numpy plyfile tqdm opencv-python rich jaxtyping tensorboard fastapi "uvicorn[standard]" websockets open3d
 
 # Build amd-gsplat from source with submodules (glm is a submodule)
 # NOTE: ROCm branch has a bug where glm include path is missing from include_dirs.

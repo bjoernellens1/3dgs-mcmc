@@ -7,6 +7,11 @@ from PIL import Image
 
 from scene.readers.common import BasicPointCloud, CameraInfo, SceneInfo, fetchPlyFlexible, getNerfppNorm, storePly
 from utils.graphics_utils import focal2fov
+from utils.pointcloud_preprocess import (
+    pointcloud_cache_suffix,
+    pointcloud_preprocess_config,
+    preprocess_pointcloud,
+)
 from utils.sh_utils import SH2RGB
 
 
@@ -174,18 +179,49 @@ def readReplicaSceneInfo(
     render_points=300000,
     splat_radius=1,
     num_pts=250000,
+    pointcloud_preprocess="none",
+    pcd_voxel_size=0.0,
+    pcd_outlier_filter="none",
+    pcd_stat_nb_neighbors=20,
+    pcd_stat_std_ratio=2.0,
+    pcd_radius=0.05,
+    pcd_min_neighbors=4,
+    pcd_estimate_normals=False,
+    pcd_force_regenerate=False,
 ):
     mesh_path = os.path.join(path, "mesh.ply")
     if not os.path.exists(mesh_path):
         raise FileNotFoundError(f"Missing Replica mesh: {mesh_path}")
 
     mesh_pcd = fetchPlyFlexible(mesh_path)
+    preprocess_cfg = pointcloud_preprocess_config(
+        pointcloud_preprocess=pointcloud_preprocess,
+        pcd_voxel_size=pcd_voxel_size,
+        pcd_outlier_filter=pcd_outlier_filter,
+        pcd_stat_nb_neighbors=pcd_stat_nb_neighbors,
+        pcd_stat_std_ratio=pcd_stat_std_ratio,
+        pcd_radius=pcd_radius,
+        pcd_min_neighbors=pcd_min_neighbors,
+        pcd_estimate_normals=pcd_estimate_normals,
+        pcd_force_regenerate=pcd_force_regenerate,
+    )
 
     if init_type == "mesh":
         pcd = _sample_pointcloud(mesh_pcd, max_init_points, seed=42)
-        ply_path = os.path.join(path, f"replica_mesh_init_{pcd.points.shape[0]}.ply")
-        if not os.path.exists(ply_path):
-            storePly(ply_path, pcd.points, np.clip(pcd.colors * 255.0, 0, 255))
+        ply_path = os.path.join(
+            path,
+            f"replica_mesh_init_{pcd.points.shape[0]}{pointcloud_cache_suffix(preprocess_cfg)}.ply",
+        )
+        if preprocess_cfg.force_regenerate or not os.path.exists(ply_path):
+            points, colors, normals, _ = preprocess_pointcloud(
+                pcd.points,
+                pcd.colors,
+                pcd.normals,
+                config=preprocess_cfg,
+                label="replica_mesh_init",
+            )
+            storePly(ply_path, points, np.clip(colors * 255.0, 0, 255), normals=normals)
+        pcd = fetchPlyFlexible(ply_path)
     elif init_type == "random":
         pcd_for_norm = _sample_pointcloud(mesh_pcd, max_init_points, seed=42)
         xyz_min = pcd_for_norm.points.min(axis=0)

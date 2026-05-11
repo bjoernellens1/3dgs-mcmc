@@ -10,6 +10,11 @@ from PIL import Image
 
 from scene.readers.common import BasicPointCloud, CameraInfo, SceneInfo, fetchPlyFlexible, getNerfppNorm, storePly
 from utils.graphics_utils import getWorld2View2, focal2fov
+from utils.pointcloud_preprocess import (
+    pointcloud_cache_suffix,
+    pointcloud_preprocess_config,
+    preprocess_pointcloud,
+)
 from utils.sh_utils import SH2RGB
 
 def _numeric_stem(path):
@@ -495,6 +500,15 @@ def readScanNetSceneInfo(
     max_init_points=250000,
     depth_scale=1000.0,
     num_pts=100000,
+    pointcloud_preprocess="none",
+    pcd_voxel_size=0.0,
+    pcd_outlier_filter="none",
+    pcd_stat_nb_neighbors=20,
+    pcd_stat_std_ratio=2.0,
+    pcd_radius=0.05,
+    pcd_min_neighbors=4,
+    pcd_estimate_normals=False,
+    pcd_force_regenerate=False,
 ):
     train_cam_infos, test_cam_infos = readScanNetCameras(
         path=path,
@@ -509,17 +523,36 @@ def readScanNetSceneInfo(
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
     init_type = init_type.lower()
+    preprocess_cfg = pointcloud_preprocess_config(
+        pointcloud_preprocess=pointcloud_preprocess,
+        pcd_voxel_size=pcd_voxel_size,
+        pcd_outlier_filter=pcd_outlier_filter,
+        pcd_stat_nb_neighbors=pcd_stat_nb_neighbors,
+        pcd_stat_std_ratio=pcd_stat_std_ratio,
+        pcd_radius=pcd_radius,
+        pcd_min_neighbors=pcd_min_neighbors,
+        pcd_estimate_normals=pcd_estimate_normals,
+        pcd_force_regenerate=pcd_force_regenerate,
+    )
 
     if init_type == "mesh":
         mesh_path = _find_scannet_mesh(path)
         if mesh_path is None:
             raise RuntimeError("ScanNet mesh init requested, but no *_vh_clean*.ply found.")
-        ply_path = os.path.join(path, "scannet_mesh_init.ply")
-        pcd = fetchPlyFlexible(mesh_path)
-        storePly(ply_path, pcd.points, np.clip(pcd.colors * 255.0, 0, 255))
+        ply_path = os.path.join(path, f"scannet_mesh_init{pointcloud_cache_suffix(preprocess_cfg)}.ply")
+        if preprocess_cfg.force_regenerate or not os.path.exists(ply_path):
+            pcd = fetchPlyFlexible(mesh_path)
+            points, colors, normals, _ = preprocess_pointcloud(
+                pcd.points,
+                pcd.colors,
+                pcd.normals,
+                config=preprocess_cfg,
+                label="scannet_mesh_init",
+            )
+            storePly(ply_path, points, np.clip(colors * 255.0, 0, 255), normals=normals)
     elif init_type == "rgbd":
-        ply_path = os.path.join(path, "scannet_rgbd_init.ply")
-        if not os.path.exists(ply_path):
+        ply_path = os.path.join(path, f"scannet_rgbd_init{pointcloud_cache_suffix(preprocess_cfg)}.ply")
+        if preprocess_cfg.force_regenerate or not os.path.exists(ply_path):
             print(
                 f"Generating ScanNet RGB-D init point cloud "
                 f"(stride={depth_stride}, frames={init_frames}, max={max_init_points})..."
@@ -541,7 +574,14 @@ def readScanNetSceneInfo(
                     max_points=max_init_points,
                     depth_scale=depth_scale,
                 )
-            storePly(ply_path, pcd.points, np.clip(pcd.colors * 255.0, 0, 255))
+            points, colors, normals, _ = preprocess_pointcloud(
+                pcd.points,
+                pcd.colors,
+                pcd.normals,
+                config=preprocess_cfg,
+                label="scannet_rgbd_init",
+            )
+            storePly(ply_path, points, np.clip(colors * 255.0, 0, 255), normals=normals)
     elif init_type == "random":
         ply_path = os.path.join(path, "scannet_random.ply")
         print(f"Generating random ScanNet point cloud ({num_pts})...")
