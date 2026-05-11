@@ -84,6 +84,16 @@ class ModelParams(ParamGroup):
         self.rgbd_min_depth = 0.1
         self.rgbd_max_depth = 8.0
         self.rgbd_random_num_pts = 250000
+        self.replica_init = "mesh"
+        self.replica_num_views = 120
+        self.replica_width = 640
+        self.replica_height = 480
+        self.replica_eval_hold = 8
+        self.replica_fov = 70.0
+        self.replica_max_init_points = 250000
+        self.replica_render_points = 300000
+        self.replica_splat_radius = 1
+        self.replica_random_num_pts = 250000
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

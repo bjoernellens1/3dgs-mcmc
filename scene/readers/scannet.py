@@ -1,5 +1,8 @@
 import glob
+import io
 import os
+import struct
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +69,197 @@ def _list_scannet_color_frames(path):
 def _scannet_frame_id_from_color(path):
     return Path(path).stem
 
+def _find_scannet_sens(path):
+    scene_name = Path(path).name
+    preferred = os.path.join(path, f"{scene_name}.sens")
+    if os.path.exists(preferred):
+        return preferred
+    candidates = sorted(glob.glob(os.path.join(path, "*.sens")))
+    return candidates[0] if candidates else None
+
+def _read_exact(f, size):
+    data = f.read(size)
+    if len(data) != size:
+        raise EOFError("Unexpected end of ScanNet .sens file")
+    return data
+
+def _read_struct(f, fmt):
+    return struct.unpack(fmt, _read_exact(f, struct.calcsize(fmt)))
+
+def _read_sens_mat4(f):
+    return np.asarray(_read_struct(f, "f" * 16), dtype=np.float32).reshape(4, 4)
+
+def _read_sens_header(f):
+    version = _read_struct(f, "I")[0]
+    name_len = _read_struct(f, "Q")[0]
+    sensor_name = _read_exact(f, name_len).decode("utf-8", errors="replace")
+    intrinsic_color = _read_sens_mat4(f)
+    extrinsic_color = _read_sens_mat4(f)
+    intrinsic_depth = _read_sens_mat4(f)
+    extrinsic_depth = _read_sens_mat4(f)
+    color_compression_type = _read_struct(f, "i")[0]
+    depth_compression_type = _read_struct(f, "i")[0]
+    color_width = _read_struct(f, "I")[0]
+    color_height = _read_struct(f, "I")[0]
+    depth_width = _read_struct(f, "I")[0]
+    depth_height = _read_struct(f, "I")[0]
+    depth_shift = _read_struct(f, "f")[0]
+    num_frames = _read_struct(f, "Q")[0]
+    return {
+        "version": version,
+        "sensor_name": sensor_name,
+        "intrinsic_color": intrinsic_color,
+        "extrinsic_color": extrinsic_color,
+        "intrinsic_depth": intrinsic_depth,
+        "extrinsic_depth": extrinsic_depth,
+        "color_compression_type": color_compression_type,
+        "depth_compression_type": depth_compression_type,
+        "color_width": int(color_width),
+        "color_height": int(color_height),
+        "depth_width": int(depth_width),
+        "depth_height": int(depth_height),
+        "depth_shift": float(depth_shift) if depth_shift > 0 else 1000.0,
+        "num_frames": int(num_frames),
+    }
+
+def _read_sens_frame_record(f):
+    c2w = _read_sens_mat4(f)
+    timestamp_color = _read_struct(f, "Q")[0]
+    timestamp_depth = _read_struct(f, "Q")[0]
+    color_size = _read_struct(f, "Q")[0]
+    depth_size = _read_struct(f, "Q")[0]
+    color_data = _read_exact(f, color_size)
+    depth_data = _read_exact(f, depth_size)
+    return c2w, timestamp_color, timestamp_depth, color_data, depth_data
+
+def _decode_sens_color(color_data):
+    if not color_data:
+        return None
+    return Image.open(io.BytesIO(color_data)).convert("RGB")
+
+def _decode_sens_depth(depth_data, header):
+    if not depth_data:
+        return None
+    raw = depth_data
+    if header["depth_compression_type"] == 1:
+        raw = zlib.decompress(depth_data)
+    elif header["depth_compression_type"] != 0:
+        try:
+            raw = zlib.decompress(depth_data)
+        except zlib.error:
+            raw = depth_data
+    depth = np.frombuffer(raw, dtype=np.uint16)
+    expected = header["depth_width"] * header["depth_height"]
+    if depth.size != expected:
+        return None
+    return depth.reshape(header["depth_height"], header["depth_width"])
+
+def _iter_scannet_sens_frames(path, frame_stride=10, max_frames=0, decode_depth=False, selected_indices=None):
+    sens_path = _find_scannet_sens(path)
+    if sens_path is None:
+        raise FileNotFoundError(f"No ScanNet .sens file found in {path}")
+
+    selected_set = set(selected_indices) if selected_indices is not None else None
+    emitted = 0
+    with open(sens_path, "rb") as f:
+        header = _read_sens_header(f)
+        for source_idx in range(header["num_frames"]):
+            c2w, timestamp_color, timestamp_depth, color_data, depth_data = _read_sens_frame_record(f)
+            if selected_set is not None:
+                keep = source_idx in selected_set
+            else:
+                keep = (frame_stride <= 1 or source_idx % frame_stride == 0)
+                keep = keep and (not max_frames or emitted < max_frames)
+            if not keep:
+                continue
+
+            color = _decode_sens_color(color_data)
+            if color is None:
+                continue
+            depth = _decode_sens_depth(depth_data, header) if decode_depth else None
+            emitted += 1
+            yield {
+                "source_idx": source_idx,
+                "c2w": c2w.astype(np.float32),
+                "timestamp_color": timestamp_color,
+                "timestamp_depth": timestamp_depth,
+                "image": color,
+                "depth": depth,
+                "header": header,
+                "sens_path": sens_path,
+            }
+
+def _read_scannet_sens_cameras(path, frame_stride=10, max_frames=0, eval=False, eval_hold=20):
+    cam_infos = []
+    skipped = 0
+    header_seen = None
+
+    for frame in _iter_scannet_sens_frames(path, frame_stride=frame_stride, max_frames=max_frames):
+        header = frame["header"]
+        header_seen = header
+        c2w = frame["c2w"]
+        if c2w.shape != (4, 4) or not np.isfinite(c2w).all() or abs(np.linalg.det(c2w[:3, :3])) < 1e-6:
+            skipped += 1
+            continue
+
+        image = frame["image"]
+        width, height = image.size
+        K = header["intrinsic_color"]
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+
+        w2c = np.linalg.inv(c2w)
+        R = w2c[:3, :3].T
+        T = w2c[:3, 3]
+
+        frame_id = f"sens_{frame['source_idx']:06d}"
+        cam_infos.append(
+            CameraInfo(
+                uid=len(cam_infos),
+                R=R,
+                T=T,
+                FovY=focal2fov(fy, height),
+                FovX=focal2fov(fx, width),
+                image=image,
+                image_path=f"{frame['sens_path']}#{frame_id}",
+                image_name=frame_id,
+                width=width,
+                height=height,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+            )
+        )
+
+    if header_seen is not None:
+        print(
+            "Loaded ScanNet .sens cameras: "
+            f"{len(cam_infos)} of {header_seen['num_frames']} frames "
+            f"(skipped invalid/missing frames: {skipped})"
+        )
+
+    if eval and eval_hold > 0:
+        train_cam_infos = [c for i, c in enumerate(cam_infos) if i % eval_hold != 0]
+        test_cam_infos = [c for i, c in enumerate(cam_infos) if i % eval_hold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    return train_cam_infos, test_cam_infos
+
 def readScanNetCameras(path, frame_stride=10, max_frames=0, eval=False, eval_hold=20):
+    if not os.path.exists(os.path.join(path, "intrinsic")) and _find_scannet_sens(path) is not None:
+        return _read_scannet_sens_cameras(
+            path=path,
+            frame_stride=frame_stride,
+            max_frames=max_frames,
+            eval=eval,
+            eval_hold=eval_hold,
+        )
+
     intr = _find_scannet_intrinsics(path)
     fx, fy, cx, cy = intr["color"]
 
@@ -205,6 +398,81 @@ def _load_scannet_rgbd_pointcloud(
     normals = np.zeros_like(points, dtype=np.float32)
     return BasicPointCloud(points=points, colors=colors, normals=normals)
 
+def _load_scannet_sens_rgbd_pointcloud(
+    path,
+    train_cam_infos,
+    depth_stride=8,
+    init_frames=200,
+    max_points=250000,
+):
+    selected = train_cam_infos
+    if init_frames and init_frames > 0:
+        selected = selected[:init_frames]
+
+    selected_indices = []
+    for cam in selected:
+        try:
+            selected_indices.append(int(str(cam.image_name).split("_")[-1]))
+        except ValueError:
+            continue
+
+    points_all = []
+    colors_all = []
+
+    for frame in _iter_scannet_sens_frames(path, decode_depth=True, selected_indices=selected_indices):
+        depth_raw = frame["depth"]
+        if depth_raw is None:
+            continue
+        c2w = frame["c2w"]
+        if c2w.shape != (4, 4) or not np.isfinite(c2w).all():
+            continue
+
+        header = frame["header"]
+        Kd = header["intrinsic_depth"]
+        dfx = float(Kd[0, 0])
+        dfy = float(Kd[1, 1])
+        dcx = float(Kd[0, 2])
+        dcy = float(Kd[1, 2])
+        depth = depth_raw.astype(np.float32) / header["depth_shift"]
+        rgb = np.array(frame["image"].convert("RGB")).astype(np.float32) / 255.0
+
+        h, w = depth.shape
+        ys, xs = np.mgrid[0:h:depth_stride, 0:w:depth_stride]
+        z = depth[ys, xs]
+        valid = np.isfinite(z) & (z > 0.1) & (z < 10.0)
+        if valid.sum() == 0:
+            continue
+
+        xs_v = xs[valid].astype(np.float32)
+        ys_v = ys[valid].astype(np.float32)
+        z_v = z[valid].astype(np.float32)
+        x = (xs_v - dcx) / dfx * z_v
+        y = (ys_v - dcy) / dfy * z_v
+        pts_cam = np.stack([x, y, z_v], axis=1)
+        pts_world = (c2w[:3, :3] @ pts_cam.T).T + c2w[:3, 3]
+
+        rgb_h, rgb_w = rgb.shape[:2]
+        rgb_x = np.clip((xs_v / max(w - 1, 1) * (rgb_w - 1)).round().astype(np.int32), 0, rgb_w - 1)
+        rgb_y = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
+        rgb_v = rgb[rgb_y, rgb_x]
+
+        points_all.append(pts_world.astype(np.float32))
+        colors_all.append(rgb_v.astype(np.float32))
+
+    if not points_all:
+        raise RuntimeError("Could not initialize ScanNet point cloud from .sens RGB-D frames.")
+
+    points = np.concatenate(points_all, axis=0)
+    colors = np.concatenate(colors_all, axis=0)
+    if max_points and points.shape[0] > max_points:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(points.shape[0], size=max_points, replace=False)
+        points = points[idx]
+        colors = colors[idx]
+
+    normals = np.zeros_like(points, dtype=np.float32)
+    return BasicPointCloud(points=points, colors=colors, normals=normals)
+
 def _find_scannet_mesh(path):
     candidates = []
     candidates.extend(glob.glob(os.path.join(path, "*_vh_clean_2.ply")))
@@ -256,14 +524,23 @@ def readScanNetSceneInfo(
                 f"Generating ScanNet RGB-D init point cloud "
                 f"(stride={depth_stride}, frames={init_frames}, max={max_init_points})..."
             )
-            pcd = _load_scannet_rgbd_pointcloud(
-                path=path,
-                train_cam_infos=train_cam_infos,
-                depth_stride=depth_stride,
-                init_frames=init_frames,
-                max_points=max_init_points,
-                depth_scale=depth_scale,
-            )
+            if _find_scannet_sens(path) is not None and not os.path.exists(os.path.join(path, "depth")):
+                pcd = _load_scannet_sens_rgbd_pointcloud(
+                    path=path,
+                    train_cam_infos=train_cam_infos,
+                    depth_stride=depth_stride,
+                    init_frames=init_frames,
+                    max_points=max_init_points,
+                )
+            else:
+                pcd = _load_scannet_rgbd_pointcloud(
+                    path=path,
+                    train_cam_infos=train_cam_infos,
+                    depth_stride=depth_stride,
+                    init_frames=init_frames,
+                    max_points=max_init_points,
+                    depth_scale=depth_scale,
+                )
             storePly(ply_path, pcd.points, np.clip(pcd.colors * 255.0, 0, 255))
     elif init_type == "random":
         ply_path = os.path.join(path, "scannet_random.ply")
@@ -287,4 +564,3 @@ def readScanNetSceneInfo(
         nerf_normalization=nerf_normalization,
         ply_path=ply_path,
     )
-

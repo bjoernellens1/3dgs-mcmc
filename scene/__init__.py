@@ -84,9 +84,12 @@ class Scene:
                 num_pts=args.rgbd_random_num_pts,
             )
         elif (
-            os.path.exists(os.path.join(args.source_path, "color"))
-            and os.path.exists(os.path.join(args.source_path, "pose"))
-            and os.path.exists(os.path.join(args.source_path, "intrinsic"))
+            (
+                os.path.exists(os.path.join(args.source_path, "color"))
+                and os.path.exists(os.path.join(args.source_path, "pose"))
+                and os.path.exists(os.path.join(args.source_path, "intrinsic"))
+            )
+            or any(name.endswith(".sens") for name in os.listdir(args.source_path))
         ):
             print("Found ScanNet RGB-D scene layout.")
             scene_info = sceneLoadTypeCallbacks["ScanNet"](
@@ -101,6 +104,29 @@ class Scene:
                 max_init_points=args.scannet_max_init_points,
                 depth_scale=args.scannet_depth_scale,
                 num_pts=args.scannet_random_num_pts,
+            )
+        elif (
+            os.path.exists(os.path.join(args.source_path, "mesh.ply"))
+            and (
+                os.path.exists(os.path.join(args.source_path, "habitat", "replica_stage.stage_config.json"))
+                or os.path.exists(os.path.join(args.source_path, "textures"))
+                or os.path.exists(os.path.join(args.source_path, "semantic.json"))
+            )
+        ):
+            print("Found Replica mesh scene layout.")
+            scene_info = sceneLoadTypeCallbacks["Replica"](
+                args.source_path,
+                args.eval,
+                init_type=args.replica_init,
+                num_views=args.replica_num_views,
+                width=args.replica_width,
+                height=args.replica_height,
+                eval_hold=args.replica_eval_hold,
+                fov_degrees=args.replica_fov,
+                max_init_points=args.replica_max_init_points,
+                render_points=args.replica_render_points,
+                splat_radius=args.replica_splat_radius,
+                num_pts=args.replica_random_num_pts,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

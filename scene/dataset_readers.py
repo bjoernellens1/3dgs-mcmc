@@ -5,11 +5,13 @@ from scene.readers.blender import readCamerasFromTransforms, readNerfSyntheticIn
 from scene.readers.rgbd_sequence import readRGBDSequenceSceneInfo
 from scene.readers.tum import readTUMCameras, readTUMSceneInfo
 from scene.readers.scannet import readScanNetCameras, readScanNetSceneInfo
+from scene.readers.replica import readReplicaSceneInfo
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender": readNerfSyntheticInfo,
     "RGBDSequence": readRGBDSequenceSceneInfo,
+    "Replica": readReplicaSceneInfo,
     "ScanNet": readScanNetSceneInfo,
     "TUM": readTUMSceneInfo,
 }
