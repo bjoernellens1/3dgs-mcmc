@@ -1326,15 +1326,6 @@ if __name__ == "__main__":
                         help="Skip torch.cuda.empty_cache() calls at test iterations for profiling.")
     parser.add_argument("--log_memory", action="store_true", default=False,
                         help="Log CUDA memory allocator stats every 50 iterations to TensorBoard.")
-    parser.add_argument("--no-energy_mcmc", "--no-energy-mcmc",
-                        dest="energy_mcmc", action="store_false",
-                        help="Disable energy-guided MCMC and use the legacy schedule-only path.")
-    parser.add_argument("--no-web-viewer", "--no-web_viewer",
-                        dest="web_viewer_enabled", action="store_false",
-                        help="Disable the default persistent web viewer.")
-    parser.add_argument("--no-web-viewer-keep-alive", "--no-web_viewer_keep_alive",
-                        dest="web_viewer_keep_alive", action="store_false",
-                        help="Let training exit after completion instead of holding the viewer process open.")
     args = parser.parse_args(sys.argv[1:])
     
     if args.config is not None:
@@ -1345,12 +1336,6 @@ if __name__ == "__main__":
             setattr(args, key, value)
 
     # Keep explicit negative CLI flags authoritative even when --config is used.
-    if "--no-energy_mcmc" in sys.argv or "--no-energy-mcmc" in sys.argv:
-        args.energy_mcmc = False
-    if "--no-web-viewer" in sys.argv or "--no-web_viewer" in sys.argv:
-        args.web_viewer_enabled = False
-    if "--no-web-viewer-keep-alive" in sys.argv or "--no-web_viewer_keep_alive" in sys.argv:
-        args.web_viewer_keep_alive = False
 
     apply_parallelism_profile(args)
 
