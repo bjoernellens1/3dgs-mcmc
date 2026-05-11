@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: Build and Push Docker Images
 
 on:
   push:
@@ -24,8 +24,6 @@ env:
 
 jobs:
   build-and-push:
-    # Standard runner is fine once we strip the pre-installed bloat
-    # (Android SDK, .NET, etc. — ~30 GB of stuff we don't need).
     runs-on: ubuntu-latest
 
     steps:
@@ -34,7 +32,6 @@ jobs:
 
       - name: Free disk space
         run: |
-          # Remove pre-installed tooling the build doesn't need
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
@@ -52,8 +49,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
+      # --- Builder image tags ------------------------------------------------
+      - name: Docker metadata (builder)
+        id: meta-builder
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=builder,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=builder-rocm-port,enable=${{ github.ref == 'refs/heads/rocm-port' }}
+            type=raw,value=builder-edge,enable=${{ startsWith(github.ref, 'refs/heads/feature/') }}
+            type=sha,prefix=builder-sha-,format=short
+
+      # --- Runtime image tags ------------------------------------------------
+      - name: Docker metadata (runtime)
+        id: meta-runtime
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -66,23 +76,39 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      # --- Build & push builder stage (gsplat compiled) ----------------------
+      - name: Build and push builder
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
+          target: builder
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta-builder.outputs.tags }}
+          labels: ${{ steps.meta-builder.outputs.labels }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
+      # --- Build & push runtime stage (minimal training image) ---------------
+      - name: Build and push runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-runtime.outputs.tags }}
+          labels: ${{ steps.meta-runtime.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ---------------------------------------------------------------------------
   smoke-test:
     needs: build-and-push
     runs-on: ubuntu-latest
 
     steps:
-      - name: Pull image
+      - name: Pull runtime image
         run: |
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
 
