@@ -128,7 +128,7 @@ class GsplatGaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd, spatial_lr_scale: float):
+    def create_from_pcd(self, pcd, spatial_lr_scale: float, init_scale_mode="fixed", init_scale=0.01, voxel_size=0.02):
         self.spatial_lr_scale = spatial_lr_scale
         points_np = np.asarray(pcd.points)
         colors_np = np.asarray(pcd.colors)
@@ -140,7 +140,15 @@ class GsplatGaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(points_np).float().cuda()), 0.0000001)
+        N = fused_point_cloud.shape[0]
+        if init_scale_mode == "fixed":
+            dist2 = torch.full((N,), init_scale ** 2, device="cuda")
+        elif init_scale_mode == "knn":
+            dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(points_np).float().cuda()), 0.0000001)
+        elif init_scale_mode == "voxel":
+            dist2 = torch.full((N,), (voxel_size * 0.5) ** 2, device="cuda")
+        else:
+            raise ValueError(f"Unknown init_scale_mode: {init_scale_mode}")
         scales = torch.log(torch.sqrt(dist2) * 0.1)[..., None].repeat(1, 3)
         quats = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         quats[:, 0] = 1

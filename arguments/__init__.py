@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, BooleanOptionalAction
 import sys
 import os
 
@@ -28,12 +28,12 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    group.add_argument("--" + key, default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -54,9 +54,11 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
-        self.cap_max = 15000000
+        self.cap_max = 500000
         self.init_type = "sfm"
         self.model_layout = "gsplat"
+        self.init_scale_mode = "fixed"
+        self.init_scale = 0.01
         self.scannet_frame_stride = 10
         self.scannet_max_frames = 0
         self.scannet_eval_hold = 20
@@ -85,7 +87,7 @@ class ModelParams(ParamGroup):
         self.rgbd_max_depth = 8.0
         self.rgbd_random_num_pts = 250000
         self.pointcloud_preprocess = "open3d"
-        self.pcd_voxel_size = 0.0
+        self.pcd_voxel_size = 0.02
         self.pcd_outlier_filter = "none"
         self.pcd_stat_nb_neighbors = 20
         self.pcd_stat_std_ratio = 2.0
@@ -226,8 +228,8 @@ class OptimizationParams(ParamGroup):
         self.compile_sh = False
         self.compile_energy = False
         self.compile_utility = False
-        # Persistent web viewer. Default-on; use --no-web-viewer to disable.
-        self.web_viewer_enabled = True
+        # Persistent web viewer. Disabled by default; use --web-viewer to enable.
+        self.web_viewer_enabled = False
         self.web_viewer_port = 6010
         self.web_viewer_host = "0.0.0.0"
         self.web_viewer_backend = "process"
@@ -235,7 +237,7 @@ class OptimizationParams(ParamGroup):
         self.web_viewer_image_interval = 100
         self.web_viewer_fixed_camera = False
         self.web_viewer_keep_alive = True
-        self.web_viewer_scene_cache_interval = 500
+        self.web_viewer_scene_cache_interval = 0
         self.web_viewer_scene_cache_keep = 3
         self.record_video = False
         self.record_video_cameras = ""
@@ -243,7 +245,7 @@ class OptimizationParams(ParamGroup):
         self.record_video_fps = 30
         self.record_video_crf = 23
         self.record_video_preset = "veryfast"
-        self.scalar_log_interval = 10
+        self.scalar_log_interval = 100
         self.geometry_log_interval = 500
         self.sfm_anchor_interval = 2000
         self.strategy_log_interval = 500

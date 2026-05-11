@@ -74,6 +74,7 @@ class Scene:
                 pcd_min_neighbors=args.pcd_min_neighbors,
                 pcd_estimate_normals=args.pcd_estimate_normals,
                 pcd_force_regenerate=args.pcd_force_regenerate,
+                cache_dir=self.model_path,
             )
         elif (
             os.path.exists(os.path.join(args.source_path, "frames.jsonl"))
@@ -202,7 +203,13 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            self.gaussians.create_from_pcd(
+                scene_info.point_cloud,
+                self.cameras_extent,
+                init_scale_mode=getattr(args, "init_scale_mode", "fixed"),
+                init_scale=getattr(args, "init_scale", 0.01),
+                voxel_size=getattr(args, "pcd_voxel_size", 0.02),
+            )
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

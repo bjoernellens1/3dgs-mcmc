@@ -318,6 +318,7 @@ def readTUMSceneInfo(
     pcd_min_neighbors=4,
     pcd_estimate_normals=False,
     pcd_force_regenerate=False,
+    cache_dir=None,
 ):
     train_cam_infos, test_cam_infos, associations = readTUMCameras(
         path=path,
@@ -347,7 +348,9 @@ def readTUMSceneInfo(
             pcd_estimate_normals=pcd_estimate_normals,
             pcd_force_regenerate=pcd_force_regenerate,
         )
-        ply_path = os.path.join(path, f"tum_rgbd_init{pointcloud_cache_suffix(preprocess_cfg)}.ply")
+        cache_dir = cache_dir or path
+        _extra = f"_d{depth_stride}_f{init_frames}_m{max_init_points}_s{int(depth_scale)}"
+        ply_path = os.path.join(cache_dir, f"tum_rgbd_init{pointcloud_cache_suffix(preprocess_cfg, extra_suffix=_extra)}.ply")
         if preprocess_cfg.force_regenerate or not os.path.exists(ply_path):
             print(
                 f"Generating TUM RGB-D init point cloud "
@@ -372,7 +375,7 @@ def readTUMSceneInfo(
             )
             storePly(ply_path, points, np.clip(colors * 255.0, 0, 255), normals=normals)
     elif init_type == "random":
-        ply_path = os.path.join(path, "tum_random.ply")
+        ply_path = os.path.join(cache_dir, "tum_random.ply")
         print(f"Generating random TUM point cloud ({num_pts})...")
         xyz = (
             np.random.random((num_pts, 3))

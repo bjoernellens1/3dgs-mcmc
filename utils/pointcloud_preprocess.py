@@ -31,13 +31,13 @@ def pointcloud_preprocess_config(**kwargs):
     )
 
 
-def pointcloud_cache_suffix(config):
+def pointcloud_cache_suffix(config, extra_suffix=""):
     if config.backend == "none":
-        return ""
+        return extra_suffix
     voxel = f"v{config.voxel_size:.3f}" if config.voxel_size > 0 else "vnone"
     filt = config.outlier_filter
     normals = "_normals" if config.estimate_normals else ""
-    return f"_{config.backend}_{voxel}_{filt}{normals}"
+    return f"_{config.backend}_{voxel}_{filt}{normals}{extra_suffix}"
 
 
 def preprocess_pointcloud(points, colors, normals=None, config=None, label="pointcloud"):
