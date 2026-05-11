@@ -1,57 +1,41 @@
-# Self-hosted GitHub Actions Runner for ROCm Docker Builds
+# CI: Docker Build Pipeline
 
-The multi-stage Docker build requires ~40 GB of temporary disk space and access to the ROCm compiler toolchain (provided by the `rocm/pytorch` builder image). Standard GitHub-hosted runners have only 14 GB root disk, so a **self-hosted runner** on the Strix Halo machine is required.
+The multi-stage Docker build runs automatically on **standard `ubuntu-latest` GitHub runners**. The workflow strips pre-installed bloat (Android SDK, .NET, etc.) before building to free up disk space.
 
-## Setup
+## How it works
+
+1. A `push` or `pull_request` triggers the workflow
+2. A cleanup step removes unneeded packages (~30 GB) from the runner
+3. Docker builds the multi-stage image using Buildx with registry cache
+4. The image is pushed to GHCR with branch-appropriate tags
+5. A smoke-test job verifies `torch`, `gsplat`, and key imports
+
+## Tags
+
+| Branch | Tags |
+|--------|------|
+| `main` | `latest`, `sha-<commit>` |
+| `rocm-port` | `rocm-port`, `sha-<commit>` |
+| `feature/*` | `edge`, `sha-<commit>` |
+| Any PR | `sha-<commit>` (not pushed) |
+
+## Self-hosted runner (optional)
+
+If you want faster builds by caching the `rocm/pytorch` base image locally, set up a self-hosted runner:
 
 ```bash
-# 1. Create a folder for the runner
 mkdir -p ~/actions-runner && cd ~/actions-runner
-
-# 2. Download the latest runner
 curl -o actions-runner-linux-x64.tar.gz -L \
   https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
-
-# 3. Extract
 tar xzf actions-runner-linux-x64.tar.gz
 
-# 4. Get a registration token from:
-#    GitHub repo → Settings → Actions → Runners → New self-hosted runner
-#    Then run the `./config.sh` command shown there, e.g.:
+# Get token from: repo → Settings → Actions → Runners → New self-hosted runner
 ./config.sh --url https://github.com/bjoernellens1/3dgs-mcmc \
   --token <TOKEN> \
   --labels rocm,amd64,linux \
   --name strix-halo-runner
 
-# 5. Install as a service
-sudo ./svc.sh install
-sudo ./svc.sh start
-
-# 6. Verify
-sudo ./svc.sh status
+sudo ./svc.sh install && sudo ./svc.sh start
 ```
 
-## Prerequisites on the runner
-
-- **Docker** with rootless mode or `sudo` access
-- **ROCm kernel drivers** installed on the host (`/dev/kfd`, `/dev/dri`)
-- At least **100 GB free disk** (the build temporarily uses ~40 GB)
-- Git, curl
-
-## Workflow
-
-The CI workflow in `.github/workflows/build-image.yml`:
-
-1. Runs on any self-hosted runner with labels `self-hosted, linux, amd64, rocm`
-2. Builds the multi-stage Docker image
-3. Pushes to GHCR with tags: `latest` (main), `rocm-port`, `edge` (feature branches), `sha-<short>`
-4. Caches Docker layers to GHCR for faster subsequent builds
-5. Runs a smoke-test job on `ubuntu-latest` verifying core imports (`torch`, `gsplat`, etc.)
-
-## Tag strategy
-
-| Branch | Tag |
-|--------|-----|
-| `main` | `latest`, `sha-<commit>` |
-| `rocm-port` | `rocm-port`, `sha-<commit>` |
-| `feature/*` | `edge`, `sha-<commit>` |
+Then change the workflow's `runs-on` to `[self-hosted, linux, amd64, rocm]` and remove the cleanup step.

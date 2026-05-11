@@ -24,18 +24,26 @@ env:
 
 jobs:
   build-and-push:
-    # Self-hosted runner with ROCm and enough disk (~40 GB needed during build).
-    # See docs/ROCM_GITHUB_RUNNER.md for setup instructions.
-    runs-on: [self-hosted, linux, amd64, rocm]
+    # Standard runner is fine once we strip the pre-installed bloat
+    # (Android SDK, .NET, etc. — ~30 GB of stuff we don't need).
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free up disk space
+      - name: Free disk space
         run: |
+          # Remove pre-installed tooling the build doesn't need
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo docker image prune -af
+          sudo apt-get clean
           df -h /
-          docker system prune -af --volumes 2>/dev/null || true
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -52,7 +60,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=rocm-port,enable=${{ github.ref == 'refs/heads/rocm-port' }}
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/feature/open3d-pointcloud-preprocess' }}
+            type=raw,value=edge,enable=${{ startsWith(github.ref, 'refs/heads/feature/') }}
             type=sha,prefix=sha-,format=short
 
       - name: Set up Docker Buildx
@@ -70,19 +78,18 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
   smoke-test:
-    # Quick validation on any runner (no GPU needed for imports).
-    runs-on: ubuntu-latest
     needs: build-and-push
+    runs-on: ubuntu-latest
 
     steps:
       - name: Pull image
         run: |
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
 
       - name: Test core imports
         run: |
           docker run --rm \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
             python3 -c "
           import torch
           import gsplat
@@ -96,6 +103,4 @@ jobs:
           print('All imports OK')
           print('PyTorch:', torch.__version__)
           print('gsplat:', gsplat.__version__)
-          print('numpy:', numpy.__version__)
-          print('cv2:', cv2.__version__)
           "
