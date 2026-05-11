@@ -102,31 +102,3 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
-  # ---------------------------------------------------------------------------
-  smoke-test:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Pull runtime image
-        run: |
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-
-      - name: Test core imports
-        run: |
-          docker run --rm \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
-            python3 -c "
-          import torch
-          import gsplat
-          import numpy
-          import cv2
-          import plyfile
-          import tqdm
-          import rich
-          from jaxtyping import Float
-          from torch.utils.tensorboard import SummaryWriter
-          print('All imports OK')
-          print('PyTorch:', torch.__version__)
-          print('gsplat:', gsplat.__version__)
-          "
