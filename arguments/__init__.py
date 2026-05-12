@@ -268,7 +268,7 @@ class StreamingParams(ParamGroup):
         # Depth-based incremental Gaussian insertion (Phase 2)
         self.streaming_insert_from_depth = True
         self.streaming_depth_stride = 8
-        self.streaming_max_new_gaussians_per_frame = 2000
+        self.streaming_max_new_gaussians_per_frame = 1000
         self.streaming_insert_voxel_size = 0.02
         self.streaming_min_depth = 0.1
         self.streaming_max_depth = 8.0
@@ -283,11 +283,21 @@ class StreamingParams(ParamGroup):
         # Coverage voxel multiplier (0 = use 1.5× insert_voxel_size)
         self.streaming_cover_voxel_size = 0.0
         # Depth discontinuity threshold: reject pixels where |dz/dx|+|dz/dy| > this (metres)
-        self.streaming_depth_edge_threshold = 0.1
+        self.streaming_depth_edge_threshold = 0.05
         # Grazing-angle rejection: reject surface normals > this angle from view direction (degrees)
         self.streaming_max_view_angle = 70.0
         # Use KNN-based initial scale for inserted Gaussians (matches bootstrap quality)
         self.streaming_insert_knn_scale = True
+        # Two-frame depth consistency threshold (metres; 0 = disabled)
+        self.streaming_depth_consistency_thresh = 0.05
+        # Hold-out every Nth arriving frame for test evaluation (0 = disabled)
+        self.streaming_eval_hold = 0
+        # Save renders at frame-PLY save milestones (opt-in to avoid overhead)
+        self.streaming_render_at_saves = False
+        # Depth supervision loss weight (0 = disabled)
+        self.streaming_depth_loss_weight = 0.0
+        # Depth loss type: "l1" or "huber"
+        self.streaming_depth_loss_type = "l1"
         super().__init__(parser, "Streaming Parameters")
 
 

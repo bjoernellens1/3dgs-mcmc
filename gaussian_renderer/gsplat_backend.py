@@ -97,7 +97,7 @@ def _gsplat_sh_coeffs(pc, update_sh_rest):
 
 def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
            scaling_modifier=1.0, override_color=None, pixel_weights=None,
-           return_taming_stats=False, update_sh_rest=True):
+           return_taming_stats=False, update_sh_rest=True, render_depth=False):
     """
     Render the scene using gsplat (ROCm-compatible backend).
 
@@ -131,8 +131,18 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     viewmats = viewmat[None].contiguous()
     Ks = K[None].contiguous()
 
-    # Background: gsplat expects flat [C] for packed=True
-    bg = bg_color.contiguous() if bg_color is not None else None
+    # Background handling.
+    # RGB mode: pass flat [3] tensor — gsplat packed mode accepts this.
+    # RGB+D mode: gsplat's Python-level code does cat([backgrounds, zeros([C,1])],
+    # dim=-1) which requires 2D input, but the CUDA kernel then asserts 1D. These
+    # two requirements are contradictory in packed+C=1 mode (gsplat bug). Workaround:
+    # pass bg=None for the rasterization call and manually composite afterward.
+    if render_depth:
+        effective_render_mode = "RGB+D"
+        bg = None  # composited manually after rasterization
+    else:
+        effective_render_mode = getattr(pipe, "render_mode", "RGB")
+        bg = bg_color.contiguous() if bg_color is not None else None
 
     # Colors / SH handling
     # -------------------------------------------------------------------------
@@ -165,7 +175,6 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
     # tile_size=8 causes NaN gradients on ROCm/gfx1151 with wave32-patched gsplat.
     # Default is 16. See docs/ROCM_PODMAN.md.
     tile_size = getattr(pipe, "tile_size", 16)
-    render_mode = getattr(pipe, "render_mode", "RGB")
     render_colors, render_alphas, meta = rasterization(
         means=means,
         quats=quats,
@@ -184,15 +193,22 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         packed=True,
         tile_size=tile_size,
         backgrounds=bg,
-        render_mode=render_mode,
+        render_mode=effective_render_mode,
         sparse_grad=sparse_grad,
         absgrad=getattr(pipe, "absgrad", False),
         rasterize_mode=getattr(pipe, "rasterize_mode", "classic"),
     )
 
-    # gsplat returns [C, H, W, 3]; Inria backend returns [3, H, W]
+    # gsplat returns [C, H, W, channels]; Inria backend returns [channels, H, W]
     rendered = render_colors[0].permute(2, 0, 1).contiguous()
     image = rendered[:3] if rendered.shape[0] >= 3 else rendered
+
+    # When render_depth=True we pass bg=None to avoid a gsplat packed+RGB+D bug.
+    # Manually composite the background onto the RGB channels using the alpha map.
+    if render_depth and bg_color is not None:
+        alpha = render_alphas[0].permute(2, 0, 1)  # [1, H, W]
+        image = image + bg_color[:, None, None] * (1.0 - alpha)
+        rendered = torch.cat([image, rendered[3:]], dim=0)  # rebuild [4, H, W]
 
     # Expand packed metadata back to full [N] arrays for compatibility
     N = means.shape[0]
@@ -234,6 +250,9 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         "meta": meta,
         "sparse_grad": sparse_grad,
     }
+    if render_depth:
+        # rendered[3:4] is the alpha-composited depth in camera space (metres)
+        result["rendered_depth"] = rendered[3:4]  # [1, H, W]
 
     if return_taming_stats or pixel_weights is not None:
         radii_float = radii.to(dtype=torch.float32)

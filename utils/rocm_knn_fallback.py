@@ -12,6 +12,11 @@ def distCUDA2(points: torch.Tensor, chunk_size: int = 8192, k: int = 4):
     points = points.contiguous()
     out = torch.empty(points.shape[0], device=points.device, dtype=points.dtype)
 
+    # k must not exceed N-1 (self is excluded)
+    k = min(k, points.shape[0] - 1)
+    if k <= 0:
+        return torch.zeros(points.shape[0], device=points.device, dtype=points.dtype)
+
     with torch.no_grad():
         for start in range(0, points.shape[0], chunk_size):
             end = min(start + chunk_size, points.shape[0])

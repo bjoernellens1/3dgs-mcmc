@@ -27,9 +27,11 @@ import queue
 import threading
 import time
 from argparse import Namespace
+from typing import Optional
 
 import numpy as np
 import torch
+from torchvision.utils import save_image
 from tqdm import tqdm
 
 from gaussian_renderer import render
@@ -127,7 +129,57 @@ def _filter_existing_coverage(
     return new_pts[keep], new_cols[keep]
 
 
-def insert_gaussians_from_frame(gaussians, frame, args) -> int:
+def _get_sensor_depth(cam, target_h: int, target_w: int) -> Optional[torch.Tensor]:
+    """
+    Return the sensor depth for a streaming camera as a [1, H, W] float32 CPU tensor,
+    resized to (target_h, target_w) with nearest-neighbour interpolation.
+    Lazy-loaded and cached on the camera object (cam._sensor_depth_cache).
+    Returns None for non-streaming cameras or if depth is unavailable.
+    """
+    if not hasattr(cam, "_streaming_depth_path"):
+        return None
+    if cam._sensor_depth_cache is False:  # sentinel: previous load failed
+        return None
+    if cam._sensor_depth_cache is not None:
+        return cam._sensor_depth_cache
+    # First access: load from disk
+    depth_path = cam._streaming_depth_path
+    if depth_path is None or not os.path.exists(depth_path):
+        cam._sensor_depth_cache = False
+        return None
+    try:
+        from utils.rgbd_frames import depth_to_meters
+        from PIL import Image as _Image
+        depth_raw = np.array(_Image.open(depth_path))
+        depth_m = depth_to_meters(depth_raw, cam._streaming_depth_scale).astype(np.float32)
+    except Exception:
+        cam._sensor_depth_cache = False
+        return None
+    d_t = torch.from_numpy(depth_m)[None, None]  # [1, 1, H_sensor, W_sensor]
+    if d_t.shape[2] != target_h or d_t.shape[3] != target_w:
+        d_t = torch.nn.functional.interpolate(d_t, (target_h, target_w), mode="nearest")
+    cam._sensor_depth_cache = d_t[0]  # [1, H, W] on CPU
+    return cam._sensor_depth_cache
+
+
+def _load_depth_meters(frame) -> Optional[np.ndarray]:
+    """Load and convert a frame's depth image to float32 metres array, or None on failure."""
+    from utils.rgbd_frames import depth_to_meters
+    from PIL import Image as _Image
+    if frame is None or frame.depth_path is None or not os.path.exists(frame.depth_path):
+        return None
+    try:
+        depth = np.array(_Image.open(frame.depth_path))
+        return depth_to_meters(depth, frame.depth_scale).astype(np.float32)
+    except Exception:
+        return None
+
+
+def insert_gaussians_from_frame(
+    gaussians, frame, args,
+    prev_frame=None,
+    prev_depth_meters: Optional[np.ndarray] = None,
+) -> int:
     """
     Phase 2: backproject an RGB-D frame, voxel-filter, remove already-covered
     regions, and append new Gaussians.  Returns the count actually added.
@@ -219,6 +271,34 @@ def insert_gaussians_from_frame(gaussians, frame, args) -> int:
     ry = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
     cols = rgb[ry, rx].astype(np.float32)
 
+    # ---- Two-frame depth consistency check ----------------------------------
+    # Reproject world-space points into the previous frame's camera and compare
+    # against the previous depth map. Single-frame artifacts (reflections,
+    # moving objects, sensor noise) are inconsistent and rejected.
+    consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
+    if prev_frame is not None and prev_depth_meters is not None and consistency_thresh > 0:
+        w2c_prev = np.linalg.inv(prev_frame.c2w)
+        pts_h = np.concatenate([pts, np.ones((len(pts), 1), dtype=np.float32)], axis=1)
+        pts_cam = (w2c_prev @ pts_h.T).T           # (N, 4) in prev camera space
+        z_proj = pts_cam[:, 2]
+        ph, pw = prev_depth_meters.shape
+        u_prev = pts_cam[:, 0] / np.where(z_proj != 0, z_proj, 1e-8) * prev_frame.fx + prev_frame.cx
+        v_prev = pts_cam[:, 1] / np.where(z_proj != 0, z_proj, 1e-8) * prev_frame.fy + prev_frame.cy
+        in_frame = (z_proj > 0) & (u_prev >= 0) & (u_prev < pw) & (v_prev >= 0) & (v_prev < ph)
+        consistent = np.ones(len(pts), dtype=bool)
+        if in_frame.any():
+            ui = np.clip(u_prev[in_frame].round().astype(np.int32), 0, pw - 1)
+            vi = np.clip(v_prev[in_frame].round().astype(np.int32), 0, ph - 1)
+            z_lookup = prev_depth_meters[vi, ui]
+            valid_lookup = z_lookup > 0
+            consistent[in_frame] = ~valid_lookup | (np.abs(z_proj[in_frame] - z_lookup) < consistency_thresh)
+        # Points outside prev frustum are accepted (new scene territory)
+        pts = pts[consistent]
+        cols = cols[consistent]
+
+    if pts.shape[0] == 0:
+        return 0
+
     pts, cols = _voxel_downsample(pts, cols, voxel_size)
     pts, cols = _filter_existing_coverage(pts, cols, gaussians.get_xyz, cover_voxel)
 
@@ -284,6 +364,65 @@ def _write_ply(snap, out_path):
         (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
     )))
     PlyData([PlyElement.describe(elements, "vertex")]).write(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Streaming render snapshot (train + test views at frame milestones)
+# ---------------------------------------------------------------------------
+
+def _render_streaming_snapshot(
+    gaussians, streaming_scene, render_fn, pipe, background, args, n_frames, tb_writer,
+    save_worker: Optional[_AsyncSaveWorker] = None,
+):
+    """
+    Render train keyframe window + held-out test cameras, save PNGs, log PSNR.
+    Called at frame-save milestones when --streaming_render_at_saves is set.
+    """
+    train_cams = streaming_scene.get_local_cameras()
+    test_cams = streaming_scene.getTestCameras()
+    if not train_cams and not test_cams:
+        return
+
+    output_base = os.path.join(args.model_path, "streaming_renders", f"frame_{n_frames}")
+
+    for split, cameras in [("train", train_cams), ("test", test_cams)]:
+        if not cameras:
+            continue
+        render_dir = os.path.join(output_base, split, "renders")
+        gt_dir = os.path.join(output_base, split, "gt")
+        os.makedirs(render_dir, exist_ok=True)
+        os.makedirs(gt_dir, exist_ok=True)
+        psnrs = []
+        render_data = []
+        for cam in cameras:
+            with torch.no_grad():
+                img = torch.clamp(render_fn(cam, gaussians, pipe, background)["render"], 0.0, 1.0)
+                gt = torch.clamp(cam.original_image[:3].cuda(), 0.0, 1.0)
+            psnrs.append(psnr(img, gt).mean().item())
+            render_data.append((
+                img.cpu(), gt.cpu(),
+                os.path.join(render_dir, f"{cam.image_name}.png"),
+                os.path.join(gt_dir, f"{cam.image_name}.png"),
+            ))
+        if psnrs:
+            mean_psnr = float(np.mean(psnrs))
+            print(
+                f"[streaming-render] frame={n_frames} {split} PSNR={mean_psnr:.2f}dB ({len(psnrs)} views)",
+                flush=True,
+            )
+            if tb_writer:
+                tb_writer.add_scalar(f"streaming_eval/{split}_psnr", mean_psnr, n_frames)
+
+        # Save images via async worker to avoid blocking training
+        def _save_batch(data=render_data):
+            for img_cpu, gt_cpu, r_path, g_path in data:
+                save_image(img_cpu, r_path)
+                save_image(gt_cpu, g_path)
+
+        if save_worker is not None:
+            save_worker.enqueue(_save_batch)
+        else:
+            _save_batch()
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +540,11 @@ def streaming_training(
     ema_loss = 0.0
     n_frames_ingested = n_init  # already ingested during init
     total_inserted = 0
+    _prev_insert_frame = None       # previous frame for depth consistency check
+    _prev_insert_depth_m = None     # depth map (metres) for previous frame
+    depth_loss_weight = getattr(args, "streaming_depth_loss_weight", 0.0)
+    use_depth_loss = depth_loss_weight > 0
+    depth_loss_type = getattr(args, "streaming_depth_loss_type", "l1")
     streaming_mcmc_local = getattr(args, "streaming_mcmc_local_only", True)
     global_maint_interval = max(0, getattr(args, "streaming_global_maintenance_interval", 500))
     scalar_log_interval = max(1, int(getattr(args, "scalar_log_interval", 10)))
@@ -444,7 +588,11 @@ def streaming_training(
                     cap = getattr(args, "cap_max", -1)
                     current_n = gaussians.get_xyz.shape[0]
                     if cap <= 0 or current_n < cap:
-                        added = insert_gaussians_from_frame(gaussians, new_frame, args)
+                        added = insert_gaussians_from_frame(
+                            gaussians, new_frame, args,
+                            prev_frame=_prev_insert_frame,
+                            prev_depth_meters=_prev_insert_depth_m,
+                        )
                         total_inserted += added
                         if added > 0 and iteration % 100 == 0:
                             print(
@@ -452,6 +600,9 @@ def streaming_training(
                                 f"inserted={added} total_inserted={total_inserted} N={gaussians.get_xyz.shape[0]}",
                                 flush=True,
                             )
+                    # Cache this frame as the previous frame for next insertion
+                    _prev_insert_frame = new_frame
+                    _prev_insert_depth_m = _load_depth_meters(new_frame)
 
         # ---- Learning rate update -----------------------------------------
         xyz_lr = gaussians.update_learning_rate(iteration)
@@ -476,7 +627,8 @@ def streaming_training(
             or sh_update_interval <= 1
             or iteration % sh_update_interval == 0
         )
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, update_sh_rest=update_sh_rest)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, update_sh_rest=update_sh_rest,
+                            render_depth=use_depth_loss)
         image = render_pkg["render"]
 
         # ---- Loss ---------------------------------------------------------
@@ -525,6 +677,26 @@ def streaming_training(
                 )
                 loss = loss + args.lambda_eff_count * L_eff
                 loss = loss + args.lambda_opacity_entropy * compute_opacity_entropy_loss(gaussians._opacity)
+
+        # ---- Depth supervision loss ----------------------------------------
+        _depth_loss_val = None
+        if use_depth_loss and "rendered_depth" in render_pkg:
+            sensor_d_cpu = _get_sensor_depth(
+                viewpoint_cam, image.shape[1], image.shape[2]
+            )
+            if sensor_d_cpu is not None:
+                sensor_d = sensor_d_cpu.to(device="cuda", non_blocking=True)
+                rend_d = render_pkg["rendered_depth"]  # [1, H, W]
+                valid = (sensor_d > 0) & (rend_d.detach() > 0)
+                if valid.any():
+                    if depth_loss_type == "huber":
+                        L_depth = torch.nn.functional.huber_loss(
+                            rend_d[valid], sensor_d[valid], reduction="mean", delta=0.1
+                        )
+                    else:
+                        L_depth = (rend_d[valid] - sensor_d[valid]).abs().mean()
+                    loss = loss + depth_loss_weight * L_depth
+                    _depth_loss_val = L_depth.item()
 
         # ---- Backward -----------------------------------------------------
         mcmc_strategy.step_pre_backward(
@@ -647,6 +819,8 @@ def streaming_training(
                                      len(streaming_scene.get_local_cameras()), iteration)
                 tb_writer.add_scalar("streaming/replay_buffer",
                                      len(streaming_scene._replay_buffer), iteration)
+                if _depth_loss_val is not None:
+                    tb_writer.add_scalar("train/depth_loss", _depth_loss_val, iteration)
 
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -667,6 +841,11 @@ def streaming_training(
                     args.model_path, f"point_cloud/frame_{n_frames_ingested}/point_cloud.ply"
                 )
                 save_worker.enqueue(lambda s=_snap, p=_ply_path: _write_ply(s, p))
+                if getattr(args, "streaming_render_at_saves", False):
+                    _render_streaming_snapshot(
+                        gaussians, streaming_scene, render, pipe, background,
+                        args, n_frames_ingested, tb_writer, save_worker=save_worker,
+                    )
 
         # Iteration-based PLY saves (explicit list or interval fallback)
         if (iteration in saving_iterations) or (save_interval > 0 and iteration % save_interval == 0):
@@ -682,6 +861,21 @@ def streaming_training(
             _state = gaussians.capture()
             _chk = os.path.join(args.model_path, f"chkpnt{iteration}.pth")
             save_worker.enqueue(lambda s=_state, i=iteration, p=_chk: torch.save((s, i), p))
+
+    # End-of-training render snapshot (all train cameras, capped at 50)
+    if getattr(args, "streaming_render_at_saves", False):
+        all_train = streaming_scene.getTrainCameras()
+        if len(all_train) > 50:
+            step = max(1, len(all_train) // 50)
+            all_train = all_train[::step][:50]
+        # Temporarily expose capped list via a simple wrapper
+        class _TmpScene:
+            def get_local_cameras(self): return all_train
+            def getTestCameras(self): return streaming_scene.getTestCameras()
+        _render_streaming_snapshot(
+            gaussians, _TmpScene(), render, pipe, background,
+            args, n_frames_ingested, tb_writer, save_worker=save_worker,
+        )
 
     save_worker.shutdown()
     print("\n[streaming] Training complete.", flush=True)

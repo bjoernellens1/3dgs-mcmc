@@ -31,6 +31,8 @@ class StreamingScene:
 
         # All cameras that have "arrived" so far (in order)
         self.train_cameras: List = []
+        # Hold-out cameras for test evaluation (never used in training)
+        self._test_cameras: List = []
         # Ring buffer of the last streaming_replay_buffer cameras
         self._replay_buffer: List = []
         self.current_camera = None
@@ -189,12 +191,17 @@ class StreamingScene:
         self._source_idx += 1
 
         cam = self._frame_to_camera(frame)
-        self.train_cameras.append(cam)
 
-        replay_size = getattr(self.args, "streaming_replay_buffer", 32)
-        self._replay_buffer.append(cam)
-        if len(self._replay_buffer) > replay_size:
-            self._replay_buffer.pop(0)
+        eval_hold = getattr(self.args, "streaming_eval_hold", 0)
+        if eval_hold > 0 and frame.index % eval_hold == 0:
+            # Hold-out frame: add to test set only, skip training/replay
+            self._test_cameras.append(cam)
+        else:
+            self.train_cameras.append(cam)
+            replay_size = getattr(self.args, "streaming_replay_buffer", 32)
+            self._replay_buffer.append(cam)
+            if len(self._replay_buffer) > replay_size:
+                self._replay_buffer.pop(0)
 
         self.current_camera = cam
         prepare_camera_for_render(cam, device="cuda")
@@ -224,7 +231,7 @@ class StreamingScene:
         return self.train_cameras
 
     def getTestCameras(self, scale: float = 1.0) -> List:
-        return []
+        return self._test_cameras
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -252,4 +259,9 @@ class StreamingScene:
             fx=float(frame.fx), fy=float(frame.fy),
             cx=float(frame.cx), cy=float(frame.cy),
         )
-        return loadCam(self.args, frame.index, cam_info, self.resolution_scale)
+        cam = loadCam(self.args, frame.index, cam_info, self.resolution_scale)
+        # Attach depth source for streaming depth loss (loaded lazily at training time)
+        cam._streaming_depth_path = frame.depth_path
+        cam._streaming_depth_scale = frame.depth_scale
+        cam._sensor_depth_cache = None  # populated on first access
+        return cam
