@@ -229,7 +229,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
         return RGBDSequenceFrameSource(
             path,
             max_frames=getattr(args, "streaming_max_frames", 0),
-            frame_stride=getattr(args, "rgbd_depth_stride", 1),
+            frame_stride=getattr(args, "streaming_frame_stride", 1),
         )
     if (
         os.path.exists(os.path.join(path, "rgb.txt"))

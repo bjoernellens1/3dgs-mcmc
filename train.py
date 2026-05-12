@@ -1201,6 +1201,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[profile] Trace saved to {_profile_path}.", flush=True)
     if scene_cache_writer is not None:
         scene_cache_writer.save(gaussians, opt.iterations, final=True)
+
+    # Mandatory post-training report: test PSNR + comparison renders + trajectory MP4.
+    try:
+        from utils.comparison_report import write_post_training_report
+        write_post_training_report(
+            model_path=args.model_path,
+            iteration=opt.iterations,
+            gaussians=gaussians,
+            train_cams=list(scene.getTrainCameras()),
+            test_cams=list(scene.getTestCameras()),
+            render_fn=render,
+            pipe=pipe,
+            background=background,
+            tb_writer=tb_writer,
+            log_prefix="report",
+        )
+    except Exception as e:
+        print(f"[report] post-training report failed: {e}", flush=True)
+
     save_worker.shutdown()
     if video_recorder is not None:
         video_recorder.close()

@@ -42,6 +42,7 @@ from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
 from utils.stream_scheduler import FrameScheduler
 from utils.streaming_frames import make_frame_source
+from utils.general_utils import inverse_sigmoid
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -86,18 +87,22 @@ class _AsyncSaveWorker:
 # Point-cloud insertion helpers (Phase 2)
 # ---------------------------------------------------------------------------
 
-def _voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size: float):
-    """Keep one representative point per voxel cell (O(N log N))."""
+def _voxel_downsample_indices(points: np.ndarray, voxel_size: float):
     if points.shape[0] == 0:
-        return points, colors
+        return points, np.array([], dtype=np.int64)
     mins = points.min(axis=0)
     cell = np.floor((points - mins) / max(voxel_size, 1e-6)).astype(np.int64)
-    # Pack (ix, iy, iz) into a single integer for np.unique
     maxc = cell.max(axis=0) + 1
     stride = np.array([maxc[1] * maxc[2], maxc[2], 1], dtype=np.int64)
     keys = cell @ stride
     _, first = np.unique(keys, return_index=True)
-    return points[first], colors[first]
+    return points[first], first
+
+
+def _voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size: float):
+    """Keep one representative point per voxel cell (O(N log N))."""
+    p, i = _voxel_downsample_indices(points, voxel_size)
+    return p, colors[i]
 
 
 def _filter_existing_coverage(
@@ -108,25 +113,9 @@ def _filter_existing_coverage(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Remove new points that fall within voxel_size of any existing Gaussian.
-    Uses a voxel-grid occupancy set — O(N_exist + N_new).
+    (DEPRECATED: Use StreamingScene.check_occupancy instead)
     """
-    if new_pts.shape[0] == 0 or existing_xyz.shape[0] == 0:
-        return new_pts, new_cols
-
-    exist_np = existing_xyz.detach().cpu().numpy()
-    all_pts = np.concatenate([exist_np, new_pts], axis=0)
-    mins = all_pts.min(axis=0)
-
-    def to_voxel_key(pts):
-        cell = np.floor((pts - mins) / max(voxel_size, 1e-6)).astype(np.int64)
-        mx = np.floor((all_pts.max(axis=0) - mins) / max(voxel_size, 1e-6)).astype(np.int64) + 1
-        stride = np.array([mx[1] * mx[2], mx[2], 1], dtype=np.int64)
-        return cell @ stride
-
-    occupied = set(to_voxel_key(exist_np).tolist())
-    new_keys = to_voxel_key(new_pts)
-    keep = np.array([k not in occupied for k in new_keys.tolist()])
-    return new_pts[keep], new_cols[keep]
+    return new_pts, new_cols
 
 
 def _get_sensor_depth(cam, target_h: int, target_w: int) -> Optional[torch.Tensor]:
@@ -175,14 +164,34 @@ def _load_depth_meters(frame) -> Optional[np.ndarray]:
         return None
 
 
+def _quaternion_from_normal(normal: np.ndarray) -> np.ndarray:
+    """Compute wxyz quaternions rotating [0,0,1] to the given normals."""
+    # normal: [N, 3] normalised
+    z_axis = np.array([0, 0, 1.0])
+    N = normal.shape[0]
+    
+    # Cross product for axis of rotation
+    cross = np.cross(z_axis, normal)
+    # Dot product + 1 for angle (half-angle identity approach)
+    w = 1.0 + np.sum(z_axis * normal, axis=1)
+    
+    q = np.stack([w, cross[:, 0], cross[:, 1], cross[:, 2]], axis=1)
+    norm = np.linalg.norm(q, axis=1, keepdims=True)
+    return q / (norm + 1e-8)
+
+
 def insert_gaussians_from_frame(
     gaussians, frame, args,
+    streaming_scene: "StreamingScene",
     prev_frame=None,
     prev_depth_meters: Optional[np.ndarray] = None,
+    render_alpha: Optional[torch.Tensor] = None,
+    render_depth: Optional[torch.Tensor] = None,
+    current_frame_idx: int = 0,
 ) -> int:
     """
     Phase 2: backproject an RGB-D frame, voxel-filter, remove already-covered
-    regions, and append new Gaussians.  Returns the count actually added.
+    regions, and append new Gaussians as surface-aligned surfels.
     """
     from utils.rgbd_frames import depth_to_meters
     from PIL import Image as _Image
@@ -198,9 +207,8 @@ def insert_gaussians_from_frame(
     if cover_voxel <= 0:
         cover_voxel = voxel_size * 1.5
     max_new = getattr(args, "streaming_max_new_gaussians_per_frame", 2000)
-    init_scale = getattr(args, "init_scale", 0.01)
-    init_opacity = getattr(args, "streaming_insert_opacity", 0.3)
-    edge_threshold = getattr(args, "streaming_depth_edge_threshold", 0.1)
+    init_opacity = getattr(args, "streaming_insert_opacity", 0.05)
+    edge_threshold = getattr(args, "streaming_depth_edge_threshold", 0.02)
     max_view_angle = getattr(args, "streaming_max_view_angle", 70.0)
     use_knn_scale = getattr(args, "streaming_insert_knn_scale", True)
 
@@ -216,107 +224,113 @@ def insert_gaussians_from_frame(
     z_v = z[ys, xs]
     valid = np.isfinite(z_v) & (z_v > min_depth) & (z_v < max_depth)
 
-    # ---- Depth discontinuity masking -----------------------------------------
-    # Reject pixels at depth edges (foreground/background boundaries) — the
-    # primary source of mid-air floaters.  Gradient computed at stride spacing.
+    # ---- Alpha & Residual masking (Step 4) ----------------------------------
+    if render_alpha is not None:
+        alpha_cpu = render_alpha.detach().cpu().numpy().squeeze() # [H, W]
+        # Downsample to match insertion grid
+        alpha_v = alpha_cpu[ys, xs]
+        valid = valid & (alpha_v < 0.5)
+    
+    if render_depth is not None:
+        rend_d_cpu = render_depth.detach().cpu().numpy().squeeze()
+        rend_d_v = rend_d_cpu[ys, xs]
+        consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
+        # Only insert if current depth is significantly in front of what's already there
+        # or if there is no rendered depth at all.
+        significant = (rend_d_v <= 0) | (rend_d_v - z_v > consistency_thresh)
+        valid = valid & significant
+
+    # ---- Relative depth discontinuity masking (Step 5) ----------------------
     if edge_threshold > 0:
         s = depth_stride
-        xs_l = np.clip(xs - s, 0, w - 1)
-        xs_r = np.clip(xs + s, 0, w - 1)
-        ys_u = np.clip(ys - s, 0, h - 1)
-        ys_d = np.clip(ys + s, 0, h - 1)
-        dzdx = np.abs(z[ys, xs_r] - z[ys, xs_l])
-        dzdy = np.abs(z[ys_d, xs] - z[ys_u, xs])
-        valid = valid & ((dzdx + dzdy) < edge_threshold)
+        dzdx = np.abs(z[ys, np.clip(xs + s, 0, w - 1)] - z[ys, np.clip(xs - s, 0, w - 1)])
+        dzdy = np.abs(z[np.clip(ys + s, 0, h - 1), xs] - z[np.clip(ys - s, 0, h - 1), xs])
+        edge_rel = (dzdx + dzdy) / np.maximum(z_v, 1e-6)
+        valid = valid & (edge_rel < edge_threshold)
 
     if not valid.any():
         return 0
 
-    xs_v = xs[valid].astype(np.float32)
-    ys_v = ys[valid].astype(np.float32)
-    z_v = z_v[valid].astype(np.float32)
+    # Sampling for normals
+    s = depth_stride
+    xs_vi = xs[valid].astype(np.int32)
+    ys_vi = ys[valid].astype(np.int32)
+    z_vi = z_v[valid]
+    
+    dzdx_v = (z[ys_vi, np.clip(xs_vi + s, 0, w - 1)] - z[ys_vi, np.clip(xs_vi - s, 0, w - 1)])
+    dzdy_v = (z[np.clip(ys_vi + s, 0, h - 1), xs_vi] - z[np.clip(ys_vi - s, 0, h - 1), xs_vi])
+    
+    # ---- Grazing-angle rejection ---------------------------------------------
+    nx = -dzdx_v / (frame.fx * (2.0 * s / depth_stride)) # scaled by local stride
+    ny = -dzdy_v / (frame.fy * (2.0 * s / depth_stride))
+    nz = np.ones_like(nx)
+    norm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-8
+    nx /= norm; ny /= norm; nz /= norm
+    
+    cos_thresh = float(np.cos(np.deg2rad(max_view_angle)))
+    angle_ok = nz > cos_thresh
+    
+    if not angle_ok.any():
+        return 0
+        
+    xs_v = xs_vi[angle_ok].astype(np.float32)
+    ys_v = ys_vi[angle_ok].astype(np.float32)
+    z_v = z_vi[angle_ok].astype(np.float32)
+    nx = nx[angle_ok]; ny = ny[angle_ok]; nz = nz[angle_ok]
+    
     x_c = (xs_v - frame.cx) / frame.fx * z_v
     y_c = (ys_v - frame.cy) / frame.fy * z_v
-
-    # ---- Grazing-angle rejection ---------------------------------------------
-    # Surface normal in camera frame: n ≈ normalize([-dzdx/fx, -dzdy/fy, 1]).
-    # cos(angle) = n_z / ||n|| — reject when angle to view ray exceeds threshold.
-    if max_view_angle < 90.0:
-        cos_thresh = float(np.cos(np.deg2rad(max_view_angle)))
-        xs_vi = xs_v.astype(np.int32)
-        ys_vi = ys_v.astype(np.int32)
-        dzdx_v = (z[ys_vi, np.clip(xs_vi + depth_stride, 0, w - 1)] -
-                  z[ys_vi, np.clip(xs_vi - depth_stride, 0, w - 1)])
-        dzdy_v = (z[np.clip(ys_vi + depth_stride, 0, h - 1), xs_vi] -
-                  z[np.clip(ys_vi - depth_stride, 0, h - 1), xs_vi])
-        # Normal components (camera frame, unnormalised)
-        nx = -dzdx_v / frame.fx
-        ny = -dzdy_v / frame.fy
-        nz = np.ones_like(nx)
-        norm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-8
-        cos_angle = nz / norm  # dot with [0,0,1] view dir
-        angle_ok = cos_angle > cos_thresh
-        xs_v = xs_v[angle_ok]
-        ys_v = ys_v[angle_ok]
-        z_v = z_v[angle_ok]
-        x_c = x_c[angle_ok]
-        y_c = y_c[angle_ok]
-
-    if xs_v.shape[0] == 0:
-        return 0
-
     pts = ((frame.c2w[:3, :3] @ np.stack([x_c, y_c, z_v], axis=1).T).T + frame.c2w[:3, 3]).astype(np.float32)
+    
     rgb_h, rgb_w = rgb.shape[:2]
     rx = np.clip((xs_v / max(w - 1, 1) * (rgb_w - 1)).round().astype(np.int32), 0, rgb_w - 1)
     ry = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
     cols = rgb[ry, rx].astype(np.float32)
 
-    # ---- Two-frame depth consistency check ----------------------------------
-    # Reproject world-space points into the previous frame's camera and compare
-    # against the previous depth map. Single-frame artifacts (reflections,
-    # moving objects, sensor noise) are inconsistent and rejected.
-    consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
-    if prev_frame is not None and prev_depth_meters is not None and consistency_thresh > 0:
-        w2c_prev = np.linalg.inv(prev_frame.c2w)
-        pts_h = np.concatenate([pts, np.ones((len(pts), 1), dtype=np.float32)], axis=1)
-        pts_cam = (w2c_prev @ pts_h.T).T           # (N, 4) in prev camera space
-        z_proj = pts_cam[:, 2]
-        ph, pw = prev_depth_meters.shape
-        u_prev = pts_cam[:, 0] / np.where(z_proj != 0, z_proj, 1e-8) * prev_frame.fx + prev_frame.cx
-        v_prev = pts_cam[:, 1] / np.where(z_proj != 0, z_proj, 1e-8) * prev_frame.fy + prev_frame.cy
-        in_frame = (z_proj > 0) & (u_prev >= 0) & (u_prev < pw) & (v_prev >= 0) & (v_prev < ph)
-        consistent = np.ones(len(pts), dtype=bool)
-        if in_frame.any():
-            ui = np.clip(u_prev[in_frame].round().astype(np.int32), 0, pw - 1)
-            vi = np.clip(v_prev[in_frame].round().astype(np.int32), 0, ph - 1)
-            z_lookup = prev_depth_meters[vi, ui]
-            valid_lookup = z_lookup > 0
-            consistent[in_frame] = ~valid_lookup | (np.abs(z_proj[in_frame] - z_lookup) < consistency_thresh)
-        # Points outside prev frustum are accepted (new scene territory)
-        pts = pts[consistent]
-        cols = cols[consistent]
+    # ---- Persistent Voxel coverage filter (Step 7) --------------------------
+    occupied = streaming_scene.check_occupancy(pts, cover_voxel, check_neighbors=True)
+    pts = pts[~occupied]
+    cols = cols[~occupied]
+    nx = nx[~occupied]; ny = ny[~occupied]; nz = nz[~occupied]
+    z_v = z_v[~occupied]
 
     if pts.shape[0] == 0:
         return 0
 
-    pts, cols = _voxel_downsample(pts, cols, voxel_size)
-    pts, cols = _filter_existing_coverage(pts, cols, gaussians.get_xyz, cover_voxel)
+    # Downsample remaining
+    pts, indices = _voxel_downsample_indices(pts, voxel_size)
+    cols = cols[indices]
+    nx = nx[indices]; ny = ny[indices]; nz = nz[indices]
+    z_v = z_v[indices]
 
-    if pts.shape[0] == 0:
-        return 0
-    if pts.shape[0] > max_new:
-        rng = np.random.default_rng()
+    if max_new > 0 and pts.shape[0] > max_new:
+        rng = np.random.default_rng(42)
         idx = rng.choice(pts.shape[0], size=max_new, replace=False)
-        pts, cols = pts[idx], cols[idx]
+        pts, cols, nx, ny, nz, z_v = pts[idx], cols[idx], nx[idx], ny[idx], nz[idx], z_v[idx]
 
-    pts_t = torch.from_numpy(pts).float()
-    cols_t = torch.from_numpy(cols).float()
+    # ---- Surface-aligned initialisation (Step 6) ----------------------------
+    # Align Gaussians to surface normals
+    normals_cam = np.stack([nx, ny, nz], axis=1)
+    normals_world = (frame.c2w[:3, :3] @ normals_cam.T).T
+    q_world = _quaternion_from_normal(normals_world)
+    
+    # Anisotropic Scales: thin surfels
+    tx = z_v / frame.fx * depth_stride
+    ty = z_v / frame.fy * depth_stride
+    tz = 0.2 * np.minimum(tx, ty)
+    log_scales = np.log(np.stack([tx, ty, tz], axis=1))
+
     added = gaussians.add_points_as_gaussians(
-        pts_t, cols_t,
-        init_scale=init_scale,
+        torch.from_numpy(pts),
+        torch.from_numpy(cols),
         init_opacity=init_opacity,
-        use_knn_scale=use_knn_scale,
+        scales=torch.from_numpy(log_scales),
+        rotations=torch.from_numpy(q_world),
+        is_provisional=True,
+        birth_frame=current_frame_idx,
     )
+    if added > 0:
+        streaming_scene.add_to_occupancy_hash(gaussians.get_xyz[-added:])
     return added
 
 
@@ -428,6 +442,60 @@ def _render_streaming_snapshot(
 # ---------------------------------------------------------------------------
 # Main streaming training function
 # ---------------------------------------------------------------------------
+
+def _update_provisional_support(gaussians, cam, render_pkg, args):
+    """
+    Check visible provisional Gaussians against sensor depth and increment support.
+    """
+    if not hasattr(gaussians, "provisional") or not gaussians.provisional.any():
+        return
+    
+    visible = render_pkg["visibility_filter"]
+    to_check = gaussians.provisional & visible
+    if not to_check.any():
+        return
+        
+    sensor_d_cpu = _get_sensor_depth(cam, cam.image_height, cam.image_width)
+    if sensor_d_cpu is None:
+        return
+        
+    sensor_d = sensor_d_cpu.to(device="cuda", non_blocking=True)
+    
+    # Project points to get pixel coords
+    xyz_v = gaussians.get_xyz[to_check]
+    pts_h = torch.cat([xyz_v, torch.ones((xyz_v.shape[0], 1), device="cuda")], dim=1)
+    
+    # W2C
+    w2c = cam.world_view_transform.transpose(0, 1)
+    pts_cam = pts_h @ w2c.T
+    z_p = pts_cam[:, 2]
+    
+    # Intrinsic projection
+    W, H = cam.image_width, cam.image_height
+    fx = getattr(cam, "fx", W / (2.0 * math.tan(cam.FoVx / 2.0)))
+    fy = getattr(cam, "fy", H / (2.0 * math.tan(cam.FoVy / 2.0)))
+    cx = getattr(cam, "cx", W / 2.0)
+    cy = getattr(cam, "cy", H / 2.0)
+    
+    u = (pts_cam[:, 0] / torch.clamp(z_p, min=1e-6)) * fx + cx
+    v = (pts_cam[:, 1] / torch.clamp(z_p, min=1e-6)) * fy + cy
+    
+    ui = u.round().long()
+    vi = v.round().long()
+    
+    valid_px = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H) & (z_p > 0)
+    if not valid_px.any():
+        return
+        
+    # Consistency check
+    z_lookup = sensor_d[0, vi[valid_px], ui[valid_px]]
+    consistent = (z_lookup > 0) & (torch.abs(z_p[valid_px] - z_lookup) < args.streaming_depth_consistency_thresh)
+    
+    # Increment support for consistent points
+    # Need to map back from valid_px -> to_check -> global
+    indices = torch.where(to_check)[0][valid_px][consistent]
+    gaussians.support_count[indices] += 1
+
 
 def streaming_training(
     dataset,
@@ -565,6 +633,36 @@ def streaming_training(
         flush=True,
     )
 
+    # Snapshot the bootstrap camera list so the end-of-training reporter can
+    # render the SAME views with the trained Gaussians for a direct diff.
+    _bootstrap_cams = list(streaming_scene.getTrainCameras())
+
+    # Pre-training snapshot: render the post-bootstrap state through the
+    # bootstrap cameras themselves (no holdout exists yet — those frames
+    # are only added as cameras stream in).
+    try:
+        from utils.comparison_report import write_post_training_report
+        print(
+            f"[streaming] Bootstrap (post-init) report at iter_0 over "
+            f"{len(_bootstrap_cams)} bootstrap views...",
+            flush=True,
+        )
+        write_post_training_report(
+            model_path=args.model_path,
+            iteration=0,
+            gaussians=gaussians,
+            train_cams=_bootstrap_cams,
+            test_cams=_bootstrap_cams,
+            render_fn=render,
+            pipe=pipe,
+            background=background,
+            tb_writer=tb_writer,
+            log_prefix="streaming_report",
+            subdir="iter_0_bootstrap_views",
+        )
+    except Exception as e:
+        print(f"[streaming-report] pre-training report failed: {e}", flush=True)
+
     progress_bar = tqdm(
         range(first_iter, opt.iterations),
         desc="Streaming training",
@@ -579,22 +677,32 @@ def streaming_training(
         if streaming_scene.has_next_frame() and scheduler.should_release(iteration):
             result = streaming_scene.ingest_next_frame()
             if result is not None:
-                new_cam, new_frame = result
+                new_cam, new_frame, is_train = result
                 scheduler.mark_released()
                 n_frames_ingested += 1
 
                 # Phase 2: insert new Gaussians from depth
-                if getattr(args, "streaming_insert_from_depth", True):
+                if is_train and getattr(args, "streaming_insert_from_depth", True):
                     cap = getattr(args, "cap_max", -1)
                     current_n = gaussians.get_xyz.shape[0]
                     if cap <= 0 or current_n < cap:
+                        # Step 4: render new_cam to get alpha/depth mask
+                        with torch.no_grad():
+                            pkg_new = render(new_cam, gaussians, pipe, background, render_depth=True)
+                            alpha_new = pkg_new["alpha"]
+                            depth_new = pkg_new.get("rendered_depth", None)
+                        
                         added = insert_gaussians_from_frame(
                             gaussians, new_frame, args,
+                            streaming_scene=streaming_scene,
                             prev_frame=_prev_insert_frame,
                             prev_depth_meters=_prev_insert_depth_m,
+                            render_alpha=alpha_new,
+                            render_depth=depth_new,
+                            current_frame_idx=n_frames_ingested,
                         )
                         total_inserted += added
-                        if added > 0 and iteration % 100 == 0:
+                        if added > 0 and (iteration % 100 == 0 or added > 1000):
                             print(
                                 f"[streaming] iter={iteration} frame={n_frames_ingested} "
                                 f"inserted={added} total_inserted={total_inserted} N={gaussians.get_xyz.shape[0]}",
@@ -630,6 +738,33 @@ def streaming_training(
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, update_sh_rest=update_sh_rest,
                             render_depth=use_depth_loss)
         image = render_pkg["render"]
+        
+        # Support update for provisional Gaussians (Step 8)
+        _update_provisional_support(gaussians, viewpoint_cam, render_pkg, args)
+
+        # SLAM Lifecycle: Promote / Prune (Step 8)
+        if iteration % 100 == 0:
+            with torch.no_grad():
+                # Promote
+                promote_mask = gaussians.provisional & (gaussians.support_count >= args.streaming_min_support_views)
+                if promote_mask.any():
+                    gaussians.provisional[promote_mask] = False
+                    # Boost opacity to signal permanence
+                    target_op = inverse_sigmoid(torch.tensor(args.streaming_promote_opacity, device="cuda"))
+                    if model_layout == "gsplat":
+                        gaussians.params["opacities"].data[promote_mask] = target_op
+                    else:
+                        gaussians._opacity.data[promote_mask] = target_op
+                    print(f"[streaming] iter={iteration} promoted {promote_mask.sum().item()} points to permanent structure.", flush=True)
+
+                # Prune stale low-support points
+                age = n_frames_ingested - gaussians.birth_frame
+                stale_mask = gaussians.provisional & (age > args.streaming_provisional_max_age)
+                if stale_mask.any():
+                    print(f"[streaming] iter={iteration} pruning {stale_mask.sum().item()} stale provisional points.", flush=True)
+                    gaussians.prune_points(stale_mask)
+                    # Force occupancy hash update after pruning
+                    streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
 
         # ---- Loss ---------------------------------------------------------
         gt_image = viewpoint_cam.original_image
@@ -640,7 +775,11 @@ def streaming_training(
         # Regularisation: local (visible) or global depending on active-set mode
         from utils.compiled_kernels import active_reg_core
         if sparse_active_set:
-            _active = render_pkg["visibility_filter"].detach()
+            # Step 10: Refine active set to include provisional/new points
+            _visible = render_pkg["visibility_filter"].detach()
+            _provisional = gaussians.provisional.detach()
+            _active = _visible | _provisional
+            
             loss = loss + active_reg_core(
                 gaussians.get_opacity[_active],
                 gaussians.get_scaling[_active],
@@ -862,20 +1001,41 @@ def streaming_training(
             _chk = os.path.join(args.model_path, f"chkpnt{iteration}.pth")
             save_worker.enqueue(lambda s=_state, i=iteration, p=_chk: torch.save((s, i), p))
 
-    # End-of-training render snapshot (all train cameras, capped at 50)
-    if getattr(args, "streaming_render_at_saves", False):
-        all_train = streaming_scene.getTrainCameras()
-        if len(all_train) > 50:
-            step = max(1, len(all_train) // 50)
-            all_train = all_train[::step][:50]
-        # Temporarily expose capped list via a simple wrapper
-        class _TmpScene:
-            def get_local_cameras(self): return all_train
-            def getTestCameras(self): return streaming_scene.getTestCameras()
-        _render_streaming_snapshot(
-            gaussians, _TmpScene(), render, pipe, background,
-            args, n_frames_ingested, tb_writer, save_worker=save_worker,
+    # Mandatory post-training report: test PSNR + side-by-side PNGs +
+    # contact sheet + trajectory MP4. Always runs (independent of the
+    # opt-in --streaming_render_at_saves milestone snapshots).
+    try:
+        from utils.comparison_report import write_post_training_report
+        write_post_training_report(
+            model_path=args.model_path,
+            iteration=opt.iterations,
+            gaussians=gaussians,
+            train_cams=list(streaming_scene.getTrainCameras()),
+            test_cams=list(streaming_scene.getTestCameras()),
+            render_fn=render,
+            pipe=pipe,
+            background=background,
+            tb_writer=tb_writer,
+            log_prefix="streaming_report",
         )
+        # Re-render the bootstrap views with the trained Gaussians so the
+        # iter_0 vs end-of-training comparison is over the same viewpoints.
+        if _bootstrap_cams:
+            write_post_training_report(
+                model_path=args.model_path,
+                iteration=opt.iterations,
+                gaussians=gaussians,
+                train_cams=_bootstrap_cams,
+                test_cams=_bootstrap_cams,
+                render_fn=render,
+                pipe=pipe,
+                background=background,
+                tb_writer=tb_writer,
+                log_prefix="streaming_report",
+                subdir=f"iter_{opt.iterations}_bootstrap_views",
+            )
+    except Exception as e:
+        print(f"[streaming-report] post-training report failed: {e}", flush=True)
 
     save_worker.shutdown()
     print("\n[streaming] Training complete.", flush=True)

@@ -53,7 +53,8 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        self.eval = False
+        # Eval is on by default — pass --no-eval to disable the test holdout.
+        self.eval = True
         self.cap_max = 500000
         self.init_type = "sfm"
         self.model_layout = "gsplat"
@@ -261,6 +262,7 @@ class StreamingParams(ParamGroup):
         self.streaming_wallclock = False          # False = deterministic step-based simulation
         self.streaming_steps_per_frame = 50       # release one frame every N training iterations
         self.streaming_max_frames = 0             # 0 = all frames in dataset
+        self.streaming_frame_stride = 1           # Release every Nth frame from the source
         self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
         self.streaming_keyframe_window = 8        # recent cameras used for local training
         self.streaming_replay_buffer = 32         # size of older-frame replay ring buffer
@@ -279,25 +281,33 @@ class StreamingParams(ParamGroup):
         # Save PLY every N frames ingested (0 = iteration-based only)
         self.streaming_save_frame_interval = 50
         # Initial opacity for depth-inserted Gaussians — high enough for gradient signal
-        self.streaming_insert_opacity = 0.3
+        self.streaming_insert_opacity = 0.05
         # Coverage voxel multiplier (0 = use 1.5× insert_voxel_size)
         self.streaming_cover_voxel_size = 0.0
         # Depth discontinuity threshold: reject pixels where |dz/dx|+|dz/dy| > this (metres)
-        self.streaming_depth_edge_threshold = 0.05
+        self.streaming_depth_edge_threshold = 0.02
         # Grazing-angle rejection: reject surface normals > this angle from view direction (degrees)
         self.streaming_max_view_angle = 70.0
         # Use KNN-based initial scale for inserted Gaussians (matches bootstrap quality)
         self.streaming_insert_knn_scale = True
         # Two-frame depth consistency threshold (metres; 0 = disabled)
         self.streaming_depth_consistency_thresh = 0.05
-        # Hold-out every Nth arriving frame for test evaluation (0 = disabled)
-        self.streaming_eval_hold = 0
+        # Hold-out every Nth arriving frame for test evaluation (0 = disabled).
+        # Default 8 ≈ 12.5% test split, evenly spread along the trajectory.
+        # Test PSNR + comparison renders are produced post-training whenever
+        # this is > 0 (mandatory unless explicitly turned off).
+        self.streaming_eval_hold = 8
+        # SLAM lifecycle: provisional -> persistent (Step 8)
+        self.streaming_min_support_views = 2      # required multi-view confirmations
+        self.streaming_support_window = 8         # check support against recent frames
+        self.streaming_provisional_max_age = 50   # frames before pruning low-support points
+        self.streaming_promote_opacity = 0.3      # opacity boost on promotion
         # Save renders at frame-PLY save milestones (opt-in to avoid overhead)
         self.streaming_render_at_saves = False
         # Depth supervision loss weight (0 = disabled)
-        self.streaming_depth_loss_weight = 0.0
+        self.streaming_depth_loss_weight = 0.05
         # Depth loss type: "l1" or "huber"
-        self.streaming_depth_loss_type = "l1"
+        self.streaming_depth_loss_type = "huber"
         super().__init__(parser, "Streaming Parameters")
 
 

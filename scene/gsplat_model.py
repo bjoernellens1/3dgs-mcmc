@@ -67,6 +67,10 @@ class GsplatGaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.visibility_ema = torch.empty(0)
+        # Streaming state
+        self.birth_frame = torch.empty(0, dtype=torch.int32, device="cuda")
+        self.support_count = torch.empty(0, dtype=torch.int16, device="cuda")
+        self.provisional = torch.empty(0, dtype=torch.bool, device="cuda")
 
     @property
     def _xyz(self):
@@ -353,6 +357,40 @@ class GsplatGaussianModel:
         self.denom = torch.zeros((count, 1), device="cuda")
         self.max_radii2D = torch.zeros((count,), device="cuda")
         self.visibility_ema = torch.zeros((count, 1), device="cuda")
+        self.birth_frame = torch.zeros(count, dtype=torch.int32, device="cuda")
+        self.support_count = torch.zeros(count, dtype=torch.int16, device="cuda")
+        self.provisional = torch.zeros(count, dtype=torch.bool, device="cuda")
+
+    def prune_points(self, mask):
+        valid_points_mask = ~mask
+        
+        # Prune optimizable parameters
+        for name, optimizer in self.optimizers.items():
+            group = optimizer.param_groups[0]
+            old_param = group["params"][0]
+            stored_state = optimizer.state.get(old_param, None)
+            
+            new_param = nn.Parameter(old_param[valid_points_mask].detach().requires_grad_(True))
+            if stored_state is not None:
+                new_state = {}
+                for k, v in stored_state.items():
+                    if isinstance(v, torch.Tensor):
+                        new_state[k] = v[valid_points_mask]
+                    else:
+                        new_state[k] = v
+                del optimizer.state[old_param]
+                optimizer.state[new_param] = new_state
+            group["params"][0] = new_param
+            self.params[name] = new_param
+
+        # Prune running state buffers
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.denom = self.denom[valid_points_mask]
+        self.visibility_ema = self.visibility_ema[valid_points_mask]
+        self.birth_frame = self.birth_frame[valid_points_mask]
+        self.support_count = self.support_count[valid_points_mask]
+        self.provisional = self.provisional[valid_points_mask]
 
     def add_points_as_gaussians(
         self,
@@ -361,6 +399,11 @@ class GsplatGaussianModel:
         init_scale: float = 0.01,
         init_opacity: float = 0.5,
         use_knn_scale: bool = False,
+        normals: torch.Tensor = None,
+        scales: torch.Tensor = None,
+        rotations: torch.Tensor = None,
+        is_provisional: bool = False,
+        birth_frame: int = 0,
     ) -> int:
         """
         Append new Gaussians initialised from 3-D world-space points and RGB
@@ -382,8 +425,10 @@ class GsplatGaussianModel:
         num_sh = (self.max_sh_degree + 1) ** 2
         fused_color = RGB2SH(colors.to(device="cuda", dtype=torch.float32))  # (N, 3)
 
-        # Scale initialisation: KNN-based (per-point density) or fixed
-        if use_knn_scale and N > 1:
+        # Scale initialisation
+        if scales is not None:
+            log_scales = scales.to(device="cuda", dtype=torch.float32)
+        elif use_knn_scale and N > 1:
             from utils.rocm_knn_fallback import distCUDA2
             pts_cuda = points.to(device="cuda", dtype=torch.float32)
             dist_sq = distCUDA2(pts_cuda)  # (N,) squared dist to nearest neighbour
@@ -392,15 +437,20 @@ class GsplatGaussianModel:
         else:
             log_scales = torch.full((N, 3), math.log(init_scale * 0.1), device="cuda")
 
+        if rotations is not None:
+            new_quats = rotations.to(device="cuda", dtype=torch.float32)
+        else:
+            new_quats = torch.cat([                                                    # wxyz identity
+                torch.ones(N, 1, device="cuda"),
+                torch.zeros(N, 3, device="cuda"),
+            ], dim=1)
+
         new_tensors = {
             "means": points.to(device="cuda", dtype=torch.float32).contiguous(),
             "sh0": fused_color[:, None, :].contiguous(),                          # (N, 1, 3)
             "shN": torch.zeros((N, num_sh - 1, 3), device="cuda"),                # (N, R-1, 3)
             "scales": log_scales,
-            "quats": torch.cat([                                                    # wxyz identity
-                torch.ones(N, 1, device="cuda"),
-                torch.zeros(N, 3, device="cuda"),
-            ], dim=1),
+            "quats": new_quats,
             "opacities": inverse_sigmoid(torch.full((N,), float(init_opacity), device="cuda")),
         }
 
@@ -433,5 +483,14 @@ class GsplatGaussianModel:
         self.xyz_gradient_accum = torch.cat([self.xyz_gradient_accum, torch.zeros(N, 1, device="cuda")])
         self.denom = torch.cat([self.denom, torch.zeros(N, 1, device="cuda")])
         self.visibility_ema = torch.cat([self.visibility_ema, torch.zeros(N, 1, device="cuda")])
+        
+        # Extend streaming buffers
+        new_birth = torch.full((N,), int(birth_frame), dtype=torch.int32, device="cuda")
+        new_support = torch.zeros(N, dtype=torch.int16, device="cuda")
+        new_provisional = torch.full((N,), bool(is_provisional), dtype=torch.bool, device="cuda")
+        
+        self.birth_frame = torch.cat([self.birth_frame, new_birth], dim=0)
+        self.support_count = torch.cat([self.support_count, new_support], dim=0)
+        self.provisional = torch.cat([self.provisional, new_provisional], dim=0)
 
         return N

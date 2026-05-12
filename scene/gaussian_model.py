@@ -69,6 +69,10 @@ class GaussianModel:
         self.optimizer_type = "adam"
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # Streaming state
+        self.birth_frame = torch.empty(0, dtype=torch.int32, device="cuda")
+        self.support_count = torch.empty(0, dtype=torch.int16, device="cuda")
+        self.provisional = torch.empty(0, dtype=torch.bool, device="cuda")
         self.setup_functions()
 
     def capture(self):
@@ -85,6 +89,9 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.birth_frame,
+            self.support_count,
+            self.provisional,
         )
     
     def restore(self, model_args, training_args):
@@ -99,7 +106,10 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        self.birth_frame,
+        self.support_count,
+        self.provisional) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -192,6 +202,11 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.visibility_ema = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+        # Initialize streaming buffers for the initial point cloud
+        count = self.get_xyz.shape[0]
+        self.birth_frame = torch.zeros(count, dtype=torch.int32, device="cuda")
+        self.support_count = torch.zeros(count, dtype=torch.int16, device="cuda")
+        self.provisional = torch.zeros(count, dtype=torch.bool, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -426,6 +441,9 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.visibility_ema = self.visibility_ema[valid_points_mask]
+        self.birth_frame = self.birth_frame[valid_points_mask]
+        self.support_count = self.support_count[valid_points_mask]
+        self.provisional = self.provisional[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -449,7 +467,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, reset_params=True):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, reset_params=True, birth_frame=0, is_provisional=False):
         old_count = self.get_xyz.shape[0]
         old_visibility_ema = getattr(self, "visibility_ema", None)
         d = {"xyz": new_xyz,
@@ -492,6 +510,22 @@ class GaussianModel:
             else:
                 self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+        # Handle streaming buffers
+        N_new = new_xyz.shape[0]
+        new_birth = torch.full((N_new,), int(birth_frame), dtype=torch.int32, device="cuda")
+        new_support = torch.zeros(N_new, dtype=torch.int16, device="cuda")
+        new_provisional = torch.full((N_new,), bool(is_provisional), dtype=torch.bool, device="cuda")
+        
+        # If the existing buffers are empty (e.g. first init), just set them
+        if self.birth_frame.shape[0] == 0:
+            self.birth_frame = new_birth
+            self.support_count = new_support
+            self.provisional = new_provisional
+        else:
+            self.birth_frame = torch.cat([self.birth_frame, new_birth], dim=0)
+            self.support_count = torch.cat([self.support_count, new_support], dim=0)
+            self.provisional = torch.cat([self.provisional, new_provisional], dim=0)
+
     def add_points_as_gaussians(
         self,
         points: torch.Tensor,
@@ -499,6 +533,11 @@ class GaussianModel:
         init_scale: float = 0.01,
         init_opacity: float = 0.5,
         use_knn_scale: bool = False,
+        normals: torch.Tensor = None,
+        scales: torch.Tensor = None,
+        rotations: torch.Tensor = None,
+        is_provisional: bool = False,
+        birth_frame: int = 0,
     ) -> int:
         """
         Append new Gaussians initialised from 3-D world-space points and RGB
@@ -528,7 +567,9 @@ class GaussianModel:
             torch.full((N, 1), float(init_opacity), device="cuda", dtype=torch.float32)
         )
 
-        if use_knn_scale and N > 1:
+        if scales is not None:
+            new_scaling = scales.to(device="cuda", dtype=torch.float32)
+        elif use_knn_scale and N > 1:
             from utils.rocm_knn_fallback import distCUDA2
             dist_sq = distCUDA2(new_xyz)
             scales_1d = torch.clamp(dist_sq.sqrt() * 0.5, 1e-4, 0.1)
@@ -536,12 +577,16 @@ class GaussianModel:
         else:
             scale_val = math.log(math.sqrt(init_scale ** 2) * 0.1)
             new_scaling = torch.full((N, 3), scale_val, device="cuda", dtype=torch.float32)
-        new_rotation = torch.zeros((N, 4), device="cuda", dtype=torch.float32)
-        new_rotation[:, 0] = 1.0  # wxyz identity
+
+        if rotations is not None:
+            new_rotation = rotations.to(device="cuda", dtype=torch.float32)
+        else:
+            new_rotation = torch.zeros((N, 4), device="cuda", dtype=torch.float32)
+            new_rotation[:, 0] = 1.0  # wxyz identity
 
         self.densification_postfix(
             new_xyz, new_f_dc, new_f_rest, new_opacities, new_scaling, new_rotation,
-            reset_params=False,
+            reset_params=False, birth_frame=birth_frame, is_provisional=is_provisional,
         )
         return N
 

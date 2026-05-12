@@ -37,8 +37,65 @@ class StreamingScene:
         self._replay_buffer: List = []
         self.current_camera = None
         self.cameras_extent = 1.0  # updated during initialize_from_frames
+        self._source_idx = 0
+        self._all_frames = list(frame_source)
 
-        # Pre-load all frame metadata (paths + poses — no image pixels yet)
+        # Persistent occupancy hash for incremental insertion
+        self.occupied_voxels = set()
+        self.occupancy_voxel_size = 0.02
+
+    def maintain_occupancy_hash(self, voxel_size: float = 0.02):
+        """Update the occupancy hash from the current Gaussians (expensive)."""
+        self.occupancy_voxel_size = voxel_size
+        xyz = self.gaussians.get_xyz.detach().cpu().numpy()
+        if xyz.shape[0] == 0:
+            self.occupied_voxels = set()
+            return
+        
+        # Use a fixed large offset to keep keys positive and avoid floating precision issues
+        offset = 1000.0
+        coords = np.floor((xyz + offset) / max(voxel_size, 1e-6)).astype(np.int64)
+        
+        # Pack into 64-bit keys: 21 bits per dimension (covers +/- 1000m at 1mm res)
+        keys = (coords[:, 0] << 42) | (coords[:, 1] << 21) | coords[:, 2]
+        self.occupied_voxels = set(keys.tolist())
+
+    def add_to_occupancy_hash(self, xyz: torch.Tensor):
+        """Incrementally add new points to the hash."""
+        if xyz.shape[0] == 0:
+            return
+        xyz_np = xyz.detach().cpu().numpy()
+        offset = 1000.0
+        coords = np.floor((xyz_np + offset) / max(self.occupancy_voxel_size, 1e-6)).astype(np.int64)
+        keys = (coords[:, 0] << 42) | (coords[:, 1] << 21) | coords[:, 2]
+        self.occupied_voxels.update(keys.tolist())
+
+    def check_occupancy(self, xyz_np: np.ndarray, voxel_size: float, check_neighbors: bool = True) -> np.ndarray:
+        """Check whether points fall into occupied voxels."""
+        if not self.occupied_voxels or xyz_np.shape[0] == 0:
+            return np.zeros(xyz_np.shape[0], dtype=bool)
+        
+        offset = 1000.0
+        coords = np.floor((xyz_np + offset) / max(voxel_size, 1e-6)).astype(np.int64)
+        
+        keys = (coords[:, 0] << 42) | (coords[:, 1] << 21) | coords[:, 2]
+        occupied = np.array([k in self.occupied_voxels for k in keys.tolist()])
+        
+        if check_neighbors and not occupied.all():
+            # Check 26 neighbors for points not already marked occupied
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    for dz in [-1, 0, 1]:
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        remaining = ~occupied
+                        if not remaining.any():
+                            break
+                        n_coords = coords[remaining] + np.array([dx, dy, dz])
+                        n_keys = (n_coords[:, 0] << 42) | (n_coords[:, 1] << 21) | n_coords[:, 2]
+                        n_occupied = np.array([k in self.occupied_voxels for k in n_keys.tolist()])
+                        occupied[remaining] |= n_occupied
+        return occupied
         self._all_frames: List["StreamingRGBDFrame"] = frame_source.get_all()
         self._source_idx: int = 0
 
@@ -73,11 +130,22 @@ class StreamingScene:
         self.current_camera = self.train_cameras[-1]
 
         # Estimate scene extent from camera positions
-        self.cameras_extent = self._estimate_cameras_extent(initial_frames)
+        camera_extent = self._estimate_cameras_extent(initial_frames)
 
         # Build initial point cloud from depth images
         from utils.graphics_utils import BasicPointCloud
         pcd = self._build_pcd_from_frames(initial_frames)
+
+        # Incorporate PCD bbox into extent
+        pcd_extent = 0.0
+        if pcd.points.shape[0] > 0:
+            mins = np.min(pcd.points, axis=0)
+            maxs = np.max(pcd.points, axis=0)
+            pcd_extent = np.linalg.norm(maxs - mins) * 0.5
+
+        # Metric scale: enforce a minimum radius of 1.0 for stability
+        self.cameras_extent = max(camera_extent, pcd_extent, 1.0)
+
         self.gaussians.create_from_pcd(
             pcd,
             self.cameras_extent,
@@ -85,6 +153,7 @@ class StreamingScene:
             init_scale=getattr(self.args, "init_scale", 0.01),
             voxel_size=getattr(self.args, "pcd_voxel_size", 0.02),
         )
+        self.maintain_occupancy_hash(voxel_size=getattr(self.args, "streaming_insert_voxel_size", 0.02))
         print(
             f"[streaming] Initialised {self.gaussians.get_xyz.shape[0]} Gaussians "
             f"from {n_frames} frames, scene radius={self.cameras_extent:.3f}",
@@ -180,8 +249,8 @@ class StreamingScene:
     def ingest_next_frame(self) -> Optional[Tuple]:
         """
         Load the next frame as a Camera and add it to the active window and
-        replay buffer.  Returns (camera, StreamingRGBDFrame) or None when
-        the source is exhausted.
+        replay buffer.  Returns (camera, StreamingRGBDFrame, is_train) or None
+        when the source is exhausted.
         """
         if not self.has_next_frame():
             return None
@@ -193,9 +262,11 @@ class StreamingScene:
         cam = self._frame_to_camera(frame)
 
         eval_hold = getattr(self.args, "streaming_eval_hold", 0)
+        is_train = True
         if eval_hold > 0 and frame.index % eval_hold == 0:
             # Hold-out frame: add to test set only, skip training/replay
             self._test_cameras.append(cam)
+            is_train = False
         else:
             self.train_cameras.append(cam)
             replay_size = getattr(self.args, "streaming_replay_buffer", 32)
@@ -205,7 +276,7 @@ class StreamingScene:
 
         self.current_camera = cam
         prepare_camera_for_render(cam, device="cuda")
-        return cam, frame
+        return cam, frame, is_train
 
     # ------------------------------------------------------------------
     # Camera sampling

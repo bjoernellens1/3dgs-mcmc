@@ -560,11 +560,17 @@ class GsplatEnergyMCMCStrategy:
             if visibility_ema.shape[0] == gaussians.get_xyz.shape[0]:
                 visibility_ema[dead_indices] = 0.0
                 visibility_ema[sampled_idxs] = visibility_ema[sampled_idxs].clamp_max(0.5)
+        
+        provisional = getattr(gaussians, "provisional", None)
+        if provisional is not None and provisional.shape[0] == gaussians.get_xyz.shape[0]:
+            gaussians.provisional[dead_indices] = gaussians.provisional[sampled_idxs]
+            gaussians.birth_frame[dead_indices] = gaussians.birth_frame[sampled_idxs]
+            gaussians.support_count[dead_indices] = gaussians.support_count[sampled_idxs]
 
     def _append_running_state(self, gaussians, old_count, added_count):
-        for name in ("visibility_ema", "xyz_gradient_accum", "denom"):
+        for name in ("visibility_ema", "xyz_gradient_accum", "denom", "birth_frame", "support_count", "provisional"):
             tensor = getattr(gaussians, name, None)
-            if tensor is not None and tensor.numel() > 0 and tensor.shape[0] == old_count:
+            if tensor is not None and tensor.shape[0] == old_count:
                 pad = torch.zeros((added_count, *tensor.shape[1:]), device=tensor.device, dtype=tensor.dtype)
                 setattr(gaussians, name, torch.cat([tensor, pad], dim=0))
         radii = getattr(gaussians, "max_radii2D", None)
