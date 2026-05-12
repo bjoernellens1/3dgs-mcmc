@@ -38,7 +38,7 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams, OptimizationParams, StreamingParams
 from utils.mcmc_schedule import MCMCScheduleConfig, get_mcmc_schedule
 from utils.energy_mcmc import (
     compute_effective_count_loss,
@@ -356,6 +356,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if run_args is None:
         raise ValueError("training() requires run_args so feature flags are explicit and non-global.")
     args = run_args
+
+    # Streaming replay: dispatch to dedicated training loop instead of the
+    # full-dataset offline path.  All offline code below is untouched.
+    if getattr(args, "streaming_replay", False):
+        from train_streaming import streaming_training
+        return streaming_training(
+            dataset=dataset,
+            opt=opt,
+            pipe=pipe,
+            testing_iterations=testing_iterations,
+            saving_iterations=saving_iterations,
+            checkpoint_iterations=checkpoint_iterations,
+            checkpoint=checkpoint,
+            debug_from=debug_from,
+            sh_degree_schedule=sh_degree_schedule,
+            run_args=args,
+        )
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, run_args=run_args)
     model_layout = getattr(args, "model_layout", getattr(dataset, "model_layout", "gsplat")).lower()
@@ -1301,6 +1318,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    StreamingParams(parser)  # populates flat args namespace; accessed via run_args
     parser.add_argument('--config', type=str, default=None)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)

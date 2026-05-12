@@ -252,6 +252,45 @@ class OptimizationParams(ParamGroup):
         self.mcmc_control_log_interval = 500
         super().__init__(parser, "Optimization Parameters")
 
+
+class StreamingParams(ParamGroup):
+    def __init__(self, parser):
+        # Enable streaming replay mode
+        self.streaming_replay = False
+        self.streaming_input_fps = 30.0
+        self.streaming_wallclock = False          # False = deterministic step-based simulation
+        self.streaming_steps_per_frame = 50       # release one frame every N training iterations
+        self.streaming_max_frames = 0             # 0 = all frames in dataset
+        self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
+        self.streaming_keyframe_window = 8        # recent cameras used for local training
+        self.streaming_replay_buffer = 32         # size of older-frame replay ring buffer
+        self.streaming_global_replay_ratio = 0.1  # fraction of steps drawn from replay buffer
+        # Depth-based incremental Gaussian insertion (Phase 2)
+        self.streaming_insert_from_depth = True
+        self.streaming_depth_stride = 8
+        self.streaming_max_new_gaussians_per_frame = 2000
+        self.streaming_insert_voxel_size = 0.02
+        self.streaming_min_depth = 0.1
+        self.streaming_max_depth = 8.0
+        # Local MCMC: restrict noise/reloc to visible/active Gaussians only
+        self.streaming_mcmc_local_only = True
+        # Global maintenance: run full MCMC pass every N iterations (0 = never)
+        self.streaming_global_maintenance_interval = 200
+        # Save PLY every N frames ingested (0 = iteration-based only)
+        self.streaming_save_frame_interval = 50
+        # Initial opacity for depth-inserted Gaussians — high enough for gradient signal
+        self.streaming_insert_opacity = 0.3
+        # Coverage voxel multiplier (0 = use 1.5× insert_voxel_size)
+        self.streaming_cover_voxel_size = 0.0
+        # Depth discontinuity threshold: reject pixels where |dz/dx|+|dz/dy| > this (metres)
+        self.streaming_depth_edge_threshold = 0.1
+        # Grazing-angle rejection: reject surface normals > this angle from view direction (degrees)
+        self.streaming_max_view_angle = 70.0
+        # Use KNN-based initial scale for inserted Gaussians (matches bootstrap quality)
+        self.streaming_insert_knn_scale = True
+        super().__init__(parser, "Streaming Parameters")
+
+
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"

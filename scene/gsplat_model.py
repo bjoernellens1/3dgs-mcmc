@@ -353,3 +353,85 @@ class GsplatGaussianModel:
         self.denom = torch.zeros((count, 1), device="cuda")
         self.max_radii2D = torch.zeros((count,), device="cuda")
         self.visibility_ema = torch.zeros((count, 1), device="cuda")
+
+    def add_points_as_gaussians(
+        self,
+        points: torch.Tensor,
+        colors: torch.Tensor,
+        init_scale: float = 0.01,
+        init_opacity: float = 0.5,
+        use_knn_scale: bool = False,
+    ) -> int:
+        """
+        Append new Gaussians initialised from 3-D world-space points and RGB
+        colours (float32, range [0, 1]).  Extends each per-parameter optimizer
+        with zero-initialised momentum state for the new entries.
+
+        use_knn_scale: derive per-Gaussian scale from k-NN distance (matches
+        bootstrap quality); falls back to fixed init_scale when False.
+
+        Returns the number of Gaussians actually added.
+        """
+        N = points.shape[0]
+        if N == 0:
+            return 0
+
+        from utils.sh_utils import RGB2SH
+        from utils.general_utils import inverse_sigmoid
+
+        num_sh = (self.max_sh_degree + 1) ** 2
+        fused_color = RGB2SH(colors.to(device="cuda", dtype=torch.float32))  # (N, 3)
+
+        # Scale initialisation: KNN-based (per-point density) or fixed
+        if use_knn_scale and N > 1:
+            from utils.rocm_knn_fallback import distCUDA2
+            pts_cuda = points.to(device="cuda", dtype=torch.float32)
+            dist_sq = distCUDA2(pts_cuda)  # (N,) squared dist to nearest neighbour
+            scales_1d = torch.clamp(dist_sq.sqrt() * 0.5, 1e-4, 0.1)
+            log_scales = torch.log(scales_1d).unsqueeze(-1).expand(-1, 3).contiguous()
+        else:
+            log_scales = torch.full((N, 3), math.log(init_scale * 0.1), device="cuda")
+
+        new_tensors = {
+            "means": points.to(device="cuda", dtype=torch.float32).contiguous(),
+            "sh0": fused_color[:, None, :].contiguous(),                          # (N, 1, 3)
+            "shN": torch.zeros((N, num_sh - 1, 3), device="cuda"),                # (N, R-1, 3)
+            "scales": log_scales,
+            "quats": torch.cat([                                                    # wxyz identity
+                torch.ones(N, 1, device="cuda"),
+                torch.zeros(N, 3, device="cuda"),
+            ], dim=1),
+            "opacities": inverse_sigmoid(torch.full((N,), float(init_opacity), device="cuda")),
+        }
+
+        for name, ext in new_tensors.items():
+            optimizer = self.optimizers[name]
+            group = optimizer.param_groups[0]
+            old_param = group["params"][0]
+            stored_state = optimizer.state.get(old_param, None)
+
+            new_param = nn.Parameter(
+                torch.cat([old_param.detach(), ext.detach()], dim=0).requires_grad_(True)
+            )
+            if stored_state is not None:
+                new_state = {}
+                for k, v in stored_state.items():
+                    if isinstance(v, torch.Tensor) and v.dim() == ext.dim():
+                        # Per-element momentum state (exp_avg, exp_avg_sq) — extend with zeros
+                        zeros = torch.zeros(N, *ext.shape[1:], dtype=v.dtype, device=v.device)
+                        new_state[k] = torch.cat([v, zeros], dim=0)
+                    else:
+                        # Scalar step counter or other non-extensible state — keep as-is
+                        new_state[k] = v
+                del optimizer.state[old_param]
+                optimizer.state[new_param] = new_state
+            group["params"][0] = new_param
+            self.params[name] = new_param
+
+        # Extend running state buffers to match the new count
+        self.max_radii2D = torch.cat([self.max_radii2D, torch.zeros(N, device="cuda")])
+        self.xyz_gradient_accum = torch.cat([self.xyz_gradient_accum, torch.zeros(N, 1, device="cuda")])
+        self.denom = torch.cat([self.denom, torch.zeros(N, 1, device="cuda")])
+        self.visibility_ema = torch.cat([self.visibility_ema, torch.zeros(N, 1, device="cuda")])
+
+        return N

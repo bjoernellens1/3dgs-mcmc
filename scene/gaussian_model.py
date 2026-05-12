@@ -492,6 +492,59 @@ class GaussianModel:
             else:
                 self.visibility_ema = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+    def add_points_as_gaussians(
+        self,
+        points: torch.Tensor,
+        colors: torch.Tensor,
+        init_scale: float = 0.01,
+        init_opacity: float = 0.5,
+        use_knn_scale: bool = False,
+    ) -> int:
+        """
+        Append new Gaussians initialised from 3-D world-space points and RGB
+        colours (float32, range [0, 1]).  Extends the optimizer with
+        zero-initialised momentum state for the new entries.
+
+        use_knn_scale: derive per-Gaussian scale from k-NN distance (matches
+        bootstrap quality); falls back to fixed init_scale when False.
+
+        Returns the number of Gaussians actually added.
+        """
+        N = points.shape[0]
+        if N == 0:
+            return 0
+
+        from utils.sh_utils import RGB2SH
+        fused_color = RGB2SH(colors.to(device="cuda", dtype=torch.float32))
+        features = torch.zeros(
+            (N, 3, (self.max_sh_degree + 1) ** 2), device="cuda", dtype=torch.float32
+        )
+        features[:, :3, 0] = fused_color
+
+        new_xyz = points.to(device="cuda", dtype=torch.float32)
+        new_f_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
+        new_f_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+        new_opacities = inverse_sigmoid(
+            torch.full((N, 1), float(init_opacity), device="cuda", dtype=torch.float32)
+        )
+
+        if use_knn_scale and N > 1:
+            from utils.rocm_knn_fallback import distCUDA2
+            dist_sq = distCUDA2(new_xyz)
+            scales_1d = torch.clamp(dist_sq.sqrt() * 0.5, 1e-4, 0.1)
+            new_scaling = torch.log(scales_1d).unsqueeze(-1).expand(-1, 3).contiguous()
+        else:
+            scale_val = math.log(math.sqrt(init_scale ** 2) * 0.1)
+            new_scaling = torch.full((N, 3), scale_val, device="cuda", dtype=torch.float32)
+        new_rotation = torch.zeros((N, 4), device="cuda", dtype=torch.float32)
+        new_rotation[:, 0] = 1.0  # wxyz identity
+
+        self.densification_postfix(
+            new_xyz, new_f_dc, new_f_rest, new_opacities, new_scaling, new_rotation,
+            reset_params=False,
+        )
+        return N
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition

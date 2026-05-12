@@ -1,0 +1,255 @@
+"""
+StreamingScene: manages arriving RGB-D frames for streaming-replay training.
+
+Replaces the full-dataset Scene for --streaming_replay mode. Frames arrive
+one at a time (controlled by FrameScheduler in train_streaming.py), each
+converting to a Camera object and appending to the local keyframe window and
+replay buffer. The Gaussian model is initialised from the first
+streaming_initial_frames frames only; later frames insert Gaussians
+incrementally via add_points_as_gaussians() (Phase 2).
+
+Thread-safety: not re-entrant. All methods called from the training loop only.
+"""
+from __future__ import annotations
+
+import os
+import random
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from utils.streaming_frames import StreamingRGBDFrame
+
+
+class StreamingScene:
+    def __init__(self, args, gaussians, frame_source, resolution_scale: float = 1.0):
+        self.args = args
+        self.gaussians = gaussians
+        self.resolution_scale = resolution_scale
+        self.model_path = args.model_path
+
+        # All cameras that have "arrived" so far (in order)
+        self.train_cameras: List = []
+        # Ring buffer of the last streaming_replay_buffer cameras
+        self._replay_buffer: List = []
+        self.current_camera = None
+        self.cameras_extent = 1.0  # updated during initialize_from_frames
+
+        # Pre-load all frame metadata (paths + poses — no image pixels yet)
+        self._all_frames: List["StreamingRGBDFrame"] = frame_source.get_all()
+        self._source_idx: int = 0
+
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
+
+    def initialize_from_frames(self, n_frames: int) -> None:
+        """
+        Ingest the first n_frames as initial cameras and build the initial
+        Gaussian point cloud from their depth data.
+
+        Must be called BEFORE gaussians.training_setup() so the optimizer is
+        built on the correct initial parameter tensors.
+        """
+        from scene.cameras import prepare_camera_for_render
+
+        n_frames = min(n_frames, len(self._all_frames))
+        if n_frames == 0:
+            raise RuntimeError("[streaming] No frames available for initialisation.")
+
+        print(f"[streaming] Bootstrapping from {n_frames} frame(s)...", flush=True)
+        initial_frames = self._all_frames[:n_frames]
+
+        for frame in initial_frames:
+            cam = self._frame_to_camera(frame)
+            self.train_cameras.append(cam)
+            self._replay_buffer.append(cam)
+            prepare_camera_for_render(cam, device="cuda")
+
+        self._source_idx = n_frames
+        self.current_camera = self.train_cameras[-1]
+
+        # Estimate scene extent from camera positions
+        self.cameras_extent = self._estimate_cameras_extent(initial_frames)
+
+        # Build initial point cloud from depth images
+        from utils.graphics_utils import BasicPointCloud
+        pcd = self._build_pcd_from_frames(initial_frames)
+        self.gaussians.create_from_pcd(
+            pcd,
+            self.cameras_extent,
+            init_scale_mode=getattr(self.args, "init_scale_mode", "fixed"),
+            init_scale=getattr(self.args, "init_scale", 0.01),
+            voxel_size=getattr(self.args, "pcd_voxel_size", 0.02),
+        )
+        print(
+            f"[streaming] Initialised {self.gaussians.get_xyz.shape[0]} Gaussians "
+            f"from {n_frames} frames, scene radius={self.cameras_extent:.3f}",
+            flush=True,
+        )
+
+    def _estimate_cameras_extent(self, frames: List["StreamingRGBDFrame"]) -> float:
+        """NeRF++ normalisation radius from a list of frames."""
+        try:
+            from scene.readers.common import CameraInfo, getNerfppNorm
+            from utils.graphics_utils import focal2fov
+            from utils.rgbd_frames import c2w_to_camera_rt
+
+            infos = []
+            for f in frames:
+                R, T = c2w_to_camera_rt(f.c2w)
+                infos.append(CameraInfo(
+                    uid=f.index, R=R, T=T,
+                    FovY=focal2fov(f.fy, f.height),
+                    FovX=focal2fov(f.fx, f.width),
+                    image=None, image_path="", image_name="",
+                    width=f.width, height=f.height,
+                ))
+            norm = getNerfppNorm(infos)
+            return max(float(norm["radius"]), 0.1)
+        except Exception:
+            return 1.0
+
+    def _build_pcd_from_frames(self, frames: List["StreamingRGBDFrame"]):
+        """Backproject depth into a BasicPointCloud for create_from_pcd()."""
+        from utils.graphics_utils import BasicPointCloud
+        from utils.rgbd_frames import depth_to_meters
+        from PIL import Image as _Image
+
+        depth_stride = getattr(self.args, "streaming_depth_stride", 8)
+        min_depth = getattr(self.args, "streaming_min_depth", 0.1)
+        max_depth = getattr(self.args, "streaming_max_depth", 8.0)
+        max_pts = getattr(self.args, "rgbd_max_init_points", 250000)
+
+        points_all, colors_all = [], []
+        for frame in frames:
+            if frame.depth_path is None or not os.path.exists(frame.depth_path):
+                continue
+            try:
+                depth = np.array(_Image.open(frame.depth_path))
+                rgb = np.array(_Image.open(frame.rgb_path).convert("RGB")).astype(np.float32) / 255.0
+            except Exception:
+                continue
+            z = depth_to_meters(depth, frame.depth_scale)
+            h, w = z.shape
+            ys, xs = np.mgrid[0:h:depth_stride, 0:w:depth_stride]
+            z_v = z[ys, xs]
+            valid = np.isfinite(z_v) & (z_v > min_depth) & (z_v < max_depth)
+            if not valid.any():
+                continue
+            xs_v = xs[valid].astype(np.float32)
+            ys_v = ys[valid].astype(np.float32)
+            z_v = z_v[valid].astype(np.float32)
+            x_c = (xs_v - frame.cx) / frame.fx * z_v
+            y_c = (ys_v - frame.cy) / frame.fy * z_v
+            pts_cam = np.stack([x_c, y_c, z_v], axis=1)
+            pts_world = (frame.c2w[:3, :3] @ pts_cam.T).T + frame.c2w[:3, 3]
+            rgb_h, rgb_w = rgb.shape[:2]
+            rx = np.clip((xs_v / max(w - 1, 1) * (rgb_w - 1)).round().astype(np.int32), 0, rgb_w - 1)
+            ry = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
+            points_all.append(pts_world.astype(np.float32))
+            colors_all.append(rgb[ry, rx].astype(np.float32))
+
+        if not points_all:
+            # Fall back to random scatter inside the estimated scene extent
+            r = self.cameras_extent
+            n = max(1000, getattr(self.args, "cap_max", 10000) // 10)
+            pts = np.random.uniform(-r, r, (n, 3)).astype(np.float32)
+            cols = np.random.uniform(0.3, 0.7, (n, 3)).astype(np.float32)
+            print("[streaming] Warning: no depth available for init, falling back to random point cloud.", flush=True)
+            return BasicPointCloud(points=pts, colors=cols, normals=np.zeros_like(pts))
+
+        pts = np.concatenate(points_all, axis=0)
+        cols = np.concatenate(colors_all, axis=0)
+        if max_pts and pts.shape[0] > max_pts:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(pts.shape[0], size=max_pts, replace=False)
+            pts, cols = pts[idx], cols[idx]
+        return BasicPointCloud(points=pts, colors=cols, normals=np.zeros_like(pts, dtype=np.float32))
+
+    # ------------------------------------------------------------------
+    # Frame ingestion
+    # ------------------------------------------------------------------
+
+    def has_next_frame(self) -> bool:
+        return self._source_idx < len(self._all_frames)
+
+    def ingest_next_frame(self) -> Optional[Tuple]:
+        """
+        Load the next frame as a Camera and add it to the active window and
+        replay buffer.  Returns (camera, StreamingRGBDFrame) or None when
+        the source is exhausted.
+        """
+        if not self.has_next_frame():
+            return None
+        from scene.cameras import prepare_camera_for_render
+
+        frame = self._all_frames[self._source_idx]
+        self._source_idx += 1
+
+        cam = self._frame_to_camera(frame)
+        self.train_cameras.append(cam)
+
+        replay_size = getattr(self.args, "streaming_replay_buffer", 32)
+        self._replay_buffer.append(cam)
+        if len(self._replay_buffer) > replay_size:
+            self._replay_buffer.pop(0)
+
+        self.current_camera = cam
+        prepare_camera_for_render(cam, device="cuda")
+        return cam, frame
+
+    # ------------------------------------------------------------------
+    # Camera sampling
+    # ------------------------------------------------------------------
+
+    def get_local_cameras(self) -> List:
+        k = getattr(self.args, "streaming_keyframe_window", 8)
+        return self.train_cameras[-k:] if self.train_cameras else []
+
+    def sample_training_camera(self):
+        """Sample a camera for one training step (local window + occasional replay)."""
+        replay_ratio = getattr(self.args, "streaming_global_replay_ratio", 0.1)
+        if self._replay_buffer and replay_ratio > 0 and random.random() < replay_ratio:
+            return random.choice(self._replay_buffer)
+        local = self.get_local_cameras()
+        return random.choice(local) if local else self.current_camera
+
+    # ------------------------------------------------------------------
+    # Compatibility shims for code that calls scene.getTrainCameras()
+    # ------------------------------------------------------------------
+
+    def getTrainCameras(self, scale: float = 1.0) -> List:
+        return self.train_cameras
+
+    def getTestCameras(self, scale: float = 1.0) -> List:
+        return []
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _frame_to_camera(self, frame: "StreamingRGBDFrame"):
+        from utils.camera_utils import loadCam
+        from utils.graphics_utils import focal2fov
+        from utils.rgbd_frames import c2w_to_camera_rt
+        from scene.readers.common import CameraInfo
+        from PIL import Image
+
+        R, T = c2w_to_camera_rt(frame.c2w)
+        image = Image.open(frame.rgb_path).convert("RGB")
+        orig_w, orig_h = image.size
+        cam_info = CameraInfo(
+            uid=frame.index,
+            R=R, T=T,
+            FovY=focal2fov(frame.fy, orig_h),
+            FovX=focal2fov(frame.fx, orig_w),
+            image=image,
+            image_path=frame.rgb_path,
+            image_name=f"{frame.index:06d}",
+            width=orig_w, height=orig_h,
+            fx=float(frame.fx), fy=float(frame.fy),
+            cx=float(frame.cx), cy=float(frame.cy),
+        )
+        return loadCam(self.args, frame.index, cam_info, self.resolution_scale)
