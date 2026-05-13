@@ -304,6 +304,10 @@ class StreamingParams(ParamGroup):
         self.streaming_promote_opacity = 0.3      # opacity boost on promotion
         # Save renders at frame-PLY save milestones (opt-in to avoid overhead)
         self.streaming_render_at_saves = False
+        # Freeze bootstrap Gaussians (birth_frame==0) from MCMC noise displacement.
+        # After each step_post_backward, their positions are restored to the pre-noise
+        # values. Tests whether position displacement of early Gaussians causes forgetting.
+        self.streaming_anchor_bootstrap = False
         # Depth supervision loss weight (0 = disabled)
         self.streaming_depth_loss_weight = 0.05
         # Depth loss type: "l1" or "huber"

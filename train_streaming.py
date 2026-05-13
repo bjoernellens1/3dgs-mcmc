@@ -544,6 +544,17 @@ def streaming_training(
     streaming_scene.initialize_from_frames(n_init)
     gaussians.training_setup(opt)
 
+    # Ensure SLAM lifecycle attributes exist for bootstrap Gaussians (birth_frame=0).
+    # add_points_as_gaussians() creates these lazily on first insertion; initialise
+    # them here so that --streaming_anchor_bootstrap works from iteration 1 even when
+    # no depth insertion has yet occurred.
+    if not hasattr(gaussians, "birth_frame"):
+        _n_boot = gaussians.get_xyz.shape[0]
+        _dev = gaussians.get_xyz.device
+        gaussians.provisional = torch.zeros(_n_boot, dtype=torch.bool, device=_dev)
+        gaussians.support_count = torch.zeros(_n_boot, dtype=torch.int32, device=_dev)
+        gaussians.birth_frame = torch.zeros(_n_boot, dtype=torch.int32, device=_dev)
+
     # Restore checkpoint if requested
     first_iter = 0
     if checkpoint:
@@ -926,6 +937,17 @@ def streaming_training(
                 sched["allow_growth"] = True
                 sched["allow_relocation"] = True
 
+        # Anchor bootstrap Gaussians: save positions before step_post_backward
+        # (which includes noise injection) and restore them after, so that MCMC
+        # noise never displaces the initial geometry.
+        _anchor_bootstrap = getattr(args, "streaming_anchor_bootstrap", False)
+        _anchor_mask = None
+        _anchor_pos = None
+        if _anchor_bootstrap and hasattr(gaussians, "birth_frame"):
+            _anchor_mask = (gaussians.birth_frame == 0)
+            if _anchor_mask.any():
+                _anchor_pos = gaussians.get_xyz[_anchor_mask].detach().clone()
+
         mcmc_strategy.step_post_backward(
             gaussians=gaussians, args=args, sched=sched, iteration=iteration,
             utility=utility, temperature=temperature, use_energy_mcmc=use_energy_mcmc,
@@ -933,6 +955,14 @@ def streaming_training(
             should_log_strategy=lambda i: i % max(1, getattr(args, "strategy_log_interval", 500)) == 0,
             render_pkg=render_pkg, lr=xyz_lr,
         )
+
+        # Restore bootstrap positions after noise injection
+        if _anchor_mask is not None and _anchor_pos is not None:
+            if gaussians.get_xyz.shape[0] == _anchor_mask.shape[0]:
+                if hasattr(gaussians, "params"):
+                    gaussians.params["means"].data[_anchor_mask] = _anchor_pos
+                else:
+                    gaussians._xyz.data[_anchor_mask] = _anchor_pos
 
         # ---- Logging ------------------------------------------------------
         with torch.no_grad():
@@ -964,9 +994,25 @@ def streaming_training(
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Test evaluation
+            # Test evaluation: full comparison report (renders + contact sheet + MP4)
             if iteration in testing_iterations:
-                _run_test_eval(tb_writer, iteration, streaming_scene, gaussians, render, pipe, background, args)
+                try:
+                    from utils.comparison_report import write_post_training_report
+                    write_post_training_report(
+                        model_path=args.model_path,
+                        iteration=iteration,
+                        gaussians=gaussians,
+                        train_cams=list(streaming_scene.getTrainCameras()),
+                        test_cams=list(streaming_scene.getTestCameras()),
+                        render_fn=render,
+                        pipe=pipe,
+                        background=background,
+                        tb_writer=tb_writer,
+                        log_prefix="streaming_report",
+                    )
+                except Exception as _e:
+                    print(f"[streaming-report] mid-training report failed iter={iteration}: {_e}", flush=True)
+                    _run_test_eval(tb_writer, iteration, streaming_scene, gaussians, render, pipe, background, args)
 
         # ---- Saving -------------------------------------------------------
         # Frame-based PLY saves: fire when frame count crosses a new milestone
