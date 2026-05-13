@@ -20,6 +20,7 @@ python train.py $SRC -m output/ablation_rolling_seed \
   $BASE_FLAGS \
   --streaming_training_mode rolling_seed \
   --streaming_submap_frames 20 \
+  --streaming_depth_stride 4 \
   --streaming_global_refine_iters 0 \
   2>&1 | tee output/ablation_rolling_seed.log
 echo "Rolling seed done."

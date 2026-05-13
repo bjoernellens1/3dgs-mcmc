@@ -601,12 +601,22 @@ def _run_rolling_seed(
         new_pts = torch.tensor(pcd.points[unoccupied], dtype=torch.float32, device="cuda")
         new_cols = torch.tensor(pcd.colors[unoccupied], dtype=torch.float32, device="cuda")
         
+        # Compute KNN scale with stricter clamp to prevent blobbing
+        if new_pts.shape[0] > 1:
+            from utils.rocm_knn_fallback import distCUDA2
+            dist_sq = distCUDA2(new_pts)
+            scales_1d = torch.clamp(dist_sq.sqrt() * 0.5, 1e-4, 0.02)  # max 2cm radius
+            import math
+            log_scales = torch.log(scales_1d).unsqueeze(-1).expand(-1, 3).contiguous()
+        else:
+            import math
+            log_scales = torch.full((new_pts.shape[0], 3), math.log(0.01), device="cuda")
+            
         # Add to global gaussians
         added = gaussians.add_points_as_gaussians(
             new_pts, new_cols,
-            init_scale=0.01,   # Fixed 1cm scale
+            scales=log_scales,
             init_opacity=0.9,  # High opacity
-            use_knn_scale=False, # Disable KNN scale because new_pts might be sparse/isolated
             is_provisional=False,
             birth_frame=0,
         )
