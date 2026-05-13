@@ -45,6 +45,13 @@ class StreamingScene:
         self.occupied_voxels = set()
         self.occupancy_voxel_size = 0.02
 
+        # H8: warmup counter — steps since the last new frame arrived
+        self._steps_since_new_frame: int = 0
+
+        # H10: permanent global keyframe reservoir (never evicted, sampled for replay)
+        self._global_reservoir: List = []
+        self._n_train_frames_ingested: int = 0  # count of train frames (excl. holdout)
+
     def maintain_occupancy_hash(self, voxel_size: float = 0.02):
         """Update the occupancy hash from the current Gaussians (expensive)."""
         self.occupancy_voxel_size = voxel_size
@@ -275,6 +282,15 @@ class StreamingScene:
             if len(self._replay_buffer) > replay_size:
                 self._replay_buffer.pop(0)
 
+            # H10: update global reservoir (every Nth train frame kept permanently)
+            self._n_train_frames_ingested += 1
+            reservoir_stride = getattr(self.args, "streaming_global_reservoir_stride", 0)
+            if reservoir_stride > 0 and self._n_train_frames_ingested % reservoir_stride == 0:
+                self._global_reservoir.append(cam)
+
+            # H8: reset warmup counter whenever a new train frame arrives
+            self._steps_since_new_frame = 0
+
         self.current_camera = cam
         prepare_camera_for_render(cam, device="cuda")
         return cam, frame, is_train
@@ -288,10 +304,33 @@ class StreamingScene:
         return self.train_cameras[-k:] if self.train_cameras else []
 
     def sample_training_camera(self):
-        """Sample a camera for one training step (local window + occasional replay)."""
+        """Sample a camera for one training step.
+
+        Priority order:
+        1. H8 warmup: return current_camera exclusively for the first
+           streaming_new_frame_warmup_steps steps after each new frame arrives.
+        2. Replay (global reservoir if H10 enabled, else recent ring buffer):
+           sampling probability = streaming_global_replay_ratio.
+        3. Local keyframe window (default).
+        """
+        # H8: warmup — force current frame for K steps after each new arrival
+        warmup_steps = getattr(self.args, "streaming_new_frame_warmup_steps", 0)
+        if warmup_steps > 0 and self._steps_since_new_frame < warmup_steps and self.current_camera is not None:
+            self._steps_since_new_frame += 1
+            return self.current_camera
+        self._steps_since_new_frame += 1
+
         replay_ratio = getattr(self.args, "streaming_global_replay_ratio", 0.1)
-        if self._replay_buffer and replay_ratio > 0 and random.random() < replay_ratio:
-            return random.choice(self._replay_buffer)
+        r = random.random()
+
+        if replay_ratio > 0 and r < replay_ratio:
+            # H10: prefer global reservoir when available; fall back to ring buffer
+            reservoir_stride = getattr(self.args, "streaming_global_reservoir_stride", 0)
+            if reservoir_stride > 0 and self._global_reservoir:
+                return random.choice(self._global_reservoir)
+            if self._replay_buffer:
+                return random.choice(self._replay_buffer)
+
         local = self.get_local_cameras()
         return random.choice(local) if local else self.current_camera
 

@@ -332,6 +332,33 @@ class StreamingParams(ParamGroup):
         self.streaming_depth_loss_weight = 0.05
         # Depth loss type: "l1" or "huber"
         self.streaming_depth_loss_type = "huber"
+        # H7: Freeze confirmed geometry gradients during streaming training.
+        # When enabled, xyz/scales/quats gradients are zeroed for old confirmed
+        # Gaussians so the optimizer cannot drag existing good splats to explain
+        # new views — depth insertion must handle new geometry instead.
+        self.streaming_freeze_old_geometry = False
+        # A Gaussian is "young" (gradients allowed) for this many frames after birth.
+        self.streaming_young_age_frames = 5
+        # Extra-strict freeze for this many steps immediately after a new frame arrives.
+        # During this window, only provisional splats get geometry gradients.
+        self.streaming_freeze_new_frame_steps = 50
+        # H8: New-frame warmup — train exclusively on the just-arrived frame for this
+        # many steps before mixing in the local window / replay.
+        self.streaming_new_frame_warmup_steps = 0
+        # H9: Anchor loss for young provisional splats.
+        # Penalises drift from the depth-insertion position while the splat is young.
+        self.streaming_anchor_loss_weight = 0.0
+        # Anchor penalty decays linearly to zero over this many training iterations.
+        self.streaming_anchor_decay_steps = 500
+        # H10: Global keyframe reservoir.
+        # Every Nth ingested train frame is kept in a permanent reservoir for
+        # trajectory-wide replay. 0 = disabled.
+        self.streaming_global_reservoir_stride = 0
+        # H11: Submap-stitching mode parameters.
+        # streaming_training_mode = "submap_stitch" enables the submap path.
+        self.streaming_submap_frames = 20       # frames per independent submap
+        self.streaming_submap_iters = 3000      # optimisation iterations per submap
+        self.streaming_global_refine_iters = 5000  # final global refinement iters
         super().__init__(parser, "Streaming Parameters")
 
 

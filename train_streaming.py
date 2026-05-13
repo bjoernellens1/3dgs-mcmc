@@ -516,6 +516,232 @@ def _update_provisional_support(gaussians, cam, render_pkg, args):
     gaussians.support_count[indices] += 1
 
 
+def _run_submap_stitch(
+    gaussians,
+    streaming_scene: "StreamingScene",
+    opt,
+    pipe,
+    args,
+    background,
+    dataset,
+    tb_writer,
+    save_worker,
+    testing_iterations,
+    saving_iterations,
+    sh_degree_schedule,
+):
+    """H11: Submap-stitching training mode.
+
+    Divides the incoming frame stream into fixed-size windows (submaps). Each
+    submap is independently bootstrapped from its own depth data, locally
+    optimised, then merged into a growing global model. A final global
+    refinement pass trains over all cameras.
+
+    This provides a clean per-submap geometry baseline to compare against the
+    sliding-window approach.
+    """
+    from utils.graphics_utils import BasicPointCloud
+    from utils.sh_utils import RGB2SH
+    from utils.general_utils import inverse_sigmoid
+
+    model_layout = getattr(args, "model_layout", "gsplat").lower()
+    model_cls = GsplatGaussianModel if model_layout == "gsplat" else GaussianModel
+
+    submap_frames = max(2, int(getattr(args, "streaming_submap_frames", 20)))
+    submap_iters  = max(100, int(getattr(args, "streaming_submap_iters", 3000)))
+    refine_iters  = max(0, int(getattr(args, "streaming_global_refine_iters", 5000)))
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    print(f"[submap] mode: {submap_frames} frames/submap, "
+          f"{submap_iters} iters/submap, {refine_iters} global refine iters", flush=True)
+
+    # Collect all frames; ingest any remaining ones
+    all_frames = list(streaming_scene._all_frames)  # full ordered frame list
+    all_train_cameras = list(streaming_scene.train_cameras)  # bootstrap already ingested
+    while streaming_scene.has_next_frame():
+        result = streaming_scene.ingest_next_frame()
+        if result is not None:
+            cam, frame, is_train = result
+            if is_train:
+                all_train_cameras.append(cam)
+
+    print(f"[submap] {len(all_train_cameras)} total train cameras collected.", flush=True)
+
+    eval_hold = getattr(args, "streaming_eval_hold", 0)
+    # Pair frames with train cameras (same ordering: non-holdout frames = train cams)
+    train_frames = [f for f in all_frames if eval_hold <= 0 or f.index % eval_hold != 0]
+    n_paired = min(len(train_frames), len(all_train_cameras))
+    frame_cam_pairs = list(zip(train_frames[:n_paired], all_train_cameras[:n_paired]))
+
+    # Split into submap windows
+    windows = [
+        frame_cam_pairs[i: i + submap_frames]
+        for i in range(0, len(frame_cam_pairs), submap_frames)
+    ]
+    print(f"[submap] {len(windows)} submaps of up to {submap_frames} frames each.", flush=True)
+
+    # --- Per-submap optimisation -------------------------------------------
+    all_gaussian_params = []  # collect param dicts per submap
+
+    for sm_idx, sm_pairs in enumerate(windows):
+        if not sm_pairs:
+            continue
+        sm_frames, sm_cams = zip(*sm_pairs)
+        sm_cams = list(sm_cams)
+        print(f"[submap {sm_idx}] {len(sm_cams)} cameras, optimising {submap_iters} iters...", flush=True)
+
+        # Build a fresh Gaussian model bootstrapped from this submap's depth
+        sub_gaussians = model_cls(dataset.sh_degree)
+
+        # Reuse StreamingScene's _build_pcd_from_frames with the actual frames
+        _tmp_scene = StreamingScene.__new__(StreamingScene)
+        _tmp_scene.args = args
+        _tmp_scene.cameras_extent = 1.0
+        pcd = _tmp_scene._build_pcd_from_frames(list(sm_frames))
+
+        if pcd is None or pcd.points.shape[0] == 0:
+            # Fallback: small random cloud in unit cube
+            import numpy as _np
+            from utils.graphics_utils import BasicPointCloud
+            pcd_pts = _np.random.uniform(-0.5, 0.5, (200, 3)).astype(_np.float32)
+            pcd_cols = _np.full((200, 3), 0.5, dtype=_np.float32)
+            pcd = BasicPointCloud(points=pcd_pts, colors=pcd_cols, normals=_np.zeros_like(pcd_pts))
+
+        sub_gaussians.create_from_pcd(pcd, spatial_lr_scale=1.0,
+                                       init_scale_mode="fixed", init_scale=0.01)
+        sub_gaussians.training_setup(opt)
+        _sub_is_selective = getattr(sub_gaussians, "optimizer_type", "adam") == "selective_adam"
+
+        # Local optimisation loop
+        from utils.loss_utils import l1_loss, ssim as _ssim_fn
+        import random as _rnd
+        for _it in range(1, submap_iters + 1):
+            cam = _rnd.choice(sm_cams)
+            pkg = render(cam, sub_gaussians, pipe, background)
+            img = pkg["render"]
+            gt = cam.original_image
+            loss = (1.0 - opt.lambda_dssim) * l1_loss(img, gt) + opt.lambda_dssim * (1.0 - _ssim_fn(img, gt))
+            loss.backward()
+            if _it < submap_iters:
+                if _sub_is_selective:
+                    sub_gaussians.prepare_selective_adam_step()
+                    _vis_all = torch.ones(sub_gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+                    sub_gaussians.optimizer.step(visibility=_vis_all)
+                    sub_gaussians.normalize_rotation_params()
+                else:
+                    sub_gaussians.optimizer.step()
+                sub_gaussians.optimizer.zero_grad(set_to_none=True)
+
+        print(f"[submap {sm_idx}] done, {sub_gaussians.get_xyz.shape[0]} Gaussians.", flush=True)
+
+        # Save the submap's final parameters (detached)
+        if model_layout == "gsplat":
+            all_gaussian_params.append({
+                k: sub_gaussians.params[k].detach().cpu()
+                for k in ("means", "sh0", "shN", "scales", "quats", "opacities")
+            })
+        else:
+            all_gaussian_params.append({
+                "means": sub_gaussians._xyz.detach().cpu(),
+                "sh0": sub_gaussians._features_dc.detach().cpu(),
+                "shN": sub_gaussians._features_rest.detach().cpu(),
+                "opacities": sub_gaussians._opacity.detach().cpu(),
+                "scales": sub_gaussians._scaling.detach().cpu(),
+                "quats": sub_gaussians._rotation.detach().cpu(),
+            })
+
+        del sub_gaussians
+        torch.cuda.empty_cache()
+
+    if not all_gaussian_params:
+        print("[submap] No submap params collected; aborting stitch.", flush=True)
+        return
+
+    # --- Merge submaps into global model -----------------------------------
+    print(f"[submap] Merging {len(all_gaussian_params)} submaps into global model...", flush=True)
+
+    # Use the pre-built gaussians object; extend it with all submap data
+    for sm_params in all_gaussian_params:
+        pts   = sm_params["means"].to("cuda")
+        cols  = sm_params["sh0"].squeeze(1).to("cuda")  # (N,3) SH DC
+        # Convert SH DC back to approximate RGB for add_points_as_gaussians API
+        from utils.sh_utils import SH2RGB
+        rgb_approx = SH2RGB(cols).clamp(0, 1)
+        log_scales = sm_params["scales"].to("cuda")
+        quats = sm_params["quats"].to("cuda")
+        gaussians.add_points_as_gaussians(
+            pts, rgb_approx,
+            scales=log_scales, rotations=quats,
+            init_opacity=0.3,
+            is_provisional=False, birth_frame=0,
+        )
+
+    print(f"[submap] Global model: {gaussians.get_xyz.shape[0]} Gaussians total.", flush=True)
+
+    # Save merged PLY
+    merged_ply_dir = os.path.join(args.model_path, "point_cloud", "submap_merged")
+    os.makedirs(merged_ply_dir, exist_ok=True)
+    gaussians.save_ply(os.path.join(merged_ply_dir, "point_cloud.ply"))
+
+    if refine_iters <= 0:
+        print("[submap] No global refinement requested. Done.", flush=True)
+        return
+
+    # --- Global refinement over all cameras --------------------------------
+    print(f"[submap] Running {refine_iters} global refinement iters over {len(all_train_cameras)} cameras...", flush=True)
+    gaussians.training_setup(opt)
+    _global_is_selective = getattr(gaussians, "optimizer_type", "adam") == "selective_adam"
+
+    from utils.loss_utils import l1_loss, ssim as _ssim_fn
+    import random as _rnd
+    for _it in tqdm(range(1, refine_iters + 1), desc="Global refine"):
+        cam = _rnd.choice(all_train_cameras)
+        pkg = render(cam, gaussians, pipe, background)
+        img = pkg["render"]
+        gt = cam.original_image
+        loss = (1.0 - opt.lambda_dssim) * l1_loss(img, gt) + opt.lambda_dssim * (1.0 - _ssim_fn(img, gt))
+        loss.backward()
+        if _it < refine_iters:
+            if _global_is_selective:
+                gaussians.prepare_selective_adam_step()
+                _vis_all = torch.ones(gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+                gaussians.optimizer.step(visibility=_vis_all)
+                gaussians.normalize_rotation_params()
+            else:
+                gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+
+    # Save final refined PLY
+    refined_ply_dir = os.path.join(args.model_path, "point_cloud", "iteration_final")
+    os.makedirs(refined_ply_dir, exist_ok=True)
+    gaussians.save_ply(os.path.join(refined_ply_dir, "point_cloud.ply"))
+
+    # Run evaluation if test cameras exist
+    if streaming_scene.getTestCameras():
+        try:
+            from utils.comparison_report import write_post_training_report
+            bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+            _eval_bg = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+            write_post_training_report(
+                args.model_path,
+                refine_iters,
+                gaussians,
+                all_train_cameras,
+                streaming_scene.getTestCameras(),
+                render,
+                pipe,
+                _eval_bg,
+                tb_writer=tb_writer,
+                subdir="submap_final",
+            )
+        except Exception as _e:
+            print(f"[submap] Evaluation failed: {_e}", flush=True)
+
+    print("[submap] Stitch complete.", flush=True)
+
+
 def streaming_training(
     dataset,
     opt,
@@ -658,7 +884,7 @@ def streaming_training(
     streaming_mcmc_local = getattr(args, "streaming_mcmc_local_only", True)
     global_maint_interval = max(0, getattr(args, "streaming_global_maintenance_interval", 500))
 
-    # Diagnostic training modes (H1/H2 ablation)
+    # Diagnostic training modes (H1/H2 ablation + H11 submap-stitch)
     _training_mode = getattr(args, "streaming_training_mode", "normal")
     _placement_only = _training_mode == "placement_only"   # H1: no backward/step/MCMC
     _colors_only    = _training_mode == "colors_only"       # H2: geometry frozen, SH trains
@@ -668,6 +894,17 @@ def streaming_training(
             if _pg.get("name") in ("means", "scales", "quats", "opacities"):
                 _pg["lr"] = 0.0
         gaussians.xyz_scheduler_args = lambda _step: 0.0
+    if _training_mode == "submap_stitch":
+        # H11: dispatch to submap-stitching path before entering the main loop
+        _run_submap_stitch(
+            gaussians, streaming_scene, opt, pipe, args,
+            background=None,  # built inside helper
+            dataset=dataset, tb_writer=tb_writer, save_worker=save_worker,
+            testing_iterations=testing_iterations, saving_iterations=saving_iterations,
+            sh_degree_schedule=sh_degree_schedule,
+        )
+        save_worker.shutdown()
+        return
     if _training_mode != "normal":
         print(f"[streaming] training_mode={_training_mode}: "
               f"placement_only={_placement_only} colors_only={_colors_only}", flush=True)
@@ -677,6 +914,16 @@ def streaming_training(
     save_frame_interval = max(0, int(getattr(args, "streaming_save_frame_interval", 50)))
     # Track which frame milestone we last saved at (avoids repeated saves for same frame)
     _last_frame_save = n_init  # bootstrap frames already "processed"
+
+    # H7: old-geometry gradient freeze parameters
+    _freeze_old = getattr(args, "streaming_freeze_old_geometry", False)
+    _young_age_frames = max(0, int(getattr(args, "streaming_young_age_frames", 5)))
+    _freeze_new_frame_steps = max(0, int(getattr(args, "streaming_freeze_new_frame_steps", 50)))
+    _iter_since_new_frame = _freeze_new_frame_steps  # start without strict freeze
+
+    # H9: anchor loss parameters
+    _anchor_loss_weight = float(getattr(args, "streaming_anchor_loss_weight", 0.0))
+    _anchor_decay_steps = max(1, int(getattr(args, "streaming_anchor_decay_steps", 500)))
     use_energy_mcmc = getattr(args, "energy_mcmc", True) and densification_strategy in {
         "mcmc", "hybrid", "gsplat_energy_mcmc"
     }
@@ -736,6 +983,7 @@ def streaming_training(
                 new_cam, new_frame, is_train = result
                 scheduler.mark_released()
                 n_frames_ingested += 1
+                _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
 
                 # Phase 2: insert new Gaussians from depth
                 if is_train and getattr(args, "streaming_insert_from_depth", True):
@@ -757,6 +1005,9 @@ def streaming_training(
                             render_depth=depth_new,
                             current_frame_idx=n_frames_ingested,
                         )
+                        # H9: record insertion iteration for anchor-loss decay
+                        if added > 0 and hasattr(gaussians, "anchor_iter"):
+                            gaussians.anchor_iter[-added:] = iteration
                         total_inserted += added
                         if added > 0 and (iteration % 100 == 0 or added > 1000):
                             print(
@@ -895,6 +1146,21 @@ def streaming_training(
                     loss = loss + depth_loss_weight * L_depth
                     _depth_loss_val = L_depth.item()
 
+        # ---- H9: Anchor loss for young provisional splats ------------------
+        # Penalise drift from the depth-insertion position while the splat is
+        # young. Weight decays linearly to zero over anchor_decay_steps iters.
+        _anchor_loss_val = None
+        if _anchor_loss_weight > 0 and hasattr(gaussians, "anchor_xyz"):
+            with torch.no_grad():
+                age_iters = (iteration - gaussians.anchor_iter.long()).clamp(min=0)
+                young_mask = (age_iters < _anchor_decay_steps) & gaussians.provisional
+            if young_mask.any():
+                decay = (1.0 - age_iters[young_mask].float() / _anchor_decay_steps).clamp(0.0, 1.0)
+                dxyz = gaussians.get_xyz[young_mask] - gaussians.anchor_xyz[young_mask]
+                L_anchor = (decay.unsqueeze(1) * dxyz.pow(2)).sum(dim=1).mean()
+                loss = loss + _anchor_loss_weight * L_anchor
+                _anchor_loss_val = L_anchor.item()
+
         # ---- Free-space / floater loss -------------------------------------
         # Penalise opacity that is rendered in front of the observed surface.
         # Targets mid-air splats that photometric loss would otherwise keep.
@@ -940,6 +1206,28 @@ def streaming_training(
                     p = group["params"][0]
                     if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
                         p.grad[~_mask] = 0.0
+
+            # H7: freeze confirmed old geometry — zero geometry gradients for splats
+            # that are old enough not to be "young" and are not provisional.
+            # Prevents optimizer from dragging confirmed good splats to explain new views.
+            _iter_since_new_frame += 1
+            if _freeze_old and hasattr(gaussians, "birth_frame") and hasattr(gaussians, "provisional"):
+                with torch.no_grad():
+                    _frame_age = n_frames_ingested - gaussians.birth_frame.long()
+                    _young = gaussians.provisional | (_frame_age <= _young_age_frames)
+                    _old = ~_young
+                    if _old.any():
+                        if model_layout == "gsplat":
+                            for _pg_name in ("means", "scales", "quats"):
+                                _p = gaussians.params.get(_pg_name)
+                                if (_p is not None and _p.grad is not None
+                                        and getattr(_p.grad, "layout", torch.strided) == torch.strided):
+                                    _p.grad[_old] = 0.0
+                        else:
+                            for _param in (gaussians._xyz, gaussians._scaling, gaussians._rotation):
+                                if (_param.grad is not None
+                                        and getattr(_param.grad, "layout", torch.strided) == torch.strided):
+                                    _param.grad[_old] = 0.0
 
             if iteration < opt.iterations:
                 if optimizer_type == "selective_adam":
@@ -1070,6 +1358,8 @@ def streaming_training(
                     tb_writer.add_scalar("train/depth_loss", _depth_loss_val, iteration)
                 if _free_loss_val is not None:
                     tb_writer.add_scalar("train/free_space_loss", _free_loss_val, iteration)
+                if _anchor_loss_val is not None:
+                    tb_writer.add_scalar("train/anchor_loss", _anchor_loss_val, iteration)
 
             if iteration == opt.iterations:
                 progress_bar.close()

@@ -71,6 +71,8 @@ class GsplatGaussianModel:
         self.birth_frame = torch.empty(0, dtype=torch.int32, device="cuda")
         self.support_count = torch.empty(0, dtype=torch.int16, device="cuda")
         self.provisional = torch.empty(0, dtype=torch.bool, device="cuda")
+        self.anchor_xyz = torch.empty((0, 3), dtype=torch.float32, device="cuda")
+        self.anchor_iter = torch.empty(0, dtype=torch.int32, device="cuda")
 
     @property
     def _xyz(self):
@@ -360,6 +362,9 @@ class GsplatGaussianModel:
         self.birth_frame = torch.zeros(count, dtype=torch.int32, device="cuda")
         self.support_count = torch.zeros(count, dtype=torch.int16, device="cuda")
         self.provisional = torch.zeros(count, dtype=torch.bool, device="cuda")
+        xyz = self.get_xyz.detach() if count > 0 else torch.zeros((0, 3), device="cuda")
+        self.anchor_xyz = xyz.clone()
+        self.anchor_iter = torch.zeros(count, dtype=torch.int32, device="cuda")
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
@@ -391,6 +396,8 @@ class GsplatGaussianModel:
         self.birth_frame = self.birth_frame[valid_points_mask]
         self.support_count = self.support_count[valid_points_mask]
         self.provisional = self.provisional[valid_points_mask]
+        self.anchor_xyz = self.anchor_xyz[valid_points_mask]
+        self.anchor_iter = self.anchor_iter[valid_points_mask]
 
     def add_points_as_gaussians(
         self,
@@ -488,9 +495,15 @@ class GsplatGaussianModel:
         new_birth = torch.full((N,), int(birth_frame), dtype=torch.int32, device="cuda")
         new_support = torch.zeros(N, dtype=torch.int16, device="cuda")
         new_provisional = torch.full((N,), bool(is_provisional), dtype=torch.bool, device="cuda")
-        
+
         self.birth_frame = torch.cat([self.birth_frame, new_birth], dim=0)
         self.support_count = torch.cat([self.support_count, new_support], dim=0)
         self.provisional = torch.cat([self.provisional, new_provisional], dim=0)
+
+        # Anchor buffers: record insertion position for young-splat anchor loss
+        new_anchor_xyz = new_tensors["means"].detach().clone()
+        new_anchor_iter = torch.zeros(N, dtype=torch.int32, device="cuda")
+        self.anchor_xyz = torch.cat([self.anchor_xyz, new_anchor_xyz], dim=0)
+        self.anchor_iter = torch.cat([self.anchor_iter, new_anchor_iter], dim=0)
 
         return N
