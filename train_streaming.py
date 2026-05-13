@@ -626,6 +626,20 @@ def streaming_training(
     depth_loss_type = getattr(args, "streaming_depth_loss_type", "l1")
     streaming_mcmc_local = getattr(args, "streaming_mcmc_local_only", True)
     global_maint_interval = max(0, getattr(args, "streaming_global_maintenance_interval", 500))
+
+    # Diagnostic training modes (H1/H2 ablation)
+    _training_mode = getattr(args, "streaming_training_mode", "normal")
+    _placement_only = _training_mode == "placement_only"   # H1: no backward/step/MCMC
+    _colors_only    = _training_mode == "colors_only"       # H2: geometry frozen, SH trains
+    _skip_mcmc      = _placement_only or _colors_only
+    if _colors_only:
+        for _pg in gaussians.optimizer.param_groups:
+            if _pg.get("name") in ("means", "scales", "quats", "opacities"):
+                _pg["lr"] = 0.0
+        gaussians.xyz_scheduler_args = lambda _step: 0.0
+    if _training_mode != "normal":
+        print(f"[streaming] training_mode={_training_mode}: "
+              f"placement_only={_placement_only} colors_only={_colors_only}", flush=True)
     scalar_log_interval = max(1, int(getattr(args, "scalar_log_interval", 10)))
     save_interval = max(0, int(getattr(args, "save_interval", 2000)))
     chk_interval = max(0, int(getattr(args, "checkpoint_interval", 2000)))
@@ -848,49 +862,50 @@ def streaming_training(
                     loss = loss + depth_loss_weight * L_depth
                     _depth_loss_val = L_depth.item()
 
-        # ---- Backward -----------------------------------------------------
-        mcmc_strategy.step_pre_backward(
-            gaussians=gaussians, args=args, iteration=iteration,
-            render_pkg=render_pkg, loss=loss,
-        )
-        loss.backward()
-
-        # Zero invisible grad rows in strided grads (active-set safety)
-        if sparse_active_set and getattr(args, "selective_adam_zero_invisible_grads", True):
-            _mask = render_pkg["visibility_filter"].detach()
-            for group in gaussians.optimizer.param_groups:
-                p = group["params"][0]
-                if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
-                    p.grad[~_mask] = 0.0
-
-        # ---- Optimizer step -----------------------------------------------
+        # ---- Backward + optimizer step (skipped in placement_only mode) -----
         visible = render_pkg["visibility_filter"].detach().to(dtype=torch.bool).contiguous()
-        if iteration < opt.iterations:
-            if optimizer_type == "selective_adam":
-                gaussians.prepare_selective_adam_step(
-                    allow_dense_grads=getattr(args, "selective_adam_allow_dense_grads", False)
-                )
-                gaussians.optimizer.step(visibility=visible)
-            else:
-                gaussians.optimizer.step()
-            if pipe.gsplat_sparse_grad:
-                gaussians.normalize_rotation_params(
-                    mask=visible if sparse_active_set else None
-                )
-            gaussians.optimizer.zero_grad(set_to_none=True)
+        if not _placement_only:
+            mcmc_strategy.step_pre_backward(
+                gaussians=gaussians, args=args, iteration=iteration,
+                render_pkg=render_pkg, loss=loss,
+            )
+            loss.backward()
 
-            # MCMC noise injection — local-only in streaming mode
-            if densification_strategy in {"mcmc", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}:
-                if streaming_mcmc_local and sparse_active_set:
-                    mcmc_strategy.inject_noise(
-                        gaussians=gaussians, args=args, xyz_lr=xyz_lr,
-                        visible=visible, sparse_active_set=True, iteration=iteration,
+            # Zero invisible grad rows in strided grads (active-set safety)
+            if sparse_active_set and getattr(args, "selective_adam_zero_invisible_grads", True):
+                _mask = render_pkg["visibility_filter"].detach()
+                for group in gaussians.optimizer.param_groups:
+                    p = group["params"][0]
+                    if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
+                        p.grad[~_mask] = 0.0
+
+            if iteration < opt.iterations:
+                if optimizer_type == "selective_adam":
+                    gaussians.prepare_selective_adam_step(
+                        allow_dense_grads=getattr(args, "selective_adam_allow_dense_grads", False)
                     )
+                    gaussians.optimizer.step(visibility=visible)
                 else:
-                    mcmc_strategy.inject_noise(
-                        gaussians=gaussians, args=args, xyz_lr=xyz_lr,
-                        visible=None, sparse_active_set=False, iteration=iteration,
+                    gaussians.optimizer.step()
+                if pipe.gsplat_sparse_grad:
+                    gaussians.normalize_rotation_params(
+                        mask=visible if sparse_active_set else None
                     )
+                gaussians.optimizer.zero_grad(set_to_none=True)
+
+                # MCMC noise injection — skipped in placement_only / colors_only modes
+                if not _skip_mcmc:
+                    if densification_strategy in {"mcmc", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}:
+                        if streaming_mcmc_local and sparse_active_set:
+                            mcmc_strategy.inject_noise(
+                                gaussians=gaussians, args=args, xyz_lr=xyz_lr,
+                                visible=visible, sparse_active_set=True, iteration=iteration,
+                            )
+                        else:
+                            mcmc_strategy.inject_noise(
+                                gaussians=gaussians, args=args, xyz_lr=xyz_lr,
+                                visible=None, sparse_active_set=False, iteration=iteration,
+                            )
 
         # ---- Utility for energy MCMC --------------------------------------
         if use_energy_mcmc:
@@ -948,21 +963,22 @@ def streaming_training(
             if _anchor_mask.any():
                 _anchor_pos = gaussians.get_xyz[_anchor_mask].detach().clone()
 
-        mcmc_strategy.step_post_backward(
-            gaussians=gaussians, args=args, sched=sched, iteration=iteration,
-            utility=utility, temperature=temperature, use_energy_mcmc=use_energy_mcmc,
-            tb_writer=tb_writer,
-            should_log_strategy=lambda i: i % max(1, getattr(args, "strategy_log_interval", 500)) == 0,
-            render_pkg=render_pkg, lr=xyz_lr,
-        )
+        if not _skip_mcmc:
+            mcmc_strategy.step_post_backward(
+                gaussians=gaussians, args=args, sched=sched, iteration=iteration,
+                utility=utility, temperature=temperature, use_energy_mcmc=use_energy_mcmc,
+                tb_writer=tb_writer,
+                should_log_strategy=lambda i: i % max(1, getattr(args, "strategy_log_interval", 500)) == 0,
+                render_pkg=render_pkg, lr=xyz_lr,
+            )
 
-        # Restore bootstrap positions after noise injection
-        if _anchor_mask is not None and _anchor_pos is not None:
-            if gaussians.get_xyz.shape[0] == _anchor_mask.shape[0]:
-                if hasattr(gaussians, "params"):
-                    gaussians.params["means"].data[_anchor_mask] = _anchor_pos
-                else:
-                    gaussians._xyz.data[_anchor_mask] = _anchor_pos
+            # Restore bootstrap positions after noise injection
+            if _anchor_mask is not None and _anchor_pos is not None:
+                if gaussians.get_xyz.shape[0] == _anchor_mask.shape[0]:
+                    if hasattr(gaussians, "params"):
+                        gaussians.params["means"].data[_anchor_mask] = _anchor_pos
+                    else:
+                        gaussians._xyz.data[_anchor_mask] = _anchor_pos
 
         # ---- Logging ------------------------------------------------------
         with torch.no_grad():

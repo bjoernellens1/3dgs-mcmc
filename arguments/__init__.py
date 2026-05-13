@@ -308,6 +308,13 @@ class StreamingParams(ParamGroup):
         # After each step_post_backward, their positions are restored to the pre-noise
         # values. Tests whether position displacement of early Gaussians causes forgetting.
         self.streaming_anchor_bootstrap = False
+        # Diagnostic training-mode gate — controls how much optimisation happens:
+        #   "normal"         — standard streaming (default)
+        #   "placement_only" — skip backward, optimizer step, and all MCMC;
+        #                       inserted points stay exactly where placed (H1 ablation)
+        #   "colors_only"    — zero LR on means/scales/quats/opacities, SH trains;
+        #                       geometry frozen, colors converge to GT (H2 ablation)
+        self.streaming_training_mode = "normal"
         # Depth supervision loss weight (0 = disabled)
         self.streaming_depth_loss_weight = 0.05
         # Depth loss type: "l1" or "huber"
