@@ -1,7 +1,7 @@
 # Streaming Degradation Ablation Results
 
-**Date:** 2026-05-12
-**Branch:** `streaming-fixes`
+**Date:** 2026-05-12 / 2026-05-13
+**Branch:** `streaming-fixes` / `insertion-ablation`
 **Scene:** TUM RGB-D `freiburg1_desk` (596 frames, capped via `--streaming_max_frames`)
 **Baseline:** `output/bootstrap_vs_iter4000` — 4000 iters, spf=50, noise_lr=5e5, replay_ratio=0.1
 
@@ -98,30 +98,64 @@ Coverage vs quality tradeoff at same total iteration budget (17k iters):
 Less coverage, dramatically higher quality. For a SLAM system with a fixed compute budget,
 spf=150 is strongly preferable unless scene coverage is the bottleneck.
 
-## Recommended next experiments
+## Experiments E / F / G (2026-05-12, completed)
 
-**Short-term actionable:**
+| Experiment | Final PSNR | Δ F-baseline | Forgetting cliff |
+|---|---|---|---|
+| E: spf=150 + replay=0.3 | 16.58 dB | — | −4.77 dB |
+| F: E + keyframe_window=20 | **17.08 dB** | **+0.50** | **−4.34 dB** |
+| G: F + anchor_bootstrap=True | 15.33 dB | −1.75 | −6.02 dB |
 
-- **E. Combine C + D2**: `replay_ratio=0.3 + spf=150` — since C adds +0.46 dB and D2 adds
-  +1.61 dB independently, the combination should get close to 16 dB final.
+G backfired: position anchoring created streaking artifacts in early-frame views.
+Root cause of forgetting confirmed: **gradient starvation**, not position displacement.
 
-- **F. `streaming_keyframe_window=20`** (from default 8): larger window means the training
-  distribution covers more of the trajectory, reducing forgetting. Expected cost: ~2× slower
-  per step due to random camera sampling range.
+## H1 / H2 / H3 insertion-geometry ablations (2026-05-13)
 
-- **G. Gradient replay with frozen early Gaussians**: mark Gaussians from the first N frames
-  as "anchored" (no MCMC noise, no relocation), give them permanent gradient updates via the
-  replay buffer. Tests whether forgetting is gradient-driven or displacement-driven.
+### Diagnostic modes added
 
-**Root cause fix (longer term):**
+`--streaming_training_mode {normal|placement_only|colors_only}` (new flag).
+- `placement_only`: zero backward/MCMC, inserted points stay exactly as placed.
+- `colors_only`: geometry frozen (zero LR on means/scales/quats/opacities), SH trains.
 
-- **H. Per-frame optimizer state retention**: store Adam state (m1/m2) per Gaussian keyed to
-  the frame that created it. Reset only on frame-local operations. Prevents Adam momentum
-  from going stale for early Gaussians.
+### H1 (placement_only) and H2 (colors_only) results
 
-- **I. Elastic Weight Consolidation (EWC)-style loss**: add a penalty for deviating from
-  the Fisher-weighted gradient direction computed on bootstrap frames. Standard continual
-  learning technique.
+| Stage | PSNR (100 frames) | Notes |
+|---|---|---|
+| H1: no training at all | 4.62 dB | 19,877 → 21,056 Gaussians, pure insertions |
+| H2: SH colors only, 5k iters | 5.79 dB | +1.17 dB from 5000 color-only iters |
+| Normal F (full training) | 17.08 dB | 11.3 dB gap = from geometry optimization |
+
+**Finding:** Color training barely helps (+1.2 dB). The entire quality gap vs normal
+training comes from scale/rotation optimization. Insertion positions are geometrically
+correct; the problem is the anisotropic surfel init.
+
+### H3 (isotropic scale init) vs F (anisotropic surfel)
+
+`--streaming_insert_isotropic_scale`: replaces `(tx, ty, 0.2·min(tx,ty))` with
+`(√(tx·ty), √(tx·ty), √(tx·ty))` — spherical Gaussian instead of flat disc.
+
+| Iter | F (anisotropic) | H3 (isotropic) | Δ |
+|---|---|---|---|
+| 1000 | 17.23 dB | 17.21 dB | ≈0 |
+| 2000 | **23.05 dB** | 21.39 dB | −1.66 |
+| 5000 | 17.94 dB | **20.40 dB** | +2.46 |
+| 10000 | — | 19.02 dB | — |
+| 17000 | 15.25 dB | **17.19 dB** | **+1.94** |
+| Forgetting cliff | −7.80 dB | **−4.20 dB** | **+3.60** |
+| Bootstrap re-render | 12.07 dB | 12.59 dB | +0.52 |
+
+**Finding:** Isotropic init reduces the forgetting cliff by 3.6 dB (7.8 → 4.2 dB),
+improving final quality by 1.94 dB. Mechanism: flat surfels are seen edge-on once the
+window moves, causing streaking that the optimizer can't repair without close-up views.
+Spherical Gaussians degrade gracefully from all viewing angles.
+
+**Recommended next experiments:**
+- **H3+F combined**: H3 is already run on the F config (spf=150, replay=0.3, window=20).
+  Best single run so far: **17.19 dB** final PSNR.
+- **H4: combine H3 + larger window (30 or 40)**: since H3 reduces cliff and F's window
+  size was the dominant replay lever, the combination could approach 18+ dB.
+- **H5: initial opacity tuning**: spherical init may need lower init_opacity to avoid
+  over-occluding bootstrapped Gaussians at insertion time.
 
 ## Artifact locations
 
@@ -131,6 +165,9 @@ output/ablation_B_low_noise_lr/comparison/
 output/ablation_C_replay_03/comparison/
 output/ablation_D1_spf50_100frames/comparison/
 output/ablation_D2_spf150_100frames/comparison/
+output/ablation_H1_placement_only/comparison/
+output/ablation_H2_colors_only/comparison/
+output/ablation_H3_isotropic_scale/comparison/
 ```
 
 Each contains `iter_0_bootstrap_views/`, `iter_N/`, `iter_N_bootstrap_views/` with
