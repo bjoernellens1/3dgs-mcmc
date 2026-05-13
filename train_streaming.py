@@ -768,7 +768,9 @@ def streaming_training(
         _update_provisional_support(gaussians, viewpoint_cam, render_pkg, args)
 
         # SLAM Lifecycle: Promote / Prune (Step 8)
-        if iteration % 100 == 0:
+        # Skipped in placement_only — pruning would invalidate render_pkg tensors
+        # before the loss computation reads visibility_filter.
+        if not _placement_only and iteration % 100 == 0:
             with torch.no_grad():
                 # Promote
                 promote_mask = gaussians.provisional & (gaussians.support_count >= args.streaming_min_support_views)
