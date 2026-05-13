@@ -315,6 +315,10 @@ class StreamingParams(ParamGroup):
         #   "colors_only"    — zero LR on means/scales/quats/opacities, SH trains;
         #                       geometry frozen, colors converge to GT (H2 ablation)
         self.streaming_training_mode = "normal"
+        # H3 ablation: replace anisotropic surfel scales (tx, ty, 0.2·min)
+        # with isotropic scales (geometric mean of tx·ty for all three axes).
+        # Prevents edge-on streaking from flat-disc insertions.
+        self.streaming_insert_isotropic_scale = False
         # Depth supervision loss weight (0 = disabled)
         self.streaming_depth_loss_weight = 0.05
         # Depth loss type: "l1" or "huber"

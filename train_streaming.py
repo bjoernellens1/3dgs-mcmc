@@ -314,11 +314,18 @@ def insert_gaussians_from_frame(
     normals_world = (frame.c2w[:3, :3] @ normals_cam.T).T
     q_world = _quaternion_from_normal(normals_world)
     
-    # Anisotropic Scales: thin surfels
+    # Scales: depth-derived per-axis pixel footprint in world space
     tx = z_v / frame.fx * depth_stride
     ty = z_v / frame.fy * depth_stride
-    tz = 0.2 * np.minimum(tx, ty)
-    log_scales = np.log(np.stack([tx, ty, tz], axis=1))
+    if getattr(args, "streaming_insert_isotropic_scale", False):
+        # H3: isotropic sphere — geometric mean of in-plane footprint.
+        # Avoids edge-on streaking that flat surfels produce when seen
+        # from angles other than the insertion camera direction.
+        t_iso = np.sqrt(tx * ty)
+        log_scales = np.log(np.stack([t_iso, t_iso, t_iso], axis=1))
+    else:
+        tz = 0.2 * np.minimum(tx, ty)
+        log_scales = np.log(np.stack([tx, ty, tz], axis=1))
 
     added = gaussians.add_points_as_gaussians(
         torch.from_numpy(pts),
