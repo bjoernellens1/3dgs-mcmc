@@ -516,6 +516,254 @@ def _update_provisional_support(gaussians, cam, render_pkg, args):
     gaussians.support_count[indices] += 1
 
 
+
+def _run_rolling_seed(
+    gaussians,
+    streaming_scene,
+    opt,
+    pipe,
+    args,
+    background,
+    dataset,
+    tb_writer,
+    save_worker,
+    testing_iterations,
+    saving_iterations,
+    sh_degree_schedule,
+):
+    """
+    Diagnostic mode: Aggregates geometry by streaming through windows of frames,
+    building depth point clouds, and inserting them into the global map via the
+    occupancy grid. No training occurs during the streaming phase.
+    Finally, performs global optimization for the specified iterations.
+    """
+    import torch
+    import os
+    import numpy as np
+    from tqdm import tqdm
+    from gaussian_renderer import render
+
+    submap_frames = max(2, int(getattr(args, "streaming_submap_frames", 20)))
+    refine_iters  = max(0, int(getattr(args, "streaming_global_refine_iters", 5000)))
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    print(f"[rolling_seed] mode: {submap_frames} frames/window, {refine_iters} global refine iters", flush=True)
+
+    # Collect all frames
+    all_frames = list(streaming_scene._all_frames)
+    all_train_cameras = list(streaming_scene.train_cameras)
+    while streaming_scene.has_next_frame():
+        result = streaming_scene.ingest_next_frame()
+        if result is not None:
+            cam, frame, is_train = result
+            if is_train:
+                all_train_cameras.append(cam)
+
+    eval_hold = getattr(args, "streaming_eval_hold", 0)
+    train_frames = [f for f in all_frames if eval_hold <= 0 or f.index % eval_hold != 0]
+    n_paired = min(len(train_frames), len(all_train_cameras))
+    frame_cam_pairs = list(zip(train_frames[:n_paired], all_train_cameras[:n_paired]))
+
+    windows = [
+        frame_cam_pairs[i: i + submap_frames]
+        for i in range(0, len(frame_cam_pairs), submap_frames)
+    ]
+
+    print(f"[rolling_seed] Aggregating geometry across {len(windows)} windows...", flush=True)
+    
+    for sm_idx, sm_pairs in enumerate(windows):
+        if not sm_pairs:
+            continue
+            
+        sm_frames, sm_cams = zip(*sm_pairs)
+        
+        # Build PCD from this window
+        from scene.streaming_scene import StreamingScene
+        _tmp_scene = StreamingScene.__new__(StreamingScene)
+        _tmp_scene.args = args
+        _tmp_scene.cameras_extent = streaming_scene.cameras_extent
+        pcd = _tmp_scene._build_pcd_from_frames(list(sm_frames))
+        
+        if pcd is None or pcd.points.shape[0] == 0:
+            continue
+            
+        # Filter points through global occupancy grid
+        voxel_size = getattr(args, "streaming_insert_voxel_size", 0.02)
+        occupied = streaming_scene.check_occupancy(pcd.points, voxel_size, check_neighbors=True)
+        unoccupied = ~occupied
+        
+        if not unoccupied.any():
+            continue
+            
+        # Extract new points
+        new_pts = torch.tensor(pcd.points[unoccupied], dtype=torch.float32, device="cuda")
+        new_cols = torch.tensor(pcd.colors[unoccupied], dtype=torch.float32, device="cuda")
+        
+        # Add to global gaussians
+        added = gaussians.add_points_as_gaussians(
+            new_pts, new_cols,
+            init_scale=0.01,   # Fixed 1cm scale
+            init_opacity=0.9,  # High opacity
+            use_knn_scale=False, # Disable KNN scale because new_pts might be sparse/isolated
+            is_provisional=False,
+            birth_frame=0,
+        )
+        
+        # Update occupancy
+        streaming_scene.add_to_occupancy_hash(new_pts)
+        print(f"[rolling_seed] Window {sm_idx+1}/{len(windows)}: added {added} points. Total: {gaussians.get_xyz.shape[0]}", flush=True)
+
+    print(f"[rolling_seed] Geometry aggregation complete. Total points: {gaussians.get_xyz.shape[0]}", flush=True)
+    
+    if refine_iters <= 0:
+        print("[rolling_seed] No global refinement requested. Skipping to evaluation.", flush=True)
+    else:
+        print(f"[rolling_seed] Running {refine_iters} global refinement iters over {len(all_train_cameras)} cameras...", flush=True)
+        
+        # Scale optimization schedules to fit the shorter refine_iters window
+        opt.iterations = refine_iters
+        opt.position_lr_max_steps = refine_iters
+        opt.densify_until_iter = int(refine_iters * 0.8)  # Stop MCMC at 80% to allow convergence
+        opt.mcmc_stop_growth_iter = int(refine_iters * 0.8)
+        
+        import numpy as np
+        sh_degree_schedule = [int(x) for x in np.linspace(refine_iters // 20, refine_iters // 2, dataset.sh_degree)]
+        
+        # Re-setup training to recreate optimizers for all points
+        gaussians.training_setup(opt)
+        _global_is_selective = getattr(gaussians, "optimizer_type", "adam") == "selective_adam"
+        
+        from utils.mcmc_schedule import MCMCScheduleConfig, get_mcmc_schedule
+        from utils.strategies import make_mcmc_strategy
+        from utils.compiled_kernels import configure_torch_compile, set_compile_iteration
+        
+        densification_strategy = getattr(opt, "densification_strategy", "gsplat_energy_mcmc").lower()
+        mcmc_cfg = MCMCScheduleConfig(
+            start_iter=opt.densify_from_iter,
+            stop_growth_iter=getattr(opt, "mcmc_stop_growth_iter", 12_000),
+            stop_reloc_iter=opt.densify_until_iter,
+            growth_factor_start=getattr(opt, "mcmc_growth_factor_start", 1.05),
+        )
+        mcmc_strategy = make_mcmc_strategy(densification_strategy, gaussians=gaussians, args=args)
+        mcmc_strategy.initialize_state(gaussians=gaussians, args=args)
+        configure_torch_compile(args)
+        
+        from utils.loss_utils import l1_loss, ssim as _ssim_fn
+        import random as _rnd
+        
+        for _it in tqdm(range(1, refine_iters + 1), desc="Global refine"):
+            set_compile_iteration(_it)
+            cam = _rnd.choice(all_train_cameras)
+            
+            xyz_lr = gaussians.update_learning_rate(_it)
+            if _it in sh_degree_schedule:
+                gaussians.oneupSHdegree()
+                
+            bg = torch.rand((3,), device="cuda") if opt.random_background else background
+            
+            pkg = render(cam, gaussians, pipe, bg)
+            img = pkg["render"]
+            gt = cam.original_image
+            loss = (1.0 - opt.lambda_dssim) * l1_loss(img, gt) + opt.lambda_dssim * (1.0 - _ssim_fn(img, gt))
+            
+            # Regularization to prevent Gaussians from exploding
+            from utils.compiled_kernels import active_reg_core
+            if _global_is_selective:
+                _active_reg = pkg["visibility_filter"].detach()
+                _reg_loss = active_reg_core(
+                    gaussians.get_opacity[_active_reg],
+                    gaussians.get_scaling[_active_reg],
+                    w_opacity=args.opacity_reg,
+                    w_scale=args.scale_reg,
+                )
+            else:
+                _reg_loss = active_reg_core(
+                    gaussians.get_opacity,
+                    gaussians.get_scaling,
+                    w_opacity=args.opacity_reg,
+                    w_scale=args.scale_reg,
+                )
+            loss = loss + _reg_loss
+            
+            mcmc_strategy.step_pre_backward(gaussians=gaussians, args=args, iteration=_it, render_pkg=pkg, loss=loss)
+            loss.backward()
+            
+            if _it < refine_iters:
+                if _global_is_selective:
+                    gaussians.prepare_selective_adam_step()
+                    _vis_all = pkg["visibility_filter"].detach()
+                    
+                    # Zero invisible grads (safety)
+                    if getattr(args, "selective_adam_zero_invisible_grads", True):
+                        for group in gaussians.optimizer.param_groups:
+                            p = group["params"][0]
+                            if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
+                                p.grad[~_vis_all] = 0.0
+                                
+                    gaussians.optimizer.step(visibility=_vis_all)
+                    gaussians.normalize_rotation_params(mask=_vis_all)
+                else:
+                    gaussians.optimizer.step()
+                    if pipe.gsplat_sparse_grad:
+                        gaussians.normalize_rotation_params()
+                        
+                gaussians.optimizer.zero_grad(set_to_none=True)
+                
+                # MCMC
+                mcmc_strategy.inject_noise(gaussians=gaussians, args=args, xyz_lr=xyz_lr, visible=pkg["visibility_filter"].detach() if _global_is_selective else None, sparse_active_set=_global_is_selective, iteration=_it)
+                
+                use_energy_mcmc = args.energy_mcmc and densification_strategy in {"mcmc", "hybrid", "gsplat_energy_mcmc"}
+                if use_energy_mcmc:
+                    from utils.energy_mcmc import compute_gaussian_utility
+                    utility = compute_gaussian_utility(
+                        gaussians=gaussians, render_pkg=pkg, iteration=_it,
+                        w_alpha=args.energy_w_alpha, w_vis=args.energy_w_vis,
+                        w_grad=args.energy_w_grad, w_scale=args.energy_w_scale,
+                        w_dead=args.energy_w_dead,
+                        w_support=getattr(args, "energy_w_support", 2.0),
+                        beta_opacity=getattr(args, "energy_beta_opacity", 1.0),
+                        beta_scale=getattr(args, "energy_beta_scale", 0.5),
+                        alpha_dead=getattr(args, "energy_alpha_dead", 0.005),
+                    )
+                    import math
+                    u_temp = min(_it / 30000.0, 1.0)
+                    tau_t = max(getattr(args, "energy_temp_tau", 0.4), 1e-6)
+                    denom_t = 1.0 - math.exp(-1.0 / tau_t)
+                    temperature = args.energy_temp_min + (args.energy_temp_start - args.energy_temp_min) * (
+                        1.0 - (1.0 - math.exp(-u_temp / tau_t)) / denom_t
+                    )
+                    if _global_is_selective:
+                        _vis = pkg["visibility_filter"].detach()
+                        utility[~_vis] = getattr(args, "energy_w_alpha", 1.0) * gaussians.get_opacity.squeeze(-1)[~_vis]
+                else:
+                    utility = None
+                    temperature = 1.0
+    
+                sched = get_mcmc_schedule(_it, gaussians.get_xyz.shape[0], getattr(args, "cap_max", -1), mcmc_cfg)
+                mcmc_strategy.step_post_backward(gaussians=gaussians, args=args, sched=sched, iteration=_it, utility=utility, temperature=temperature, use_energy_mcmc=use_energy_mcmc, tb_writer=tb_writer, should_log_strategy=lambda i: False, render_pkg=pkg, lr=xyz_lr)
+
+    # Save final refined PLY
+    refined_ply_dir = os.path.join(args.model_path, "point_cloud", "iteration_final")
+    os.makedirs(refined_ply_dir, exist_ok=True)
+    gaussians.save_ply(os.path.join(refined_ply_dir, "point_cloud.ply"))
+
+    # Eval
+    if streaming_scene.getTestCameras():
+        try:
+            from utils.comparison_report import write_post_training_report
+            bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+            _eval_bg = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+            write_post_training_report(
+                args.model_path, refine_iters, gaussians, all_train_cameras, streaming_scene.getTestCameras(),
+                render, pipe, _eval_bg, tb_writer=tb_writer, subdir="rolling_seed_final"
+            )
+        except Exception as _e:
+            print(f"[rolling_seed] Evaluation failed: {_e}", flush=True)
+
+    print("[rolling_seed] Training complete.", flush=True)
+
 def _run_submap_stitch(
     gaussians,
     streaming_scene: "StreamingScene",
@@ -899,6 +1147,16 @@ def streaming_training(
         _run_submap_stitch(
             gaussians, streaming_scene, opt, pipe, args,
             background=None,  # built inside helper
+            dataset=dataset, tb_writer=tb_writer, save_worker=save_worker,
+            testing_iterations=testing_iterations, saving_iterations=saving_iterations,
+            sh_degree_schedule=sh_degree_schedule,
+        )
+        save_worker.shutdown()
+        return
+    if _training_mode == "rolling_seed":
+        _run_rolling_seed(
+            gaussians, streaming_scene, opt, pipe, args,
+            background=None,
             dataset=dataset, tb_writer=tb_writer, save_worker=save_worker,
             testing_iterations=testing_iterations, saving_iterations=saving_iterations,
             sh_degree_schedule=sh_degree_schedule,
