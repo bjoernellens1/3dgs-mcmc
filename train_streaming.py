@@ -166,18 +166,17 @@ def _load_depth_meters(frame) -> Optional[np.ndarray]:
 
 def _quaternion_from_normal(normal: np.ndarray) -> np.ndarray:
     """Compute wxyz quaternions rotating [0,0,1] to the given normals."""
-    # normal: [N, 3] normalised
     z_axis = np.array([0, 0, 1.0])
-    N = normal.shape[0]
-    
-    # Cross product for axis of rotation
-    cross = np.cross(z_axis, normal)
-    # Dot product + 1 for angle (half-angle identity approach)
-    w = 1.0 + np.sum(z_axis * normal, axis=1)
-    
+    cross = np.cross(z_axis, normal)           # [N, 3]
+    w = 1.0 + np.sum(z_axis * normal, axis=1)  # [N]
     q = np.stack([w, cross[:, 0], cross[:, 1], cross[:, 2]], axis=1)
-    norm = np.linalg.norm(q, axis=1, keepdims=True)
-    return q / (norm + 1e-8)
+    nrm = np.linalg.norm(q, axis=1, keepdims=True)
+    # Degenerate case: normal ≈ [0,0,-1] → 180° rotation around x-axis
+    bad = (nrm.squeeze(-1) < 1e-6)
+    if bad.any():
+        q[bad] = np.array([0.0, 1.0, 0.0, 0.0])
+        nrm[bad] = 1.0
+    return q / nrm
 
 
 def insert_gaussians_from_frame(
@@ -225,15 +224,25 @@ def insert_gaussians_from_frame(
     valid = np.isfinite(z_v) & (z_v > min_depth) & (z_v < max_depth)
 
     # ---- Alpha & Residual masking (Step 4) ----------------------------------
+    # Render may be at a different resolution than the raw sensor (--resolution
+    # rescaling). Map sensor pixel coords into render pixel coords before indexing.
     if render_alpha is not None:
-        alpha_cpu = render_alpha.detach().cpu().numpy().squeeze() # [H, W]
-        # Downsample to match insertion grid
-        alpha_v = alpha_cpu[ys, xs]
-        valid = valid & (alpha_v < 0.5)
-    
+        alpha_cpu = render_alpha.detach().cpu().numpy().squeeze()  # [Hr, Wr]
+        Hr, Wr = alpha_cpu.shape
+        xs_r = np.clip(np.round(xs / max(w - 1, 1) * (Wr - 1)).astype(np.int32), 0, Wr - 1)
+        ys_r = np.clip(np.round(ys / max(h - 1, 1) * (Hr - 1)).astype(np.int32), 0, Hr - 1)
+        alpha_v = alpha_cpu[ys_r, xs_r]
+        # Low-alpha → unoccupied space: strong signal to insert.
+        # High-alpha with sensor depth in front → surface missed by map: also insert.
+        low_alpha = alpha_v < 0.3
+        valid = valid & low_alpha
+
     if render_depth is not None:
         rend_d_cpu = render_depth.detach().cpu().numpy().squeeze()
-        rend_d_v = rend_d_cpu[ys, xs]
+        Hr_d, Wr_d = rend_d_cpu.shape
+        xs_rd = np.clip(np.round(xs / max(w - 1, 1) * (Wr_d - 1)).astype(np.int32), 0, Wr_d - 1)
+        ys_rd = np.clip(np.round(ys / max(h - 1, 1) * (Hr_d - 1)).astype(np.int32), 0, Hr_d - 1)
+        rend_d_v = rend_d_cpu[ys_rd, xs_rd]
         consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
         # Only insert if current depth is significantly in front of what's already there
         # or if there is no rendered depth at all.
@@ -314,17 +323,20 @@ def insert_gaussians_from_frame(
     normals_world = (frame.c2w[:3, :3] @ normals_cam.T).T
     q_world = _quaternion_from_normal(normals_world)
     
-    # Scales: depth-derived per-axis pixel footprint in world space
-    tx = z_v / frame.fx * depth_stride
-    ty = z_v / frame.fy * depth_stride
+    # Scales: depth-derived per-axis pixel footprint in world space, with
+    # an optional multiplier and hard upper clamp to avoid over-large splats.
+    scale_mult  = getattr(args, "streaming_insert_scale_mult", 0.5)
+    scale_max   = getattr(args, "streaming_insert_scale_max", 0.05)
+    normal_ratio = getattr(args, "streaming_insert_normal_scale_ratio", 0.15)
+    tx = np.clip(scale_mult * z_v / frame.fx * depth_stride, 1e-4, scale_max)
+    ty = np.clip(scale_mult * z_v / frame.fy * depth_stride, 1e-4, scale_max)
     if getattr(args, "streaming_insert_isotropic_scale", False):
-        # H3: isotropic sphere — geometric mean of in-plane footprint.
-        # Avoids edge-on streaking that flat surfels produce when seen
-        # from angles other than the insertion camera direction.
+        # Isotropic sphere (H3): geometric mean of in-plane footprint.
+        # Avoids edge-on streaking from flat surfels seen off-axis.
         t_iso = np.sqrt(tx * ty)
         log_scales = np.log(np.stack([t_iso, t_iso, t_iso], axis=1))
     else:
-        tz = 0.2 * np.minimum(tx, ty)
+        tz = np.clip(normal_ratio * np.minimum(tx, ty), 1e-5, scale_max * normal_ratio)
         log_scales = np.log(np.stack([tx, ty, tz], axis=1))
 
     added = gaussians.add_points_as_gaussians(
@@ -524,6 +536,18 @@ def streaming_training(
     os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), "w") as f:
         f.write(str(Namespace(**{k: v for k, v in vars(args).items() if not k.startswith("_")})))
+
+    # Write reproduce.sh so the exact run can be replayed from the output dir
+    import shlex as _shlex
+    import sys as _sys
+    _repro_path = os.path.join(args.model_path, "reproduce.sh")
+    with open(_repro_path, "w") as _rf:
+        _cmd = " ".join(_shlex.quote(a) for a in _sys.argv)
+        _rf.write("#!/bin/bash\n")
+        _rf.write("# Reproduces the training run stored in this output directory.\n")
+        _rf.write("# Generated automatically at training start.\n")
+        _rf.write(f"python {_cmd}\n")
+    os.chmod(_repro_path, 0o755)
 
     tb_writer = None
     if _TB:
@@ -871,6 +895,35 @@ def streaming_training(
                     loss = loss + depth_loss_weight * L_depth
                     _depth_loss_val = L_depth.item()
 
+        # ---- Free-space / floater loss -------------------------------------
+        # Penalise opacity that is rendered in front of the observed surface.
+        # Targets mid-air splats that photometric loss would otherwise keep.
+        _free_loss_val = None
+        free_space_weight = getattr(args, "streaming_free_space_loss_weight", 0.0)
+        if free_space_weight > 0 and use_depth_loss and "alpha" in render_pkg and "rendered_depth" in render_pkg:
+            sensor_d_fs = _get_sensor_depth(viewpoint_cam, image.shape[1], image.shape[2])
+            if sensor_d_fs is not None:
+                sensor_d_fs = sensor_d_fs.to("cuda", non_blocking=True)
+                rend_d_fs = render_pkg["rendered_depth"]         # [1, H, W]
+                # render_alphas[0] from gsplat is [H, W, 1]; permute to [1, H, W]
+                rend_a_raw = render_pkg["alpha"]
+                if rend_a_raw.dim() == 3 and rend_a_raw.shape[-1] == 1:
+                    rend_a_fs = rend_a_raw.permute(2, 0, 1)     # [1, H, W]
+                else:
+                    rend_a_fs = rend_a_raw.unsqueeze(0) if rend_a_raw.dim() == 2 else rend_a_raw
+                # Floater: rendered alpha is significant AND rendered depth is
+                # shallower than the sensor surface by at least 5 cm.
+                floater = (
+                    (sensor_d_fs > 0)
+                    & (rend_d_fs.detach() > 0)
+                    & (rend_a_fs.detach() > 0.2)
+                    & (rend_d_fs.detach() < sensor_d_fs - 0.05)
+                )
+                if floater.any():
+                    L_free = (rend_a_fs[floater] * (sensor_d_fs[floater] - rend_d_fs[floater]).detach()).mean()
+                    loss = loss + free_space_weight * L_free
+                    _free_loss_val = L_free.item()
+
         # ---- Backward + optimizer step (skipped in placement_only mode) -----
         visible = render_pkg["visibility_filter"].detach().to(dtype=torch.bool).contiguous()
         if not _placement_only:
@@ -1015,6 +1068,8 @@ def streaming_training(
                                      len(streaming_scene._replay_buffer), iteration)
                 if _depth_loss_val is not None:
                     tb_writer.add_scalar("train/depth_loss", _depth_loss_val, iteration)
+                if _free_loss_val is not None:
+                    tb_writer.add_scalar("train/free_space_loss", _free_loss_val, iteration)
 
             if iteration == opt.iterations:
                 progress_bar.close()

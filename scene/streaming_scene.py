@@ -17,6 +17,7 @@ import random
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 if TYPE_CHECKING:
     from utils.streaming_frames import StreamingRGBDFrame

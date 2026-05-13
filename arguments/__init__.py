@@ -300,7 +300,7 @@ class StreamingParams(ParamGroup):
         # SLAM lifecycle: provisional -> persistent (Step 8)
         self.streaming_min_support_views = 2      # required multi-view confirmations
         self.streaming_support_window = 8         # check support against recent frames
-        self.streaming_provisional_max_age = 50   # frames before pruning low-support points
+        self.streaming_provisional_max_age = 20   # frames before pruning low-support points
         self.streaming_promote_opacity = 0.3      # opacity boost on promotion
         # Save renders at frame-PLY save milestones (opt-in to avoid overhead)
         self.streaming_render_at_saves = False
@@ -319,6 +319,15 @@ class StreamingParams(ParamGroup):
         # with isotropic scales (geometric mean of tx·ty for all three axes).
         # Prevents edge-on streaking from flat-disc insertions.
         self.streaming_insert_isotropic_scale = False
+        # Scale clamping for depth-inserted Gaussians:
+        #   scale_mult:         multiplier on the raw depth-derived footprint
+        #   scale_max:          hard upper bound per axis (metres)
+        #   normal_scale_ratio: z-axis fraction of in-plane scale (anisotropic mode)
+        self.streaming_insert_scale_mult = 0.5
+        self.streaming_insert_scale_max = 0.05
+        self.streaming_insert_normal_scale_ratio = 0.15
+        # Free-space / floater loss weight (penalises opacity rendered in front of surface)
+        self.streaming_free_space_loss_weight = 0.0
         # Depth supervision loss weight (0 = disabled)
         self.streaming_depth_loss_weight = 0.05
         # Depth loss type: "l1" or "huber"

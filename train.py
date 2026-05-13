@@ -1249,6 +1249,17 @@ def prepare_output_and_logger(args, run_args=None):
         with open(os.path.join(args.model_path, "run_args"), 'w') as run_args_f:
             run_args_f.write(str(public_namespace(run_args)))
 
+    # Write a shell script that reproduces this exact run
+    import shlex
+    _repro_path = os.path.join(args.model_path, "reproduce.sh")
+    with open(_repro_path, 'w') as _repro_f:
+        _cmd = " ".join(shlex.quote(a) for a in sys.argv)
+        _repro_f.write("#!/bin/bash\n")
+        _repro_f.write("# Reproduces the training run stored in this output directory.\n")
+        _repro_f.write("# Generated automatically at training start.\n")
+        _repro_f.write(f"python {_cmd}\n")
+    os.chmod(_repro_path, 0o755)
+
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
