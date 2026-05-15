@@ -1536,6 +1536,15 @@ def streaming_training(
                 if _occ_rebuild_every > 0 and iteration % _occ_rebuild_every == 0:
                     streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
 
+        # If N changed this iteration (insertion or pruning), resize render_pkg visibility
+        # so all downstream code (loss, MCMC, energy, grad-zeroing) sees a consistent size.
+        _cur_n_after = gaussians.get_xyz.shape[0]
+        _vf = render_pkg.get("visibility_filter")
+        if _vf is not None and _vf.shape[0] != _cur_n_after:
+            _vf_safe = torch.zeros(_cur_n_after, dtype=torch.bool, device=_vf.device)
+            _vf_safe[:min(_vf.shape[0], _cur_n_after)] = _vf[:min(_vf.shape[0], _cur_n_after)]
+            render_pkg["visibility_filter"] = _vf_safe
+
         # ---- Loss ---------------------------------------------------------
         gt_image = viewpoint_cam.original_image
         Ll1 = l1_loss(image, gt_image)
@@ -1694,7 +1703,7 @@ def streaming_training(
 
             # Zero invisible grad rows in strided grads (active-set safety)
             if sparse_active_set and getattr(args, "selective_adam_zero_invisible_grads", True):
-                _mask = render_pkg["visibility_filter"].detach()
+                _mask = visible  # already resized above
                 for group in gaussians.optimizer.param_groups:
                     p = group["params"][0]
                     if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
