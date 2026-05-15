@@ -64,7 +64,7 @@ class ModelParams(ParamGroup):
         self.scannet_max_frames = 0
         self.scannet_eval_hold = 20
         self.scannet_init = "rgbd"
-        self.scannet_depth_stride = 8
+        self.scannet_depth_stride = 4
         self.scannet_init_frames = 200
         self.scannet_max_init_points = 250000
         self.scannet_depth_scale = 1000.0
@@ -161,7 +161,7 @@ class OptimizationParams(ParamGroup):
         self.sparse_energy_global_interval = 500
         self.benchmark_dir = ""
         self.noise_lr = 5e5
-        self.mcmc_noise_stop_iter = 30_000
+        self.mcmc_noise_stop_iter = -1   # -1 → default to mcmc_stop_growth_iter at runtime
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
         self.densification_strategy = "gsplat_energy_mcmc"
@@ -278,19 +278,19 @@ class StreamingParams(ParamGroup):
         self.streaming_frame_stride = 1           # Release every Nth frame from the source
         self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
         self.streaming_keyframe_window = 8        # recent cameras used for local training
-        self.streaming_replay_buffer = 32         # size of older-frame replay ring buffer
+        self.streaming_replay_buffer = 200        # size of older-frame replay ring buffer
         self.streaming_global_replay_ratio = 0.1  # fraction of steps drawn from replay buffer
         # Depth-based incremental Gaussian insertion (Phase 2)
         self.streaming_insert_from_depth = True
-        self.streaming_depth_stride = 8
-        self.streaming_max_new_gaussians_per_frame = 1000
+        self.streaming_depth_stride = 4
+        self.streaming_max_new_gaussians_per_frame = 2000
         self.streaming_insert_voxel_size = 0.02
         self.streaming_min_depth = 0.1
         self.streaming_max_depth = 8.0
         # Local MCMC: restrict noise/reloc to visible/active Gaussians only
         self.streaming_mcmc_local_only = True
         # Global maintenance: run full MCMC pass every N iterations (0 = never)
-        self.streaming_global_maintenance_interval = 200
+        self.streaming_global_maintenance_interval = 1000
         # Save PLY every N frames ingested (0 = iteration-based only)
         self.streaming_save_frame_interval = 50
         # Initial opacity for depth-inserted Gaussians — high enough for gradient signal

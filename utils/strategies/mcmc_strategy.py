@@ -6,6 +6,19 @@ from utils.energy_mcmc import compute_dead_mask
 from utils.general_utils import build_scaling_rotation
 
 
+def _resolve_noise_stop_iter(args):
+    """Return the effective noise-stop iteration.
+
+    When mcmc_noise_stop_iter == -1 (new default), noise stops at
+    mcmc_stop_growth_iter so that noise injection ends when MCMC growth ends.
+    An explicit non-negative value is used as-is.
+    """
+    val = int(getattr(args, "mcmc_noise_stop_iter", -1))
+    if val < 0:
+        return int(getattr(args, "mcmc_stop_growth_iter", getattr(args, "iterations", 30_000)))
+    return val
+
+
 class ScheduledMCMCStrategy:
     """Upstream-shaped adapter around this repo's scheduled Energy-MCMC logic."""
 
@@ -32,7 +45,7 @@ class ScheduledMCMCStrategy:
         return True
 
     def inject_noise(self, gaussians, args, xyz_lr, visible=None, sparse_active_set=False, iteration=0):
-        if iteration > int(getattr(args, "mcmc_noise_stop_iter", getattr(args, "iterations", 30_000))):
+        if iteration > _resolve_noise_stop_iter(args):
             return
         with torch.no_grad():
             if sparse_active_set and visible is not None:
@@ -240,9 +253,7 @@ class UpstreamGsplatMCMCStrategy:
             "refine_every": int(getattr(args, "densification_interval", 100)),
             "min_opacity": float(getattr(args, "mcmc_dead_opacity_end", 0.005)),
             "verbose": bool(getattr(args, "mcmc_strategy_verbose", False)),
-            "noise_injection_stop_iter": int(
-                getattr(args, "mcmc_noise_stop_iter", getattr(args, "iterations", 30_000))
-            ),
+            "noise_injection_stop_iter": _resolve_noise_stop_iter(args),
         }
         supported = inspect.signature(MCMCStrategy).parameters
         kwargs = {key: value for key, value in requested.items() if key in supported}
@@ -320,9 +331,7 @@ class GsplatEnergyMCMCStrategy:
             "refine_every": int(getattr(args, "densification_interval", 100)),
             "min_opacity": float(getattr(args, "mcmc_dead_opacity_end", 0.005)),
             "verbose": bool(getattr(args, "mcmc_strategy_verbose", False)),
-            "noise_injection_stop_iter": int(
-                getattr(args, "mcmc_noise_stop_iter", getattr(args, "iterations", 30_000))
-            ),
+            "noise_injection_stop_iter": _resolve_noise_stop_iter(args),
         }
         supported = inspect.signature(MCMCStrategy).parameters
         kwargs = {key: value for key, value in requested.items() if key in supported}
@@ -419,14 +428,37 @@ class GsplatEnergyMCMCStrategy:
             torch.cuda.empty_cache()
 
         if self.noise_stop_iter is None or iteration <= self.noise_stop_iter:
-            from gsplat.strategy.ops import inject_noise_to_position
-
-            inject_noise_to_position(
-                params=params,
-                optimizers=optimizers,
-                state={},
-                scaler=float(lr if lr is not None else 0.0) * self.strategy.noise_lr,
+            scaler = float(lr if lr is not None else 0.0) * self.strategy.noise_lr
+            # When streaming_mcmc_local_only is set, restrict noise to visible
+            # Gaussians so that older invisible splats are not perturbed.
+            streaming_local = getattr(args, "streaming_mcmc_local_only", False)
+            vis_filter = (
+                render_pkg.get("visibility_filter") if render_pkg is not None else None
             )
+            if streaming_local and vis_filter is not None and vis_filter.numel() == params["means"].shape[0]:
+                noise_idx = vis_filter.detach().to(dtype=torch.bool).nonzero(as_tuple=True)[0]
+                if noise_idx.numel() > 0:
+                    with torch.no_grad():
+                        def op_sigmoid(x, k=100, x0=0.995):
+                            return 1 / (1 + torch.exp(-k * (x - x0)))
+                        L = build_scaling_rotation(
+                            gaussians.get_scaling[noise_idx],
+                            gaussians.get_rotation[noise_idx],
+                        )
+                        cov = L @ L.transpose(1, 2)
+                        noise = torch.randn_like(params["means"][noise_idx]) * (
+                            op_sigmoid(1.0 - gaussians.get_opacity[noise_idx])
+                        ) * scaler
+                        noise = torch.bmm(cov, noise.unsqueeze(-1)).squeeze(-1)
+                        params["means"].data[noise_idx].add_(noise)
+            else:
+                from gsplat.strategy.ops import inject_noise_to_position
+                inject_noise_to_position(
+                    params=params,
+                    optimizers=optimizers,
+                    state={},
+                    scaler=scaler,
+                )
 
         after = params["means"].shape[0]
         if tb_writer:

@@ -270,7 +270,11 @@ def insert_gaussians_from_frame(
     _debug = getattr(args, "streaming_insertion_debug", False)
     _stats: dict = {}
 
-    if frame.depth_path is None or not os.path.exists(frame.depth_path):
+    # Support both file-based frames (TUM, extracted ScanNet) and in-memory frames (.sens)
+    from utils.streaming_frames import load_frame_depth_np, load_frame_rgb
+    if frame.depth_path is None and frame._depth_bytes is None:
+        return 0, _stats
+    if frame.depth_path is not None and not os.path.exists(frame.depth_path) and frame._depth_bytes is None:
         return 0, _stats
 
     depth_stride = getattr(args, "streaming_depth_stride", 8)
@@ -288,8 +292,11 @@ def insert_gaussians_from_frame(
     use_knn_scale = getattr(args, "streaming_insert_knn_scale", True)
 
     try:
-        depth = np.array(_Image.open(frame.depth_path))
-        rgb = np.array(_Image.open(frame.rgb_path).convert("RGB")).astype(np.float32) / 255.0
+        depth_raw = load_frame_depth_np(frame)
+        if depth_raw is None:
+            return 0, _stats
+        depth = np.asarray(depth_raw)
+        rgb = np.array(load_frame_rgb(frame)).astype(np.float32) / 255.0
     except Exception:
         return 0, _stats
 
@@ -403,7 +410,10 @@ def insert_gaussians_from_frame(
     cols = rgb[ry, rx].astype(np.float32)
 
     # ---- Persistent Voxel coverage filter (Step 7) --------------------------
-    occupied = streaming_scene.check_occupancy(pts, cover_voxel, check_neighbors=True)
+    # check_neighbors=False: the earlier voxel-downsampling already deduplicates;
+    # the 26-neighbor check would inflate the exclusion zone 3x and create an
+    # artificial density ceiling well below cap_max.
+    occupied = streaming_scene.check_occupancy(pts, cover_voxel, check_neighbors=False)
     pts = pts[~occupied]
     cols = cols[~occupied]
     nx = nx[~occupied]; ny = ny[~occupied]; nz = nz[~occupied]
@@ -1549,6 +1559,8 @@ def streaming_training(
                     else:
                         gaussians._opacity.data[promote_mask] = target_op
                     print(f"[streaming] iter={iteration} promoted {promote_mask.sum().item()} points to permanent structure.", flush=True)
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("streaming/provisional/promoted", int(promote_mask.sum()), iteration)
 
                 # Prune stale low-support points
                 age = n_frames_ingested - gaussians.birth_frame
@@ -1558,6 +1570,12 @@ def streaming_training(
                     gaussians.prune_points(stale_mask)
                     # Force occupancy hash update after pruning
                     streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("streaming/provisional/pruned_stale", int(stale_mask.sum()), iteration)
+
+                if tb_writer is not None:
+                    tb_writer.add_scalar("streaming/provisional/count",
+                                         int(gaussians.provisional.sum()), iteration)
 
                 # Periodic rebuild regardless of pruning — frees voxels of relocated Gaussians
                 _occ_rebuild_every = getattr(args, "streaming_occupancy_rebuild_interval", 200)
