@@ -222,11 +222,17 @@ class StreamingScene:
 
         points_all, colors_all = [], []
         for frame in frames:
-            if frame.depth_path is None or not os.path.exists(frame.depth_path):
+            if frame.depth_path is None and frame._depth_bytes is None:
+                continue
+            if frame.depth_path is not None and not os.path.exists(frame.depth_path) and frame._depth_bytes is None:
                 continue
             try:
-                depth = np.array(_Image.open(frame.depth_path))
-                rgb = np.array(_Image.open(frame.rgb_path).convert("RGB")).astype(np.float32) / 255.0
+                from utils.streaming_frames import load_frame_rgb, load_frame_depth_np
+                depth_raw = load_frame_depth_np(frame)
+                if depth_raw is None:
+                    continue
+                depth = np.asarray(depth_raw)
+                rgb = np.array(load_frame_rgb(frame)).astype(np.float32) / 255.0
             except Exception:
                 continue
             z = depth_to_meters(depth, frame.depth_scale)
@@ -239,8 +245,12 @@ class StreamingScene:
             xs_v = xs[valid].astype(np.float32)
             ys_v = ys[valid].astype(np.float32)
             z_v = z_v[valid].astype(np.float32)
-            x_c = (xs_v - frame.cx) / frame.fx * z_v
-            y_c = (ys_v - frame.cy) / frame.fy * z_v
+            d_fx = frame.depth_fx if frame.depth_fx is not None else frame.fx
+            d_fy = frame.depth_fy if frame.depth_fy is not None else frame.fy
+            d_cx = frame.depth_cx if frame.depth_cx is not None else frame.cx
+            d_cy = frame.depth_cy if frame.depth_cy is not None else frame.cy
+            x_c = (xs_v - d_cx) / d_fx * z_v
+            y_c = (ys_v - d_cy) / d_fy * z_v
             pts_cam = np.stack([x_c, y_c, z_v], axis=1)
             pts_world = (frame.c2w[:3, :3] @ pts_cam.T).T + frame.c2w[:3, 3]
             rgb_h, rgb_w = rgb.shape[:2]
@@ -431,8 +441,9 @@ class StreamingScene:
         from scene.readers.common import CameraInfo
         from PIL import Image
 
+        from utils.streaming_frames import load_frame_rgb
         R, T = c2w_to_camera_rt(frame.c2w)
-        image = Image.open(frame.rgb_path).convert("RGB")
+        image = load_frame_rgb(frame)
         orig_w, orig_h = image.size
         cam_info = CameraInfo(
             uid=frame.index,
@@ -451,4 +462,6 @@ class StreamingScene:
         cam._streaming_depth_path = frame.depth_path
         cam._streaming_depth_scale = frame.depth_scale
         cam._sensor_depth_cache = None  # populated on first access
+        # Keep reference to frame for in-memory depth access (.sens source)
+        cam._streaming_frame = frame
         return cam

@@ -131,15 +131,23 @@ def _get_sensor_depth(cam, target_h: int, target_w: int) -> Optional[torch.Tenso
         return None
     if cam._sensor_depth_cache is not None:
         return cam._sensor_depth_cache
-    # First access: load from disk
-    depth_path = cam._streaming_depth_path
-    if depth_path is None or not os.path.exists(depth_path):
-        cam._sensor_depth_cache = False
-        return None
+    # First access: load from frame (in-memory bytes) or disk
     try:
         from utils.rgbd_frames import depth_to_meters
-        from PIL import Image as _Image
-        depth_raw = np.array(_Image.open(depth_path))
+        frame = getattr(cam, "_streaming_frame", None)
+        if frame is not None and frame._depth_bytes is not None:
+            from utils.streaming_frames import load_frame_depth_np
+            depth_raw = load_frame_depth_np(frame)
+        else:
+            depth_path = cam._streaming_depth_path
+            if depth_path is None or not os.path.exists(depth_path):
+                cam._sensor_depth_cache = False
+                return None
+            from PIL import Image as _Image
+            depth_raw = np.array(_Image.open(depth_path))
+        if depth_raw is None:
+            cam._sensor_depth_cache = False
+            return None
         depth_m = depth_to_meters(depth_raw, cam._streaming_depth_scale).astype(np.float32)
     except Exception:
         cam._sensor_depth_cache = False
@@ -210,12 +218,18 @@ def _sync_streaming_state_lengths(gaussians):
 def _load_depth_meters(frame) -> Optional[np.ndarray]:
     """Load and convert a frame's depth image to float32 metres array, or None on failure."""
     from utils.rgbd_frames import depth_to_meters
-    from PIL import Image as _Image
-    if frame is None or frame.depth_path is None or not os.path.exists(frame.depth_path):
+    from utils.streaming_frames import load_frame_depth_np
+    if frame is None:
+        return None
+    if frame.depth_path is None and frame._depth_bytes is None:
+        return None
+    if frame.depth_path is not None and not os.path.exists(frame.depth_path) and frame._depth_bytes is None:
         return None
     try:
-        depth = np.array(_Image.open(frame.depth_path))
-        return depth_to_meters(depth, frame.depth_scale).astype(np.float32)
+        depth_raw = load_frame_depth_np(frame)
+        if depth_raw is None:
+            return None
+        return depth_to_meters(depth_raw, frame.depth_scale).astype(np.float32)
     except Exception:
         return None
 
@@ -278,6 +292,13 @@ def insert_gaussians_from_frame(
         rgb = np.array(_Image.open(frame.rgb_path).convert("RGB")).astype(np.float32) / 255.0
     except Exception:
         return 0, _stats
+
+    # Use sensor-specific depth intrinsics when available (e.g. ScanNet has
+    # separate color (1296×968) and depth (640×480) cameras).
+    d_fx = frame.depth_fx if frame.depth_fx is not None else frame.fx
+    d_fy = frame.depth_fy if frame.depth_fy is not None else frame.fy
+    d_cx = frame.depth_cx if frame.depth_cx is not None else frame.cx
+    d_cy = frame.depth_cy if frame.depth_cy is not None else frame.cy
 
     z = depth_to_meters(depth, frame.depth_scale)
     h, w = z.shape
@@ -353,8 +374,8 @@ def insert_gaussians_from_frame(
     dzdy_v = (z[np.clip(ys_vi + s, 0, h - 1), xs_vi] - z[np.clip(ys_vi - s, 0, h - 1), xs_vi])
     
     # ---- Grazing-angle rejection ---------------------------------------------
-    nx = -dzdx_v / (frame.fx * (2.0 * s / depth_stride)) # scaled by local stride
-    ny = -dzdy_v / (frame.fy * (2.0 * s / depth_stride))
+    nx = -dzdx_v / (d_fx * (2.0 * s / depth_stride))
+    ny = -dzdy_v / (d_fy * (2.0 * s / depth_stride))
     nz = np.ones_like(nx)
     norm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-8
     nx /= norm; ny /= norm; nz /= norm
@@ -372,8 +393,8 @@ def insert_gaussians_from_frame(
     z_v = z_vi[angle_ok].astype(np.float32)
     nx = nx[angle_ok]; ny = ny[angle_ok]; nz = nz[angle_ok]
     
-    x_c = (xs_v - frame.cx) / frame.fx * z_v
-    y_c = (ys_v - frame.cy) / frame.fy * z_v
+    x_c = (xs_v - d_cx) / d_fx * z_v
+    y_c = (ys_v - d_cy) / d_fy * z_v
     pts = ((frame.c2w[:3, :3] @ np.stack([x_c, y_c, z_v], axis=1).T).T + frame.c2w[:3, 3]).astype(np.float32)
     
     rgb_h, rgb_w = rgb.shape[:2]
@@ -451,8 +472,8 @@ def insert_gaussians_from_frame(
     scale_mult  = getattr(args, "streaming_insert_scale_mult", 0.5)
     scale_max   = getattr(args, "streaming_insert_scale_max", 0.05)
     normal_ratio = getattr(args, "streaming_insert_normal_scale_ratio", 0.15)
-    tx = np.clip(scale_mult * z_v / frame.fx * depth_stride, 1e-4, scale_max)
-    ty = np.clip(scale_mult * z_v / frame.fy * depth_stride, 1e-4, scale_max)
+    tx = np.clip(scale_mult * z_v / d_fx * depth_stride, 1e-4, scale_max)
+    ty = np.clip(scale_mult * z_v / d_fy * depth_stride, 1e-4, scale_max)
     if getattr(args, "streaming_insert_isotropic_scale", False):
         # Isotropic sphere (H3): geometric mean of in-plane footprint.
         # Avoids edge-on streaking from flat surfels seen off-axis.
@@ -1323,8 +1344,15 @@ def streaming_training(
     # Training-progress video setup
     _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
     _progress_video_fps = int(getattr(args, "progress_video_fps", 10))
-    _progress_cams: list = []     # 3 equally-spaced fixed cameras, locked in once enough are available
     _progress_frames: list = []   # accumulated side-by-side uint8 HWC numpy frames
+
+    # Pre-compute 3 target frame indices from the FULL trajectory (start/mid/end).
+    # At each render trigger we pick the closest arrived camera to each target —
+    # renders start from iteration 1 without waiting for a coverage threshold.
+    _n_total_frames = len(streaming_scene._all_frames)
+    _progress_target_idxs = [0, max(0, _n_total_frames // 2), max(0, _n_total_frames - 1)]
+
+    from gaussian_renderer.gsplat_backend import render_batch as _render_batch
 
     # Async render: renders go on a side CUDA stream; CPU work (numpy/cv2) goes to a daemon thread.
     # This overlaps GPU renders and CPU image assembly with the next training iteration.
@@ -1907,31 +1935,23 @@ def streaming_training(
 
             # ---- Training-progress video capture (async) --------------------
             if _progress_video_interval > 0 and iteration % _progress_video_interval == 0:
-                # Lock in 3 cameras once enough trajectory is covered.
-                # Require ≥3 test cameras AND ≥20% of frames ingested so the
-                # selected cameras span meaningfully different viewpoints.
-                if not _progress_cams:
-                    _total_frames_avail = len(streaming_scene._all_frames)
-                    # Wait until 20% of the trajectory has been ingested so that
-                    # the first, middle, and last of the pool span genuinely
-                    # different viewpoints (not just the same position 3×).
-                    _lock_at = max(30, _total_frames_avail // 5)
-                    if n_frames_ingested >= _lock_at:
-                        _tcams = list(streaming_scene.getTestCameras())
-                        _trcams = list(streaming_scene.train_cameras)
-                        _pool = _tcams if len(_tcams) >= 3 else (_trcams if len(_trcams) >= 3 else None)
-                        if _pool is not None:
-                            _n = len(_pool)
-                            _progress_cams = [_pool[0], _pool[(_n - 1) // 2], _pool[_n - 1]]
-                if _progress_cams:
-                    # Submit 3 renders to side CUDA stream (non-blocking for main stream)
-                    _gpu_panels = []
+                # Dynamically pick 3 cameras from the arrived pool that are
+                # closest to the 0%, 50%, 100% positions of the FULL trajectory.
+                # Renders start from iteration 1 with whatever cameras exist.
+                _arrived_trcams = list(streaming_scene.train_cameras)
+                _n_arr = len(_arrived_trcams)
+                if _n_arr >= 1:
+                    _progress_cams_now = []
+                    for _tidx in _progress_target_idxs:
+                        _cam_idx = min(_tidx, _n_arr - 1)
+                        _progress_cams_now.append(_arrived_trcams[_cam_idx])
+                    # Submit batched render to side CUDA stream
                     with torch.cuda.stream(_pv_stream):
                         _pv_stream.wait_stream(torch.cuda.current_stream())
                         with torch.no_grad():
-                            for _pvc in _progress_cams:
-                                _pv_pkg = render(_pvc, gaussians, pipe, background)
-                                _gpu_panels.append(_pv_pkg["render"].detach().clamp(0, 1))
+                            _gpu_panels = _render_batch(
+                                _progress_cams_now, gaussians, pipe, background
+                            )
                     # Hand off to CPU worker; drop frame if worker is still busy
                     try:
                         _pv_cpu_queue.put_nowait((_gpu_panels, iteration, opt.iterations))
@@ -1975,6 +1995,7 @@ def streaming_training(
             if iteration in testing_iterations:
                 try:
                     from utils.comparison_report import write_post_training_report
+                    from gaussian_renderer.gsplat_backend import render_batch as _rb_mid
                     write_post_training_report(
                         model_path=args.model_path,
                         iteration=iteration,
@@ -1986,6 +2007,7 @@ def streaming_training(
                         background=background,
                         tb_writer=tb_writer,
                         log_prefix="streaming_report",
+                        batch_render_fn=_rb_mid,
                     )
                 except Exception as _e:
                     print(f"[streaming-report] mid-training report failed iter={iteration}: {_e}", flush=True)
@@ -2029,6 +2051,7 @@ def streaming_training(
     # opt-in --streaming_render_at_saves milestone snapshots).
     try:
         from utils.comparison_report import write_post_training_report
+        from gaussian_renderer.gsplat_backend import render_batch as _rb_final
         write_post_training_report(
             model_path=args.model_path,
             iteration=opt.iterations,
@@ -2040,6 +2063,7 @@ def streaming_training(
             background=background,
             tb_writer=tb_writer,
             log_prefix="streaming_report",
+            batch_render_fn=_rb_final,
         )
         # Re-render the bootstrap views with the trained Gaussians so the
         # iter_0 vs end-of-training comparison is over the same viewpoints.
@@ -2056,6 +2080,7 @@ def streaming_training(
                 tb_writer=tb_writer,
                 log_prefix="streaming_report",
                 subdir=f"iter_{opt.iterations}_bootstrap_views",
+                batch_render_fn=_rb_final,
             )
     except Exception as e:
         print(f"[streaming-report] post-training report failed: {e}", flush=True)

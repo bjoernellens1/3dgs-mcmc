@@ -195,6 +195,17 @@ def _render_image(cam, gaussians, render_fn, pipe, background) -> torch.Tensor:
     return img.clamp(0.0, 1.0)
 
 
+def _batch_render_images(cams, gaussians, pipe, background,
+                         batch_render_fn=None, chunk_size: int = 32) -> list:
+    """Render a list of cameras in batches. Returns list of (3,H,W) tensors."""
+    if not cams:
+        return []
+    if batch_render_fn is None:
+        return []
+    with torch.no_grad():
+        return batch_render_fn(cams, gaussians, pipe, background, chunk_size=chunk_size)
+
+
 def _gt_image(cam) -> torch.Tensor:
     gt = cam.original_image[:3].to("cuda", non_blocking=True)
     return gt.clamp(0.0, 1.0)
@@ -361,6 +372,7 @@ def write_post_training_report(
     contact_sheet_cell_width: int = 320,
     log_prefix: str = "report",
     subdir: Optional[str] = None,
+    batch_render_fn=None,
 ) -> dict:
     """Produce side-by-side PNGs, contact sheet, trajectory MP4, and report.json.
 
@@ -400,9 +412,23 @@ def write_post_training_report(
     def _compute_metrics(cams: List, split: str):
         psnr_list = []
         lpips_list = []
-        for cam in cams:
+        # Batch-render all cameras at once when batch_render_fn is available
+        batch_imgs_m: list = []
+        if batch_render_fn is not None:
             try:
-                img = _render_image(cam, gaussians, render_fn, pipe, background)
+                batch_imgs_m = _batch_render_images(
+                    cams, gaussians, pipe, background,
+                    batch_render_fn=batch_render_fn,
+                )
+            except Exception:
+                batch_imgs_m = []
+        use_batch_m = len(batch_imgs_m) == len(cams)
+        for i, cam in enumerate(cams):
+            try:
+                if use_batch_m:
+                    img = batch_imgs_m[i].clamp(0.0, 1.0)
+                else:
+                    img = _render_image(cam, gaussians, render_fn, pipe, background)
                 gt = _gt_image(cam)
             except Exception as e:
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
@@ -420,9 +446,26 @@ def write_post_training_report(
     pairs_for_sheet: List[Tuple[str, np.ndarray, np.ndarray]] = []
     if test_cams:
         test_dir = os.path.join(out_dir, "test")
-        for cam in test_cams:
+        # Batch-render all test cameras at once when batch_render_fn is available
+        if batch_render_fn is not None:
             try:
-                img = _render_image(cam, gaussians, render_fn, pipe, background)
+                batch_imgs = _batch_render_images(
+                    test_cams, gaussians, pipe, background,
+                    batch_render_fn=batch_render_fn,
+                )
+            except Exception as e:
+                print(f"[report] batch render failed, falling back: {e}", flush=True)
+                batch_imgs = []
+        else:
+            batch_imgs = []
+        use_batch = len(batch_imgs) == len(test_cams)
+
+        for i, cam in enumerate(test_cams):
+            try:
+                if use_batch:
+                    img = batch_imgs[i].clamp(0.0, 1.0)
+                else:
+                    img = _render_image(cam, gaussians, render_fn, pipe, background)
                 gt = _gt_image(cam)
             except Exception as e:
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
@@ -508,10 +551,26 @@ def write_post_training_report(
             step = max(1, len(cams_for_video) // mp4_max_frames)
             cams_for_video = cams_for_video[::step][:mp4_max_frames]
 
+        if batch_render_fn is not None:
+            try:
+                traj_imgs = _batch_render_images(
+                    cams_for_video, gaussians, pipe, background,
+                    batch_render_fn=batch_render_fn, chunk_size=32,
+                )
+            except Exception as e:
+                print(f"[report] batch trajectory render failed, falling back: {e}", flush=True)
+                traj_imgs = []
+        else:
+            traj_imgs = []
+        use_traj_batch = len(traj_imgs) == len(cams_for_video)
+
         def _frames():
-            for cam in cams_for_video:
+            for idx, cam in enumerate(cams_for_video):
                 try:
-                    img = _render_image(cam, gaussians, render_fn, pipe, background)
+                    if use_traj_batch:
+                        img = traj_imgs[idx].clamp(0.0, 1.0)
+                    else:
+                        img = _render_image(cam, gaussians, render_fn, pipe, background)
                 except Exception as e:
                     print(f"[report] trajectory render failed for {cam.image_name}: {e}", flush=True)
                     continue

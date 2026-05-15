@@ -280,3 +280,98 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         })
 
     return result
+
+
+def render_batch(viewpoint_cameras, pc, pipe, bg_color: torch.Tensor,
+                 chunk_size: int = 32) -> list:
+    """Render multiple cameras via batched gsplat rasterization.
+
+    All cameras must have the same image dimensions. Falls back to sequential
+    render() calls if cameras have mismatched sizes or on any error.
+    Returns a list of (3, H, W) float tensors clamped [0, 1].
+    """
+    if not viewpoint_cameras:
+        return []
+    if len(viewpoint_cameras) == 1:
+        with torch.no_grad():
+            return [render(viewpoint_cameras[0], pc, pipe, bg_color)["render"].clamp(0, 1)]
+
+    device = pc.get_xyz.device
+    W = int(viewpoint_cameras[0].image_width)
+    H = int(viewpoint_cameras[0].image_height)
+
+    # Verify all cameras share H, W — fall back if not
+    for cam in viewpoint_cameras:
+        if int(cam.image_width) != W or int(cam.image_height) != H:
+            with torch.no_grad():
+                return [render(cam, pc, pipe, bg_color)["render"].clamp(0, 1)
+                        for cam in viewpoint_cameras]
+
+    means = pc.get_xyz.contiguous()
+    scales = pc.get_scaling.contiguous()
+    quats = pc.get_rotation.contiguous()
+    opacities = pc.get_opacity.squeeze(-1).contiguous()
+    bg = bg_color.contiguous() if bg_color is not None else None
+
+    sh_backend = str(getattr(pipe, "sh_backend", "python")).lower()
+    tile_size = getattr(pipe, "tile_size", 16)
+
+    results = []
+    for start in range(0, len(viewpoint_cameras), chunk_size):
+        chunk = viewpoint_cameras[start:start + chunk_size]
+        C = len(chunk)
+
+        viewmats_list = []
+        Ks_list = []
+
+        if sh_backend == "gsplat":
+            colors = _gsplat_sh_coeffs(pc, update_sh_rest=False)
+            sh_degree = pc.active_sh_degree
+            for cam in chunk:
+                vm, K, _ = _camera_tensors(cam, device)
+                viewmats_list.append(vm)
+                Ks_list.append(K)
+        else:
+            colors_list = []
+            sh_degree = None
+            compiled = sh_backend == "compiled_python"
+            for cam in chunk:
+                vm, K, cam_center = _camera_tensors(cam, device)
+                viewmats_list.append(vm)
+                Ks_list.append(K)
+                c = _python_sh_colors(pc, means, cam_center, False, pipe, False, compiled)
+                colors_list.append(c)
+            colors = torch.stack(colors_list, dim=0)  # (C, N, 3)
+
+        viewmats = torch.stack(viewmats_list, dim=0).contiguous()  # (C, 4, 4)
+        Ks = torch.stack(Ks_list, dim=0).contiguous()              # (C, 3, 3)
+
+        render_colors, _, _ = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=W,
+            height=H,
+            near_plane=getattr(pipe, "near_plane", 0.01),
+            far_plane=getattr(pipe, "far_plane", 1e10),
+            radius_clip=getattr(pipe, "radius_clip", 0.0),
+            eps2d=getattr(pipe, "eps2d", 0.3),
+            sh_degree=sh_degree,
+            packed=True,
+            tile_size=tile_size,
+            backgrounds=bg,
+            render_mode="RGB",
+            sparse_grad=False,
+            absgrad=False,
+            rasterize_mode=getattr(pipe, "rasterize_mode", "classic"),
+        )
+
+        for c_idx in range(C):
+            img = render_colors[c_idx].permute(2, 0, 1).contiguous().clamp(0, 1)
+            results.append(img)
+
+    return results

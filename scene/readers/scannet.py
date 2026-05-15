@@ -55,7 +55,10 @@ def _find_scannet_intrinsics(path):
     }
 
 def _read_scannet_pose(path):
-    pose = np.loadtxt(path).astype(np.float32)
+    try:
+        pose = np.loadtxt(path).astype(np.float32)
+    except (FileNotFoundError, OSError):
+        return None
     if pose.shape != (4, 4):
         return None
     if not np.isfinite(pose).all():
