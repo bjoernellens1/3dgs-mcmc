@@ -1912,17 +1912,17 @@ def streaming_training(
                 # selected cameras span meaningfully different viewpoints.
                 if not _progress_cams:
                     _total_frames_avail = len(streaming_scene._all_frames)
-                    _tcams = list(streaming_scene.getTestCameras())
-                    _trcams = list(streaming_scene.train_cameras)
-                    if len(_tcams) >= 3 and n_frames_ingested >= max(3, _total_frames_avail // 5):
-                        _pool = _tcams
-                    elif len(_trcams) >= 10 and n_frames_ingested >= 10:
-                        _pool = _trcams
-                    else:
-                        _pool = None
-                    if _pool is not None:
-                        _n = len(_pool)
-                        _progress_cams = [_pool[0], _pool[(_n - 1) // 2], _pool[_n - 1]]
+                    # Wait until 20% of the trajectory has been ingested so that
+                    # the first, middle, and last of the pool span genuinely
+                    # different viewpoints (not just the same position 3×).
+                    _lock_at = max(30, _total_frames_avail // 5)
+                    if n_frames_ingested >= _lock_at:
+                        _tcams = list(streaming_scene.getTestCameras())
+                        _trcams = list(streaming_scene.train_cameras)
+                        _pool = _tcams if len(_tcams) >= 3 else (_trcams if len(_trcams) >= 3 else None)
+                        if _pool is not None:
+                            _n = len(_pool)
+                            _progress_cams = [_pool[0], _pool[(_n - 1) // 2], _pool[_n - 1]]
                 if _progress_cams:
                     # Submit 3 renders to side CUDA stream (non-blocking for main stream)
                     _gpu_panels = []
