@@ -367,7 +367,7 @@ def write_post_training_report(
     *,
     tb_writer=None,
     mp4_max_frames: int = 300,
-    mp4_fps: int = 30,
+    mp4_fps: int = 15,
     contact_sheet_cols: int = 4,
     contact_sheet_cell_width: int = 320,
     log_prefix: str = "report",

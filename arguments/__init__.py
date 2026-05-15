@@ -245,7 +245,7 @@ class OptimizationParams(ParamGroup):
         self.record_video = False
         self.record_video_cameras = ""
         self.record_video_interval = 100
-        self.record_video_fps = 30
+        self.record_video_fps = 15
         self.record_video_crf = 23
         self.record_video_preset = "veryfast"
         # Training-progress video: render a fixed camera every N iters,
