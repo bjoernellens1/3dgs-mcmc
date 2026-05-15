@@ -83,6 +83,47 @@ class _AsyncSaveWorker:
         self._thread.join(timeout=120)
 
 
+class _AsyncEvalWorker:
+    """Runs mid-training eval reports on a background thread + side CUDA stream.
+
+    Single-slot queue: if the previous eval is still running the new one is
+    dropped rather than queued, so a slow eval can never pile up and OOM.
+    """
+
+    def __init__(self):
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._stream = torch.cuda.Stream()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                break
+            try:
+                with torch.cuda.stream(self._stream):
+                    job()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                self._queue.task_done()
+
+    def submit(self, fn) -> None:
+        try:
+            self._queue.put_nowait(fn)
+        except queue.Full:
+            print("[async-eval] previous eval still running; skipping this checkpoint", flush=True)
+
+    def shutdown(self) -> None:
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=300)
+
+
 # ---------------------------------------------------------------------------
 # Point-cloud insertion helpers (Phase 2)
 # ---------------------------------------------------------------------------
@@ -538,6 +579,29 @@ def _snapshot_for_ply(gaussians):
         "scales": gaussians._scaling.detach().contiguous().cpu(),
         "quats": gaussians._rotation.detach().contiguous().cpu(),
     }
+
+
+def _snapshot_for_eval(gaussians):
+    """Clone gaussian params on GPU for eval while training mutates live params."""
+    from collections import OrderedDict
+    clone = type(gaussians).__new__(type(gaussians))
+    for k in ("active_sh_degree", "max_sh_degree", "spatial_lr_scale"):
+        if hasattr(gaussians, k):
+            setattr(clone, k, getattr(gaussians, k))
+    if hasattr(gaussians, "params") and isinstance(gaussians.params, (dict, OrderedDict)):
+        clone.params = torch.nn.ParameterDict({
+            k: torch.nn.Parameter(v.detach().clone(), requires_grad=False)
+            for k, v in gaussians.params.items()
+        })
+    else:
+        clone._xyz           = gaussians._xyz.detach().clone()
+        clone._features_dc   = gaussians._features_dc.detach().clone()
+        clone._features_rest = gaussians._features_rest.detach().clone()
+        clone._opacity       = gaussians._opacity.detach().clone()
+        clone._scaling       = gaussians._scaling.detach().clone()
+        clone._rotation      = gaussians._rotation.detach().clone()
+    clone.optimizer = None
+    return clone
 
 
 def _write_ply(snap, out_path):
@@ -1192,6 +1256,7 @@ def streaming_training(
         print("[streaming] TensorBoard not available.")
 
     save_worker = _AsyncSaveWorker()
+    eval_worker = _AsyncEvalWorker()
 
     # --- Build Gaussian model ----------------------------------------------
     model_layout = getattr(args, "model_layout", "gsplat").lower()
@@ -1919,10 +1984,15 @@ def streaming_training(
         # new geometry comes from depth insertion instead.
         if streaming_mcmc_local:
             sched["allow_growth"] = False
-            # Global maintenance: allow full reloc/grow on configured cadence
+            # Global maintenance sweep: respect the user-set stop iterations so
+            # growth/reloc don't fire after the schedule has already wound down.
             if global_maint_interval > 0 and iteration % global_maint_interval == 0:
-                sched["allow_growth"] = True
-                sched["allow_relocation"] = True
+                stop_growth = int(getattr(opt, "mcmc_stop_growth_iter", 12_000))
+                stop_reloc  = int(getattr(opt, "densify_until_iter", 25_000))
+                if iteration < stop_growth:
+                    sched["allow_growth"] = True
+                if iteration < stop_reloc:
+                    sched["allow_relocation"] = True
 
         # Anchor bootstrap Gaussians: save positions before step_post_backward
         # (which includes noise injection) and restore them after, so that MCMC
@@ -2022,27 +2092,30 @@ def streaming_training(
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Test evaluation: full comparison report (renders + contact sheet + MP4)
+            # Test evaluation: snapshot params then run report in background
             if iteration in testing_iterations:
-                try:
-                    from utils.comparison_report import write_post_training_report
-                    from gaussian_renderer.gsplat_backend import render_batch as _rb_mid
-                    write_post_training_report(
-                        model_path=args.model_path,
-                        iteration=iteration,
-                        gaussians=gaussians,
-                        train_cams=list(streaming_scene.getTrainCameras()),
-                        test_cams=list(streaming_scene.getTestCameras()),
-                        render_fn=render,
-                        pipe=pipe,
-                        background=background,
-                        tb_writer=tb_writer,
-                        log_prefix="streaming_report",
-                        batch_render_fn=_rb_mid,
-                    )
-                except Exception as _e:
-                    print(f"[streaming-report] mid-training report failed iter={iteration}: {_e}", flush=True)
-                    _run_test_eval(tb_writer, iteration, streaming_scene, gaussians, render, pipe, background, args)
+                _eval_snap = _snapshot_for_eval(gaussians)
+                _eval_train_cams = list(streaming_scene.getTrainCameras())
+                _eval_test_cams  = list(streaming_scene.getTestCameras())
+                _eval_iter = iteration
+
+                def _do_eval(snap=_eval_snap, tr=_eval_train_cams, te=_eval_test_cams, it=_eval_iter):
+                    try:
+                        from utils.comparison_report import write_post_training_report
+                        from gaussian_renderer.gsplat_backend import render_batch as _rb_mid
+                        write_post_training_report(
+                            model_path=args.model_path,
+                            iteration=it,
+                            gaussians=snap,
+                            train_cams=tr, test_cams=te,
+                            render_fn=render, pipe=pipe, background=background,
+                            tb_writer=tb_writer,
+                            log_prefix="streaming_report",
+                            batch_render_fn=_rb_mid,
+                        )
+                    except Exception as _e:
+                        print(f"[async-eval] report failed iter={it}: {_e}", flush=True)
+                eval_worker.submit(_do_eval)
 
         # ---- Saving -------------------------------------------------------
         # Frame-based PLY saves: fire when frame count crosses a new milestone
@@ -2131,6 +2204,7 @@ def streaming_training(
         else:
             print(f"[streaming] training_progress.mp4 FAILED: {_err}", flush=True)
 
+    eval_worker.shutdown()
     save_worker.shutdown()
     print("\n[streaming] Training complete.", flush=True)
 

@@ -409,20 +409,24 @@ def write_post_training_report(
     except ImportError:
         _lpips = None
 
-    def _compute_metrics(cams: List, split: str):
-        psnr_list = []
-        lpips_list = []
-        # Batch-render all cameras at once when batch_render_fn is available
-        batch_imgs_m: list = []
-        if batch_render_fn is not None:
-            try:
-                batch_imgs_m = _batch_render_images(
-                    cams, gaussians, pipe, background,
-                    batch_render_fn=batch_render_fn,
-                )
-            except Exception:
-                batch_imgs_m = []
-        use_batch_m = len(batch_imgs_m) == len(cams)
+    def _compute_metrics(cams: List, split: str, pre_rendered: Optional[list] = None):
+        psnr_list: list = []
+        if pre_rendered is not None and len(pre_rendered) == len(cams):
+            batch_imgs_m = pre_rendered
+            use_batch_m = True
+        else:
+            batch_imgs_m = []
+            if batch_render_fn is not None:
+                try:
+                    batch_imgs_m = _batch_render_images(
+                        cams, gaussians, pipe, background,
+                        batch_render_fn=batch_render_fn,
+                    )
+                except Exception:
+                    batch_imgs_m = []
+            use_batch_m = len(batch_imgs_m) == len(cams)
+        valid_imgs: list = []
+        valid_gts: list = []
         for i, cam in enumerate(cams):
             try:
                 if use_batch_m:
@@ -434,10 +438,22 @@ def write_post_training_report(
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
                 continue
             psnr_list.append(float(_psnr(img, gt).mean().item()))
-            if _lpips is not None:
-                # LPIPS expects batched tensors
-                l_val = float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
-                lpips_list.append(l_val)
+            valid_imgs.append(img)
+            valid_gts.append(gt)
+        lpips_list: list = []
+        if _lpips is not None and valid_imgs:
+            try:
+                _imgs_b = torch.stack(valid_imgs)
+                _gts_b = torch.stack(valid_gts)
+                _lv = _lpips(_imgs_b, _gts_b, net_type='vgg').reshape(-1)
+                lpips_list = _lv.tolist()
+            except Exception as _le:
+                print(f"[report] batched LPIPS failed for {split}: {_le}", flush=True)
+                for _img, _gt in zip(valid_imgs, valid_gts):
+                    try:
+                        lpips_list.append(float(_lpips(_img.unsqueeze(0), _gt.unsqueeze(0), net_type='vgg').item()))
+                    except Exception:
+                        pass
         return psnr_list, lpips_list
 
     # --- Test split: side-by-side + contact sheet + metrics -----------------------------
@@ -459,6 +475,8 @@ def write_post_training_report(
         else:
             batch_imgs = []
         use_batch = len(batch_imgs) == len(test_cams)
+        _valid_test_imgs: list = []
+        _valid_test_gts: list = []
 
         for i, cam in enumerate(test_cams):
             try:
@@ -471,8 +489,8 @@ def write_post_training_report(
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
                 continue
             psnrs.append(float(_psnr(img, gt).mean().item()))
-            if _lpips is not None:
-                lpipss.append(float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item()))
+            _valid_test_imgs.append(img)
+            _valid_test_gts.append(gt)
             r_u8 = _to_uint8_hwc(img)
             g_u8 = _to_uint8_hwc(gt)
             d_u8 = _abs_diff(img, gt)
@@ -480,6 +498,19 @@ def write_post_training_report(
             name = str(getattr(cam, "image_name", f"view_{len(pairs_for_sheet):04d}"))
             _save_png(os.path.join(test_dir, f"{name}.png"), side)
             pairs_for_sheet.append((name, r_u8, g_u8))
+        if _lpips is not None and _valid_test_imgs:
+            try:
+                _tb2 = torch.stack(_valid_test_imgs)
+                _gb2 = torch.stack(_valid_test_gts)
+                _lv2 = _lpips(_tb2, _gb2, net_type='vgg').reshape(-1)
+                lpipss = _lv2.tolist()
+            except Exception as _le2:
+                print(f"[report] batched test LPIPS failed: {_le2}", flush=True)
+                for _im2, _gt2 in zip(_valid_test_imgs, _valid_test_gts):
+                    try:
+                        lpipss.append(float(_lpips(_im2.unsqueeze(0), _gt2.unsqueeze(0), net_type='vgg').item()))
+                    except Exception:
+                        pass
         if pairs_for_sheet:
             sheet = _build_contact_sheet(
                 pairs_for_sheet,
@@ -500,9 +531,12 @@ def write_post_training_report(
             )
             print(msg, flush=True)
             if tb_writer is not None:
-                tb_writer.add_scalar(f"{log_prefix}/test_psnr_mean", summary["mean_test_psnr"], iteration)
-                tb_writer.add_scalar(f"{log_prefix}/test_psnr_min", summary["min_test_psnr"], iteration)
-                tb_writer.add_scalar(f"{log_prefix}/test_psnr_max", summary["max_test_psnr"], iteration)
+                try:
+                    tb_writer.add_scalar(f"{log_prefix}/test_psnr_mean", summary["mean_test_psnr"], iteration)
+                    tb_writer.add_scalar(f"{log_prefix}/test_psnr_min", summary["min_test_psnr"], iteration)
+                    tb_writer.add_scalar(f"{log_prefix}/test_psnr_max", summary["max_test_psnr"], iteration)
+                except Exception:
+                    pass
         if lpipss:
             summary["mean_test_lpips"] = float(np.mean(lpipss))
             summary["min_test_lpips"] = float(np.min(lpipss))
@@ -513,13 +547,27 @@ def write_post_training_report(
             )
             print(msg, flush=True)
             if tb_writer is not None:
-                tb_writer.add_scalar(f"{log_prefix}/test_lpips_mean", summary["mean_test_lpips"], iteration)
+                try:
+                    tb_writer.add_scalar(f"{log_prefix}/test_lpips_mean", summary["mean_test_lpips"], iteration)
+                except Exception:
+                    pass
     else:
         print(f"[report] iter={iteration} no test views — skipping test PSNR/LPIPS/contact sheet", flush=True)
 
+    # Pre-render train cams once — reused for both metrics and trajectory MP4
+    _train_imgs_all: list = []
+    if train_cams and batch_render_fn is not None:
+        try:
+            _train_imgs_all = _batch_render_images(
+                train_cams, gaussians, pipe, background,
+                batch_render_fn=batch_render_fn,
+            )
+        except Exception as _re:
+            print(f"[report] train pre-render failed: {_re}", flush=True)
+
     # --- Train split: metrics ------------------------------------
     if train_cams:
-        train_psnrs, train_lpipss = _compute_metrics(train_cams, "train")
+        train_psnrs, train_lpipss = _compute_metrics(train_cams, "train", pre_rendered=_train_imgs_all)
         if train_psnrs:
             summary["mean_train_psnr"] = float(np.mean(train_psnrs))
             summary["min_train_psnr"] = float(np.min(train_psnrs))
@@ -531,7 +579,10 @@ def write_post_training_report(
             )
             print(msg, flush=True)
             if tb_writer is not None:
-                tb_writer.add_scalar(f"{log_prefix}/train_psnr_mean", summary["mean_train_psnr"], iteration)
+                try:
+                    tb_writer.add_scalar(f"{log_prefix}/train_psnr_mean", summary["mean_train_psnr"], iteration)
+                except Exception:
+                    pass
         if train_lpipss:
             summary["mean_train_lpips"] = float(np.mean(train_lpipss))
             summary["min_train_lpips"] = float(np.min(train_lpipss))
@@ -542,16 +593,25 @@ def write_post_training_report(
             )
             print(msg, flush=True)
             if tb_writer is not None:
-                tb_writer.add_scalar(f"{log_prefix}/train_lpips_mean", summary["mean_train_lpips"], iteration)
+                try:
+                    tb_writer.add_scalar(f"{log_prefix}/train_lpips_mean", summary["mean_train_lpips"], iteration)
+                except Exception:
+                    pass
 
     # --- Trajectory MP4 over train cameras ------------------------------------
     if train_cams:
         cams_for_video = train_cams
+        traj_imgs: list = []
         if len(cams_for_video) > mp4_max_frames:
             step = max(1, len(cams_for_video) // mp4_max_frames)
-            cams_for_video = cams_for_video[::step][:mp4_max_frames]
+            _vidx = list(range(0, len(train_cams), step))[:mp4_max_frames]
+            cams_for_video = [train_cams[i] for i in _vidx]
+            if len(_train_imgs_all) == len(train_cams):
+                traj_imgs = [_train_imgs_all[i] for i in _vidx]
+        else:
+            traj_imgs = _train_imgs_all  # no subsampling: reuse directly
 
-        if batch_render_fn is not None:
+        if not traj_imgs and batch_render_fn is not None:
             try:
                 traj_imgs = _batch_render_images(
                     cams_for_video, gaussians, pipe, background,
@@ -559,9 +619,6 @@ def write_post_training_report(
                 )
             except Exception as e:
                 print(f"[report] batch trajectory render failed, falling back: {e}", flush=True)
-                traj_imgs = []
-        else:
-            traj_imgs = []
         use_traj_batch = len(traj_imgs) == len(cams_for_video)
 
         def _frames():
