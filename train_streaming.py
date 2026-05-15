@@ -287,33 +287,48 @@ def insert_gaussians_from_frame(
     if _debug:
         _stats["raw_candidates"] = int(valid.sum())
 
-    # ---- Alpha & Residual masking (Step 4) ----------------------------------
+    # ---- Alpha + Depth occupancy masking (Step 4) ----------------------------
     # Render may be at a different resolution than the raw sensor (--resolution
     # rescaling). Map sensor pixel coords into render pixel coords before indexing.
-    if render_alpha is not None:
-        alpha_cpu = render_alpha.detach().cpu().numpy().squeeze()  # [Hr, Wr]
-        Hr, Wr = alpha_cpu.shape
-        xs_r = np.clip(np.round(xs / max(w - 1, 1) * (Wr - 1)).astype(np.int32), 0, Wr - 1)
-        ys_r = np.clip(np.round(ys / max(h - 1, 1) * (Hr - 1)).astype(np.int32), 0, Hr - 1)
-        alpha_v = alpha_cpu[ys_r, xs_r]
-        # Low-alpha → unoccupied space: strong signal to insert.
-        # High-alpha with sensor depth in front → surface missed by map: also insert.
-        low_alpha = alpha_v < 0.3
-        valid = valid & low_alpha
+    #
+    # Insert a depth candidate if ANY of these hold:
+    #   (a) alpha < 0.3  → pixel is unoccupied in the current map
+    #   (b) rendered depth = 0 → nothing rendered here at all
+    #   (c) rendered depth > sensor depth + thresh → sensor found a closer surface
+    #       the map hasn't captured yet (e.g. behind a floater)
+    #
+    # Previously only (a) was tested, which caused N to plateau once every
+    # visible pixel reached alpha ≥ 0.3 — regardless of new geometry in-frame.
+    if render_alpha is not None or render_depth is not None:
+        sh2d = xs.shape  # (Nh, Nw) — all working arrays must stay 2D
+        low_alpha = np.zeros(sh2d, dtype=bool)
+        no_rend_depth = np.ones(sh2d, dtype=bool)   # default: treat as "no depth"
+        sensor_closer = np.zeros(sh2d, dtype=bool)
 
-    if render_depth is not None:
-        rend_d_cpu = render_depth.detach().cpu().numpy().squeeze()
-        Hr_d, Wr_d = rend_d_cpu.shape
-        xs_rd = np.clip(np.round(xs / max(w - 1, 1) * (Wr_d - 1)).astype(np.int32), 0, Wr_d - 1)
-        ys_rd = np.clip(np.round(ys / max(h - 1, 1) * (Hr_d - 1)).astype(np.int32), 0, Hr_d - 1)
-        rend_d_v = rend_d_cpu[ys_rd, xs_rd]
-        consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
-        # Only insert if current depth is significantly in front of what's already there
-        # or if there is no rendered depth at all.
-        significant = (rend_d_v <= 0) | (rend_d_v - z_v > consistency_thresh)
-        valid = valid & significant
+        if render_alpha is not None:
+            alpha_cpu = render_alpha.detach().cpu().numpy().squeeze()  # [Hr, Wr]
+            Hr, Wr = alpha_cpu.shape
+            xs_r = np.clip(np.round(xs / max(w - 1, 1) * (Wr - 1)).astype(np.int32), 0, Wr - 1)
+            ys_r = np.clip(np.round(ys / max(h - 1, 1) * (Hr - 1)).astype(np.int32), 0, Hr - 1)
+            alpha_v = alpha_cpu[ys_r, xs_r]
+            low_alpha = alpha_v < 0.3
+
+        if render_depth is not None:
+            rend_d_cpu = render_depth.detach().cpu().numpy().squeeze()
+            Hr_d, Wr_d = rend_d_cpu.shape
+            xs_rd = np.clip(np.round(xs / max(w - 1, 1) * (Wr_d - 1)).astype(np.int32), 0, Wr_d - 1)
+            ys_rd = np.clip(np.round(ys / max(h - 1, 1) * (Hr_d - 1)).astype(np.int32), 0, Hr_d - 1)
+            rend_d_v = rend_d_cpu[ys_rd, xs_rd]
+            consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
+            no_rend_depth = rend_d_v <= 0
+            sensor_closer = rend_d_v - z_v > consistency_thresh
+
+        valid = valid & (low_alpha | no_rend_depth | sensor_closer)
         if _debug:
             _stats["after_alpha_depth_mask"] = int(valid.sum())
+            _stats["insert_path_low_alpha"] = int((valid & low_alpha).sum())
+            _stats["insert_path_no_depth"] = int((valid & no_rend_depth & ~low_alpha).sum())
+            _stats["insert_path_sensor_closer"] = int((valid & sensor_closer & ~low_alpha & ~no_rend_depth).sum())
 
     # ---- Relative depth discontinuity masking (Step 5) ----------------------
     if edge_threshold > 0:
