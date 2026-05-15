@@ -392,10 +392,10 @@ class GsplatGaussianModel:
             if stored_state is not None:
                 new_state = {}
                 for k, v in stored_state.items():
-                    if isinstance(v, torch.Tensor):
+                    if isinstance(v, torch.Tensor) and v.dim() > 0:
                         new_state[k] = v[valid_points_mask]
                     else:
-                        new_state[k] = v
+                        new_state[k] = v  # scalar 'step' or Python int/float
                 del optimizer.state[old_param]
                 optimizer.state[new_param] = new_state
             group["params"][0] = new_param
