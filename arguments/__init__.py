@@ -319,6 +319,12 @@ class StreamingParams(ParamGroup):
         self.streaming_support_window = 8         # check support against recent frames
         self.streaming_provisional_max_age = 20   # frames before pruning low-support points
         self.streaming_promote_opacity = 0.3      # opacity boost on promotion
+        # Cap active SH degree in streaming mode. Each Gaussian sees each view
+        # only a handful of times, so high-degree SH (degree 3 = 48 coefficients)
+        # overfits to the current camera subset. Degree 1 (DC + 3 coeffs/channel)
+        # captures gentle lighting variation without view-dependent overfitting.
+        # Set to -1 to use the global sh_degree schedule unchanged.
+        self.streaming_max_sh_degree = 1
         # Save renders at frame-PLY save milestones (opt-in to avoid overhead)
         self.streaming_render_at_saves = False
         # Freeze bootstrap Gaussians (birth_frame==0) from MCMC noise displacement.

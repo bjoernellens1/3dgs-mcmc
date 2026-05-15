@@ -1351,6 +1351,15 @@ def streaming_training(
     _anchor_loss_weight = float(getattr(args, "streaming_anchor_loss_weight", 0.0))
     _anchor_decay_steps = max(1, int(getattr(args, "streaming_anchor_decay_steps", 500)))
 
+    # Cap SH degree schedule to streaming_max_sh_degree (default 1).
+    # High-degree SH overfits to the current camera subset since each Gaussian
+    # sees each view only a few times in the streaming window.
+    _max_sh = int(getattr(args, "streaming_max_sh_degree", 1))
+    if _max_sh >= 0:
+        sh_degree_schedule = list(sh_degree_schedule[:_max_sh])
+        # Clamp model's own max so oneupSHdegree() never exceeds _max_sh.
+        gaussians.max_sh_degree = min(gaussians.max_sh_degree, _max_sh)
+
     # Training-progress video setup
     _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
     _progress_video_fps = int(getattr(args, "progress_video_fps", 10))
