@@ -1356,9 +1356,13 @@ def streaming_training(
     # sees each view only a few times in the streaming window.
     _max_sh = int(getattr(args, "streaming_max_sh_degree", 1))
     if _max_sh >= 0:
+        # Only truncate the schedule — do NOT change gaussians.max_sh_degree.
+        # The SH parameter buffers are allocated at init-time with sh_degree=3;
+        # add_points_as_gaussians uses max_sh_degree to size new insertions, so
+        # lowering it would cause a shape mismatch on torch.cat at insert time.
+        # Truncating the schedule is sufficient: oneupSHdegree() is only called
+        # when iteration is in the schedule, so active_sh_degree stays ≤ _max_sh.
         sh_degree_schedule = list(sh_degree_schedule[:_max_sh])
-        # Clamp model's own max so oneupSHdegree() never exceeds _max_sh.
-        gaussians.max_sh_degree = min(gaussians.max_sh_degree, _max_sh)
 
     # Training-progress video setup
     _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
