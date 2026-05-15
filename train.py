@@ -268,11 +268,11 @@ def apply_parallelism_profile(args):
             f"Unsupported --model_layout '{args.model_layout}'. Expected 'gsplat' or 'legacy'."
         )
     args.densification_strategy = getattr(args, "densification_strategy", "gsplat_energy_mcmc").lower()
-    gsplat_strategies = {"gsplat_mcmc", "gsplat_energy_mcmc"}
+    gsplat_strategies = {"gsplat_mcmc", "gsplat_energy_mcmc", "gsplat_default"}
     if args.model_layout == "gsplat" and args.densification_strategy not in gsplat_strategies:
         raise ValueError(
             "--model_layout gsplat currently supports only --densification_strategy "
-            "gsplat_mcmc or gsplat_energy_mcmc. "
+            "gsplat_mcmc, gsplat_energy_mcmc, or gsplat_default. "
             "Use --model_layout legacy for mcmc, hybrid, or taming."
         )
     if args.model_layout == "legacy" and args.densification_strategy in gsplat_strategies:
@@ -415,7 +415,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         target_tau=getattr(opt, "mcmc_target_tau", 0.45),
     )
     densification_strategy = getattr(opt, "densification_strategy", "gsplat_energy_mcmc").lower()
-    valid_strategies = {"mcmc", "taming", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}
+    valid_strategies = {"mcmc", "taming", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc", "gsplat_default"}
     if densification_strategy not in valid_strategies:
         raise ValueError(
             f"Unsupported --densification_strategy '{densification_strategy}'. "
@@ -486,6 +486,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
     mcmc_strategy.initialize_state(gaussians=gaussians, args=args)
+
+    lpips_fn = None
+    if opt.lambda_lpips > 0:
+        from lpipsPyTorch import LPIPS
+        lpips_fn = LPIPS(net_type='vgg').to("cuda")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -581,6 +586,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Keeps the copy from blocking the main training stream.
     _viewer_stream = torch.cuda.Stream() if web_viewer is not None else None
     _video_stream = torch.cuda.Stream() if video_recorder is not None else None
+
+    _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
+    _progress_video_fps = int(getattr(args, "progress_video_fps", 10))
+    _progress_cams: list = []     # 3 equally-spaced fixed cameras (locked at first trigger)
+    _progress_frames: list = []   # accumulated side-by-side uint8 HWC numpy frames
+
+    import threading as _threading
+    import queue as _queue_mod
+    _pv_stream = torch.cuda.Stream()
+    _pv_cpu_queue: _queue_mod.Queue = _queue_mod.Queue(maxsize=2)
+
+    def _pv_cpu_worker():
+        import numpy as _np2
+        while True:
+            item = _pv_cpu_queue.get()
+            if item is None:
+                break
+            _gpu_panels, _pv_iter, _pv_total = item
+            _panels = []
+            for _t in _gpu_panels:
+                _arr = _t.cpu().numpy()
+                _arr = _np2.transpose(_arr, (1, 2, 0))
+                _arr = (_arr * 255 + 0.5).astype(_np2.uint8)
+                _panels.append(_arr)
+            _sep = _np2.ones((_panels[0].shape[0], 2, 3), dtype=_np2.uint8) * 80
+            _combined = _np2.concatenate([_panels[0], _sep, _panels[1], _sep, _panels[2]], axis=1)
+            try:
+                import cv2 as _cv2
+                _lbl = f"iter {_pv_iter:>6d} / {_pv_total}"
+                _cv2.putText(_combined, _lbl, (8, 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, _cv2.LINE_AA)
+                _cv2.putText(_combined, _lbl, (8, 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, _cv2.LINE_AA)
+            except Exception:
+                pass
+            _progress_frames.append(_combined)
+
+    _pv_thread = _threading.Thread(target=_pv_cpu_worker, daemon=True)
+    _pv_thread.start()
 
     for iteration in range(first_iter, opt.iterations + 1):
         set_compile_iteration(iteration)
@@ -693,11 +735,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _video_frames.append((_video_cam_idx, _web_viewer_mod.encode_render_image_finish(_video_buf).copy()))
         mark_stage("forward")
 
+        if _progress_video_interval > 0 and iteration % _progress_video_interval == 0:
+            if not _progress_cams:
+                _all_cams = scene.getTrainCameras()
+                if len(_all_cams) >= 3:
+                    _n = len(_all_cams)
+                    _progress_cams = [_all_cams[0], _all_cams[(_n - 1) // 2], _all_cams[_n - 1]]
+            if _progress_cams:
+                _gpu_panels = []
+                with torch.cuda.stream(_pv_stream):
+                    _pv_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.no_grad():
+                        for _pvc in _progress_cams:
+                            _pv_pkg = render(_pvc, gaussians, pipe, background)
+                            _gpu_panels.append(_pv_pkg["render"].detach().clamp(0, 1))
+                try:
+                    _pv_cpu_queue.put_nowait((_gpu_panels, iteration, opt.iterations))
+                except _queue_mod.Full:
+                    pass
+
         # Loss — capture intermediate values for logging (no recompute)
         gt_image = viewpoint_cam.original_image
         Ll1 = l1_loss(image, gt_image)
         _ssim_val = ssim(image, gt_image)  # capture for logging (already computed for loss)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - _ssim_val)
+
+        if lpips_fn is not None and iteration % opt.lpips_interval == 0:
+            # LPIPS expects [B, 3, H, W] in [0, 1]
+            # render and gt_image are [3, H, W]
+            l_lpips = lpips_fn(image.unsqueeze(0), gt_image.unsqueeze(0))
+            loss = loss + opt.lambda_lpips * l_lpips
 
         # Active-set regularization: in sparse mode, only regularize visible Gaussians.
         # This avoids dense all-Gaussian gradient traffic that defeats sparse training.
@@ -778,6 +845,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     _scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
             tb_writer.add_scalar('train_loss_patches/opacity_reg_term', _opacity_reg.item(), iteration)
             tb_writer.add_scalar('train_loss_patches/scale_reg_term', _scale_reg.item(), iteration)
+            if lpips_fn is not None:
+                tb_writer.add_scalar('train_loss_patches/lpips_loss', l_lpips.item(), iteration)
             if use_energy_mcmc and L_eff is not None:
                 tb_writer.add_scalar('train_loss_patches/eff_count_loss', args.lambda_eff_count * L_eff.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/opacity_entropy_loss', args.lambda_opacity_entropy * L_entropy.item(), iteration)
@@ -1202,6 +1271,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if scene_cache_writer is not None:
         scene_cache_writer.save(gaussians, opt.iterations, final=True)
 
+    _pv_cpu_queue.put(None)
+    _pv_thread.join(timeout=120)
+    if _progress_frames:
+        from utils.comparison_report import _write_mp4
+        _prog_path = os.path.join(args.model_path, "training_progress.mp4")
+        print(f"[train] Writing training_progress.mp4 ({len(_progress_frames)} frames @ {_progress_video_fps}fps)…", flush=True)
+        _err = _write_mp4(_prog_path, iter(_progress_frames), fps=_progress_video_fps)
+        if _err is None:
+            print(f"[train] training_progress.mp4 → {_prog_path}", flush=True)
+        else:
+            print(f"[train] training_progress.mp4 FAILED: {_err}", flush=True)
+
     # Mandatory post-training report: test PSNR + comparison renders + trajectory MP4.
     try:
         from utils.comparison_report import write_post_training_report
@@ -1249,16 +1330,9 @@ def prepare_output_and_logger(args, run_args=None):
         with open(os.path.join(args.model_path, "run_args"), 'w') as run_args_f:
             run_args_f.write(str(public_namespace(run_args)))
 
-    # Write a shell script that reproduces this exact run
-    import shlex
-    _repro_path = os.path.join(args.model_path, "reproduce.sh")
-    with open(_repro_path, 'w') as _repro_f:
-        _cmd = " ".join(shlex.quote(a) for a in sys.argv)
-        _repro_f.write("#!/bin/bash\n")
-        _repro_f.write("# Reproduces the training run stored in this output directory.\n")
-        _repro_f.write("# Generated automatically at training start.\n")
-        _repro_f.write(f"python {_cmd}\n")
-    os.chmod(_repro_path, 0o755)
+    # Write reproduce.sh (includes docker compose wrapper when running in container)
+    from utils.comparison_report import write_reproduce_sh
+    write_reproduce_sh(os.path.join(args.model_path, "reproduce.sh"), sys.argv)
 
     # Create Tensorboard writer
     tb_writer = None

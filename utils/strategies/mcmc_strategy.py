@@ -568,15 +568,119 @@ class GsplatEnergyMCMCStrategy:
             gaussians.support_count[dead_indices] = gaussians.support_count[sampled_idxs]
 
     def _append_running_state(self, gaussians, old_count, added_count):
-        for name in ("visibility_ema", "xyz_gradient_accum", "denom", "birth_frame", "support_count", "provisional"):
+        for name in ("visibility_ema", "xyz_gradient_accum", "denom", "birth_frame", "support_count", "provisional",
+                     "anchor_iter", "lifecycle_state", "utility_ema"):
             tensor = getattr(gaussians, name, None)
             if tensor is not None and tensor.shape[0] == old_count:
                 pad = torch.zeros((added_count, *tensor.shape[1:]), device=tensor.device, dtype=tensor.dtype)
                 setattr(gaussians, name, torch.cat([tensor, pad], dim=0))
+        # anchor_xyz needs its own path: pad with the new Gaussian positions so anchor=current pos at birth
+        anchor_xyz = getattr(gaussians, "anchor_xyz", None)
+        if anchor_xyz is not None and anchor_xyz.shape[0] == old_count:
+            new_means = gaussians.get_xyz[-added_count:].detach().clone()
+            gaussians.anchor_xyz = torch.cat([anchor_xyz, new_means], dim=0)
+        # anchor_scale_log / anchor_opacity_logit: pad with current values
+        anchor_scale_log = getattr(gaussians, "anchor_scale_log", None)
+        if anchor_scale_log is not None and anchor_scale_log.shape[0] == old_count:
+            new_scales = gaussians.params["scales"][-added_count:].detach().clone() if hasattr(gaussians, "params") else torch.zeros((added_count, 3), device=anchor_scale_log.device)
+            gaussians.anchor_scale_log = torch.cat([anchor_scale_log, new_scales], dim=0)
+        anchor_opacity_logit = getattr(gaussians, "anchor_opacity_logit", None)
+        if anchor_opacity_logit is not None and anchor_opacity_logit.shape[0] == old_count:
+            new_ops = gaussians.params["opacities"][-added_count:].detach().clone() if hasattr(gaussians, "params") else torch.zeros(added_count, device=anchor_opacity_logit.device)
+            gaussians.anchor_opacity_logit = torch.cat([anchor_opacity_logit, new_ops], dim=0)
         radii = getattr(gaussians, "max_radii2D", None)
         if radii is not None and radii.numel() > 0 and radii.shape[0] == old_count:
             pad = torch.zeros((added_count,), device=radii.device, dtype=radii.dtype)
             gaussians.max_radii2D = torch.cat([radii, pad], dim=0)
+
+
+class GsplatDefaultStrategy:
+    """Gradient-based densification using gsplat's DefaultStrategy (clone/split/prune)."""
+
+    name = "gsplat_default"
+
+    def __init__(self):
+        self.strategy = None
+        self.state = None
+
+    def initialize_state(self, gaussians, args, scene_scale=1.0, **_kwargs):
+        from gsplat.strategy import DefaultStrategy
+
+        requested = {
+            "prune_opa": float(getattr(args, "mcmc_dead_opacity_end", 0.005)),
+            "grow_grad2d": float(getattr(args, "default_grow_grad2d", 0.0002)),
+            "grow_scale3d": float(getattr(args, "default_grow_scale3d", 0.01)),
+            "refine_start_iter": int(getattr(args, "densify_from_iter", 500)),
+            "refine_stop_iter": int(getattr(args, "mcmc_stop_growth_iter", 15_000)),
+            "refine_every": int(getattr(args, "densification_interval", 100)),
+            "reset_every": 999_999_999,
+            "verbose": bool(getattr(args, "mcmc_strategy_verbose", False)),
+        }
+        supported = inspect.signature(DefaultStrategy).parameters
+        kwargs = {k: v for k, v in requested.items() if k in supported}
+        self.strategy = DefaultStrategy(**kwargs)
+        self.state = self.strategy.initialize_state(scene_scale=scene_scale)
+        return self.state
+
+    def _reset_accum_if_n_changed(self, gaussians):
+        """Reset accumulated grad stats when Gaussian count changes (e.g. after depth insertion)."""
+        if self.state is None:
+            return
+        n = gaussians.get_xyz.shape[0]
+        for key in ("grad2d", "count", "radii"):
+            v = self.state.get(key)
+            if v is not None and v.shape[0] != n:
+                self.state[key] = None
+
+    def step_pre_backward(self, gaussians=None, args=None, iteration=None, render_pkg=None, **_kwargs):
+        if self.strategy is None or self.state is None:
+            return
+        self._reset_accum_if_n_changed(gaussians)
+        info = render_pkg.get("meta", {}) if render_pkg is not None else {}
+        self.strategy.step_pre_backward(
+            params=gaussians.params,
+            optimizers=gaussians.optimizers,
+            state=self.state,
+            step=iteration,
+            info=info,
+        )
+
+    def inject_noise(self, **_kwargs):
+        return None
+
+    def step_post_backward(
+        self,
+        gaussians,
+        args,
+        sched,
+        iteration,
+        utility=None,
+        temperature=1.0,
+        use_energy_mcmc=False,
+        tb_writer=None,
+        should_log_strategy=None,
+        render_pkg=None,
+        lr=None,
+    ):
+        if self.strategy is None or self.state is None:
+            self.initialize_state(gaussians=gaussians, args=args)
+        self._reset_accum_if_n_changed(gaussians)
+        before = gaussians.get_xyz.shape[0]
+        info = render_pkg.get("meta", {}) if render_pkg is not None else {}
+        self.strategy.step_post_backward(
+            params=gaussians.params,
+            optimizers=gaussians.optimizers,
+            state=self.state,
+            step=iteration,
+            info=info,
+            packed=True,
+        )
+        after = gaussians.get_xyz.shape[0]
+        if tb_writer:
+            tb_writer.add_scalar("mcmc/growth_delta_N", after - before, iteration)
+        should_log = should_log_strategy or (lambda _iteration: False)
+        if should_log(iteration):
+            print(f"[gsplat-default] iter={iteration} N={before}->{after}", flush=True)
 
 
 def make_mcmc_strategy(name, gaussians=None, args=None):
@@ -588,4 +692,8 @@ def make_mcmc_strategy(name, gaussians=None, args=None):
         return UpstreamGsplatMCMCStrategy()
     if name == "gsplat_mcmc":
         return GsplatMCMCBaselineStrategy()
+    if name == "gsplat_default":
+        if not getattr(gaussians, "uses_gsplat_layout", False):
+            raise ValueError("--densification_strategy gsplat_default requires --model_layout gsplat.")
+        return GsplatDefaultStrategy()
     return ScheduledMCMCStrategy(name)

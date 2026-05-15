@@ -26,6 +26,107 @@ import torch
 from utils.image_utils import psnr as _psnr
 
 
+# ---------------------------------------------------------------------------
+# reproduce.sh generation
+# ---------------------------------------------------------------------------
+
+def _parse_docker_volumes() -> dict:
+    """Parse /proc/self/mountinfo to find Docker bind-mount volumes.
+
+    Returns {container_path: host_path} for each detected bind mount.
+    Skips standard system paths and filesystem types that are not user data.
+    """
+    SKIP_FSTYPES = {
+        "overlay", "tmpfs", "proc", "sysfs", "devpts", "cgroup", "cgroup2",
+        "mqueue", "shm", "nsfs", "hugetlbfs", "fuse", "debugfs", "tracefs",
+        "securityfs", "pstorefs", "bpf", "autofs", "rpc_pipefs",
+    }
+    SKIP_MOUNT_PREFIXES = ("/proc", "/sys", "/dev", "/etc/", "/run")
+
+    volumes = {}
+    try:
+        with open("/proc/self/mountinfo") as fh:
+            for line in fh:
+                parts = line.strip().split()
+                if len(parts) < 7:
+                    continue
+                host_root = parts[3]    # path on host device
+                mountpoint = parts[4]   # path inside container
+
+                # Find " - " separator between optional fields and fstype
+                sep = None
+                for i, p in enumerate(parts):
+                    if p == "-":
+                        sep = i
+                        break
+                if sep is None or sep + 1 >= len(parts):
+                    continue
+                fstype = parts[sep + 1]
+
+                if fstype in SKIP_FSTYPES:
+                    continue
+                if mountpoint == "/":
+                    continue
+                if any(mountpoint == p or mountpoint.startswith(p + "/")
+                       for p in SKIP_MOUNT_PREFIXES):
+                    continue
+                # host_root is the path within the block device's FS.
+                # For most setups (ext4, xfs, plain btrfs) it equals the host path.
+                if host_root.startswith("/") and len(host_root) > 1:
+                    volumes[mountpoint] = host_root
+    except Exception:
+        pass
+    return volumes
+
+
+def write_reproduce_sh(path: str, argv: list) -> None:
+    """Write a reproduce.sh that includes the Docker wrapper when running in a container.
+
+    When /.dockerenv is present (Docker/Podman), the script contains:
+      - A `docker compose run --rm ...` section (for re-running from the host)
+      - A plain `python ...` section (for re-running inside the container)
+
+    When not in a container, writes a plain `python ...` command.
+    """
+    import shlex
+    import stat
+
+    cmd = " ".join(shlex.quote(a) for a in argv)
+    in_docker = os.path.exists("/.dockerenv")
+
+    lines = [
+        "#!/bin/bash",
+        "# Reproduces the training run stored in this output directory.",
+        "# Auto-generated at training start.",
+        "",
+    ]
+
+    if in_docker:
+        volumes = _parse_docker_volumes()
+        lines += [
+            "# ── Run from the HOST machine (project root) ─────────────────────",
+            "docker compose run --rm \\",
+        ]
+        for cpath in sorted(volumes):
+            hpath = volumes[cpath]
+            lines.append(f'  -v "{hpath}:{cpath}" \\')
+        lines += [
+            "  train \\",
+            f"  python {cmd}",
+            "",
+            "# ── OR run directly inside the container ─────────────────────────",
+            f"# python {cmd}",
+        ]
+    else:
+        lines += [f"python {cmd}"]
+
+    content = "\n".join(lines) + "\n"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(content)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def _to_uint8_hwc(img: torch.Tensor) -> np.ndarray:
     """Convert a CHW float tensor in [0, 1] to HWC uint8."""
     arr = img.detach().clamp(0.0, 1.0).cpu().numpy()
@@ -154,20 +255,76 @@ def _build_contact_sheet(
 
 
 def _write_mp4(path: str, frames_iter: Iterable[np.ndarray], fps: int = 30) -> Optional[str]:
-    """Write an MP4 from an iterable of uint8 HWC frames. Returns error string on failure."""
+    """Write an MP4 from an iterable of uint8 HWC RGB frames.
+
+    Tries ffmpeg first (libx264, all CPU threads via -threads 0, piped stdin).
+    Falls back to cv2.VideoWriter with mp4v if ffmpeg is unavailable.
+    Returns an error string on failure, or None on success.
+    """
+    import shutil
+    import subprocess
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if shutil.which("ffmpeg"):
+        proc = None
+        n = 0
+        h2 = w2 = None
+        try:
+            for frame in frames_iter:
+                h, w = frame.shape[:2]
+                if proc is None:
+                    h2 = h - (h % 2)
+                    w2 = w - (w % 2)
+                    proc = subprocess.Popen(
+                        [
+                            "ffmpeg", "-y",
+                            "-f", "rawvideo",
+                            "-pix_fmt", "rgb24",
+                            "-s", f"{w2}x{h2}",
+                            "-r", str(fps),
+                            "-i", "pipe:0",
+                            "-c:v", "libx264",
+                            "-threads", "0",
+                            "-crf", "23",
+                            "-pix_fmt", "yuv420p",
+                            "-movflags", "+faststart",
+                            path,
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                frame_cropped = frame[:h2, :w2]
+                proc.stdin.write(frame_cropped.tobytes())
+                n += 1
+        except Exception as e:
+            if proc is not None:
+                proc.stdin.close()
+                proc.wait()
+            return f"ffmpeg pipe error: {e}"
+        finally:
+            if proc is not None:
+                proc.stdin.close()
+                proc.wait()
+        if n == 0:
+            return "no frames written"
+        if proc.returncode != 0:
+            return f"ffmpeg exited with code {proc.returncode}"
+        return None
+
+    # Fallback: cv2.VideoWriter
     try:
         import cv2  # type: ignore
     except Exception as e:
-        return f"cv2 unavailable: {e}"
+        return f"ffmpeg unavailable and cv2 unavailable: {e}"
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     writer = None
     n = 0
     try:
         for frame in frames_iter:
             if writer is None:
                 h, w = frame.shape[:2]
-                # Ensure even dimensions (some encoders require it)
                 h2 = h - (h % 2)
                 w2 = w - (w % 2)
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -222,12 +379,44 @@ def write_post_training_report(
         "mean_test_psnr": None,
         "min_test_psnr": None,
         "max_test_psnr": None,
+        "mean_test_lpips": None,
+        "min_test_lpips": None,
+        "max_test_lpips": None,
+        "mean_train_psnr": None,
+        "min_train_psnr": None,
+        "max_train_psnr": None,
+        "mean_train_lpips": None,
+        "min_train_lpips": None,
+        "max_train_lpips": None,
         "output_dir": out_dir,
         "artifacts": artifacts,
     }
 
-    # --- Test split: side-by-side + contact sheet -----------------------------
+    try:
+        from lpipsPyTorch import lpips as _lpips
+    except ImportError:
+        _lpips = None
+
+    def _compute_metrics(cams: List, split: str):
+        psnr_list = []
+        lpips_list = []
+        for cam in cams:
+            try:
+                img = _render_image(cam, gaussians, render_fn, pipe, background)
+                gt = _gt_image(cam)
+            except Exception as e:
+                print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
+                continue
+            psnr_list.append(float(_psnr(img, gt).mean().item()))
+            if _lpips is not None:
+                # LPIPS expects batched tensors
+                l_val = float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
+                lpips_list.append(l_val)
+        return psnr_list, lpips_list
+
+    # --- Test split: side-by-side + contact sheet + metrics -----------------------------
     psnrs: List[float] = []
+    lpipss: List[float] = []
     pairs_for_sheet: List[Tuple[str, np.ndarray, np.ndarray]] = []
     if test_cams:
         test_dir = os.path.join(out_dir, "test")
@@ -239,6 +428,8 @@ def write_post_training_report(
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
                 continue
             psnrs.append(float(_psnr(img, gt).mean().item()))
+            if _lpips is not None:
+                lpipss.append(float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item()))
             r_u8 = _to_uint8_hwc(img)
             g_u8 = _to_uint8_hwc(gt)
             d_u8 = _abs_diff(img, gt)
@@ -269,8 +460,46 @@ def write_post_training_report(
                 tb_writer.add_scalar(f"{log_prefix}/test_psnr_mean", summary["mean_test_psnr"], iteration)
                 tb_writer.add_scalar(f"{log_prefix}/test_psnr_min", summary["min_test_psnr"], iteration)
                 tb_writer.add_scalar(f"{log_prefix}/test_psnr_max", summary["max_test_psnr"], iteration)
+        if lpipss:
+            summary["mean_test_lpips"] = float(np.mean(lpipss))
+            summary["min_test_lpips"] = float(np.min(lpipss))
+            summary["max_test_lpips"] = float(np.max(lpipss))
+            msg = (
+                f"[report] iter={iteration} test LPIPS mean={summary['mean_test_lpips']:.4f} "
+                f"min={summary['min_test_lpips']:.4f} max={summary['max_test_lpips']:.4f}"
+            )
+            print(msg, flush=True)
+            if tb_writer is not None:
+                tb_writer.add_scalar(f"{log_prefix}/test_lpips_mean", summary["mean_test_lpips"], iteration)
     else:
-        print(f"[report] iter={iteration} no test views — skipping PSNR/contact sheet", flush=True)
+        print(f"[report] iter={iteration} no test views — skipping test PSNR/LPIPS/contact sheet", flush=True)
+
+    # --- Train split: metrics ------------------------------------
+    if train_cams:
+        train_psnrs, train_lpipss = _compute_metrics(train_cams, "train")
+        if train_psnrs:
+            summary["mean_train_psnr"] = float(np.mean(train_psnrs))
+            summary["min_train_psnr"] = float(np.min(train_psnrs))
+            summary["max_train_psnr"] = float(np.max(train_psnrs))
+            msg = (
+                f"[report] iter={iteration} train PSNR mean={summary['mean_train_psnr']:.2f}dB "
+                f"min={summary['min_train_psnr']:.2f} max={summary['max_train_psnr']:.2f} "
+                f"({len(train_psnrs)} views)"
+            )
+            print(msg, flush=True)
+            if tb_writer is not None:
+                tb_writer.add_scalar(f"{log_prefix}/train_psnr_mean", summary["mean_train_psnr"], iteration)
+        if train_lpipss:
+            summary["mean_train_lpips"] = float(np.mean(train_lpipss))
+            summary["min_train_lpips"] = float(np.min(train_lpipss))
+            summary["max_train_lpips"] = float(np.max(train_lpipss))
+            msg = (
+                f"[report] iter={iteration} train LPIPS mean={summary['mean_train_lpips']:.4f} "
+                f"min={summary['min_train_lpips']:.4f} max={summary['max_train_lpips']:.4f}"
+            )
+            print(msg, flush=True)
+            if tb_writer is not None:
+                tb_writer.add_scalar(f"{log_prefix}/train_lpips_mean", summary["mean_train_lpips"], iteration)
 
     # --- Trajectory MP4 over train cameras ------------------------------------
     if train_cams:

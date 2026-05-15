@@ -142,6 +142,8 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_lpips = 0.0
+        self.lpips_interval = 10
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
@@ -246,6 +248,10 @@ class OptimizationParams(ParamGroup):
         self.record_video_fps = 30
         self.record_video_crf = 23
         self.record_video_preset = "veryfast"
+        # Training-progress video: render a fixed camera every N iters,
+        # write training_progress.mp4 at end of training.
+        self.progress_video_interval = 200   # 0 = disabled
+        self.progress_video_fps = 10         # output FPS
         self.scalar_log_interval = 100
         self.geometry_log_interval = 500
         self.sfm_anchor_interval = 2000
@@ -259,8 +265,15 @@ class StreamingParams(ParamGroup):
         # Enable streaming replay mode
         self.streaming_replay = False
         self.streaming_input_fps = 30.0
-        self.streaming_wallclock = False          # False = deterministic step-based simulation
+        self.streaming_wallclock = False          # False = deterministic step-based simulation (legacy)
         self.streaming_steps_per_frame = 50       # release one frame every N training iterations
+        # Ingestion pacing mode: iter_based | dataset_fps | wallclock_strict
+        # iter_based      — deterministic, release every streaming_steps_per_frame iters (default)
+        # dataset_fps     — simulated clock; train as many iters as possible per real-time second;
+        #                   cap arrivals at streaming_input_fps_cap (never drops frames)
+        # wallclock_strict — true wall-clock pacing; drops frames when training is slow
+        self.streaming_ingestion_mode = "iter_based"
+        self.streaming_input_fps_cap = 30.0       # max frame rate for dataset_fps / wallclock_strict
         self.streaming_max_frames = 0             # 0 = all frames in dataset
         self.streaming_frame_stride = 1           # Release every Nth frame from the source
         self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
@@ -284,6 +297,10 @@ class StreamingParams(ParamGroup):
         self.streaming_insert_opacity = 0.05
         # Coverage voxel multiplier (0 = use 1.5× insert_voxel_size)
         self.streaming_cover_voxel_size = 0.0
+        # Multiplier on insert_voxel_size for the occupancy exclusion check (replaces hardcoded 1.5)
+        self.streaming_cover_voxel_multiplier = 1.0
+        # Rebuild occupancy hash from current Gaussian positions every N iters (0 = only on stale prune)
+        self.streaming_occupancy_rebuild_interval = 200
         # Depth discontinuity threshold: reject pixels where |dz/dx|+|dz/dy| > this (metres)
         self.streaming_depth_edge_threshold = 0.02
         # Grazing-angle rejection: reject surface normals > this angle from view direction (degrees)
@@ -359,6 +376,53 @@ class StreamingParams(ParamGroup):
         self.streaming_submap_frames = 20       # frames per independent submap
         self.streaming_submap_iters = 3000      # optimisation iterations per submap
         self.streaming_global_refine_iters = 5000  # final global refinement iters
+        # -----------------------------------------------------------------------
+        # Four-state Gaussian lifecycle (PROVISIONAL=0, YOUNG=1, MATURE=2, FROZEN=3)
+        # Requires --streaming_lifecycle_enabled to activate.
+        # Without it, all behaviour is identical to prior H4d config.
+        # -----------------------------------------------------------------------
+        self.streaming_lifecycle_enabled = False
+        # Frame age (since birth) at which a YOUNG Gaussian becomes MATURE
+        self.streaming_mature_age_frames = 15
+        # Minimum utility EMA for YOUNG→MATURE promotion (0 = age-only)
+        self.streaming_mature_min_utility = 0.1
+        # Frame age at which a MATURE Gaussian becomes FROZEN (-1 = never)
+        self.streaming_freeze_age_frames = -1
+        # EMA decay for per-Gaussian utility tracking
+        self.streaming_utility_ema_beta = 0.95
+        # -----------------------------------------------------------------------
+        # Soft-anchor anti-fade losses for MATURE Gaussians (Component C)
+        # All three weights default to 0.0 (opt-in). Recommended: ~0.05 each.
+        # -----------------------------------------------------------------------
+        self.streaming_mature_anchor_xyz_weight = 0.0
+        self.streaming_mature_anchor_scale_weight = 0.0
+        self.streaming_mature_anchor_opacity_weight = 0.0
+        # -----------------------------------------------------------------------
+        # Stratified replay sampling (Component D)
+        # -----------------------------------------------------------------------
+        # sampling_mode: "legacy" (existing ring-buffer logic) or "stratified"
+        self.streaming_sampling_mode = "legacy"
+        # Comma-separated ratios for [recent, covisible, global_reservoir, hard_frames]
+        # Must sum to ~1.0. Only used when streaming_sampling_mode = "stratified".
+        self.streaming_sampling_ratios = "0.70,0.15,0.10,0.05"
+        # Minimum shared Gaussians to consider two frames covisible
+        self.streaming_covisible_min_shared = 200
+        # Number of recent high-loss frames to keep as "hard frames"
+        self.streaming_hard_frame_history = 8
+        # -----------------------------------------------------------------------
+        # KNN insertion dedup (Component E)
+        # -----------------------------------------------------------------------
+        self.streaming_insert_knn_dedup = False
+        # Radius factor: candidate rejected if nearest existing Gaussian is within
+        # depth * streaming_insert_knn_radius_factor metres
+        self.streaming_insert_knn_radius_factor = 0.005
+        # Max existing Gaussians to query (beyond this, subsample via voxel grid)
+        self.streaming_insert_knn_max_existing = 200000
+        # -----------------------------------------------------------------------
+        # Insertion telemetry (Component F)
+        # -----------------------------------------------------------------------
+        self.streaming_insertion_debug = False
+        self.streaming_insertion_debug_ply = False
         super().__init__(parser, "Streaming Parameters")
 
 

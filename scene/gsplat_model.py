@@ -73,6 +73,13 @@ class GsplatGaussianModel:
         self.provisional = torch.empty(0, dtype=torch.bool, device="cuda")
         self.anchor_xyz = torch.empty((0, 3), dtype=torch.float32, device="cuda")
         self.anchor_iter = torch.empty(0, dtype=torch.int32, device="cuda")
+        # Four-state lifecycle: 0=PROVISIONAL, 1=YOUNG, 2=MATURE, 3=FROZEN
+        self.lifecycle_state = torch.empty(0, dtype=torch.int8, device="cuda")
+        # Per-Gaussian utility EMA (rolling average of energy_mcmc utility score)
+        self.utility_ema = torch.empty(0, dtype=torch.float32, device="cuda")
+        # Anchors snapshotted at YOUNG->MATURE transition for anti-fade losses
+        self.anchor_scale_log = torch.empty((0, 3), dtype=torch.float32, device="cuda")
+        self.anchor_opacity_logit = torch.empty(0, dtype=torch.float32, device="cuda")
 
     @property
     def _xyz(self):
@@ -365,6 +372,12 @@ class GsplatGaussianModel:
         xyz = self.get_xyz.detach() if count > 0 else torch.zeros((0, 3), device="cuda")
         self.anchor_xyz = xyz.clone()
         self.anchor_iter = torch.zeros(count, dtype=torch.int32, device="cuda")
+        self.lifecycle_state = torch.zeros(count, dtype=torch.int8, device="cuda")
+        self.utility_ema = torch.zeros(count, dtype=torch.float32, device="cuda")
+        scales = self.params["scales"].detach() if count > 0 else torch.zeros((0, 3), device="cuda")
+        opacities = self.params["opacities"].detach() if count > 0 else torch.zeros(0, device="cuda")
+        self.anchor_scale_log = scales.clone()
+        self.anchor_opacity_logit = opacities.clone()
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
@@ -398,6 +411,14 @@ class GsplatGaussianModel:
         self.provisional = self.provisional[valid_points_mask]
         self.anchor_xyz = self.anchor_xyz[valid_points_mask]
         self.anchor_iter = self.anchor_iter[valid_points_mask]
+        if self.lifecycle_state.shape[0] == mask.shape[0]:
+            self.lifecycle_state = self.lifecycle_state[valid_points_mask]
+        if self.utility_ema.shape[0] == mask.shape[0]:
+            self.utility_ema = self.utility_ema[valid_points_mask]
+        if self.anchor_scale_log.shape[0] == mask.shape[0]:
+            self.anchor_scale_log = self.anchor_scale_log[valid_points_mask]
+        if self.anchor_opacity_logit.shape[0] == mask.shape[0]:
+            self.anchor_opacity_logit = self.anchor_opacity_logit[valid_points_mask]
 
     def add_points_as_gaussians(
         self,
@@ -505,5 +526,20 @@ class GsplatGaussianModel:
         new_anchor_iter = torch.zeros(N, dtype=torch.int32, device="cuda")
         self.anchor_xyz = torch.cat([self.anchor_xyz, new_anchor_xyz], dim=0)
         self.anchor_iter = torch.cat([self.anchor_iter, new_anchor_iter], dim=0)
+
+        # Lifecycle state: new insertions start as PROVISIONAL (0)
+        self.lifecycle_state = torch.cat([
+            self.lifecycle_state,
+            torch.zeros(N, dtype=torch.int8, device="cuda"),
+        ], dim=0)
+        self.utility_ema = torch.cat([
+            self.utility_ema,
+            torch.zeros(N, dtype=torch.float32, device="cuda"),
+        ], dim=0)
+        # Mature anchors: seeded with current values; re-snapshotted at YOUNG->MATURE
+        new_scale_log = new_tensors["scales"].detach().clone()
+        new_op_logit = new_tensors["opacities"].detach().clone()
+        self.anchor_scale_log = torch.cat([self.anchor_scale_log, new_scale_log], dim=0)
+        self.anchor_opacity_logit = torch.cat([self.anchor_opacity_logit, new_op_logit], dim=0)
 
         return N

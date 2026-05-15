@@ -52,6 +52,25 @@ class StreamingScene:
         self._global_reservoir: List = []
         self._n_train_frames_ingested: int = 0  # count of train frames (excl. holdout)
 
+        # Stratified sampling support (Component D)
+        # Hard-frame heap: list of (loss, camera) — capped at streaming_hard_frame_history
+        self._hard_frames: List = []
+        # Covisible sets: {cam_uid -> List[cam]} of recently-covisible cameras
+        self._last_gaussian_ids: Optional[torch.Tensor] = None  # gaussian_ids from last render
+        self._covisible_cache: List = []  # flat list of covisible cameras (refreshed periodically)
+
+    def update_cameras_extent(self) -> None:
+        """Grow cameras_extent to encompass all arrived camera positions (never shrinks)."""
+        if not self.train_cameras:
+            return
+        try:
+            centers = np.stack([c.camera_center.cpu().numpy() for c in self.train_cameras])
+            centroid = centers.mean(axis=0)
+            new_extent = float(np.max(np.linalg.norm(centers - centroid, axis=1)))
+            self.cameras_extent = max(self.cameras_extent, new_extent, 1.0)
+        except Exception:
+            pass
+
     def maintain_occupancy_hash(self, voxel_size: float = 0.02):
         """Update the occupancy hash from the current Gaussians (expensive)."""
         self.occupancy_voxel_size = voxel_size
@@ -290,6 +309,7 @@ class StreamingScene:
 
             # H8: reset warmup counter whenever a new train frame arrives
             self._steps_since_new_frame = 0
+            self.update_cameras_extent()
 
         self.current_camera = cam
         prepare_camera_for_render(cam, device="cuda")
@@ -304,15 +324,7 @@ class StreamingScene:
         return self.train_cameras[-k:] if self.train_cameras else []
 
     def sample_training_camera(self):
-        """Sample a camera for one training step.
-
-        Priority order:
-        1. H8 warmup: return current_camera exclusively for the first
-           streaming_new_frame_warmup_steps steps after each new frame arrives.
-        2. Replay (global reservoir if H10 enabled, else recent ring buffer):
-           sampling probability = streaming_global_replay_ratio.
-        3. Local keyframe window (default).
-        """
+        """Sample a camera for one training step."""
         # H8: warmup — force current frame for K steps after each new arrival
         warmup_steps = getattr(self.args, "streaming_new_frame_warmup_steps", 0)
         if warmup_steps > 0 and self._steps_since_new_frame < warmup_steps and self.current_camera is not None:
@@ -320,19 +332,83 @@ class StreamingScene:
             return self.current_camera
         self._steps_since_new_frame += 1
 
+        sampling_mode = getattr(self.args, "streaming_sampling_mode", "legacy")
+        if sampling_mode == "stratified":
+            return self._sample_stratified()
+        return self._sample_legacy()
+
+    def _sample_legacy(self):
+        """Original ring-buffer + reservoir sampling."""
         replay_ratio = getattr(self.args, "streaming_global_replay_ratio", 0.1)
         r = random.random()
-
         if replay_ratio > 0 and r < replay_ratio:
-            # H10: prefer global reservoir when available; fall back to ring buffer
             reservoir_stride = getattr(self.args, "streaming_global_reservoir_stride", 0)
             if reservoir_stride > 0 and self._global_reservoir:
                 return random.choice(self._global_reservoir)
             if self._replay_buffer:
                 return random.choice(self._replay_buffer)
-
         local = self.get_local_cameras()
         return random.choice(local) if local else self.current_camera
+
+    def _sample_stratified(self):
+        """Four-strata sampling: recent / covisible / global-reservoir / hard-frames."""
+        ratios_str = getattr(self.args, "streaming_sampling_ratios", "0.70,0.15,0.10,0.05")
+        try:
+            ratios = [float(x) for x in ratios_str.split(",")]
+            if len(ratios) != 4:
+                ratios = [0.70, 0.15, 0.10, 0.05]
+        except Exception:
+            ratios = [0.70, 0.15, 0.10, 0.05]
+        r_recent, r_covis, r_reservoir, r_hard = ratios
+
+        r = random.random()
+        local = self.get_local_cameras()
+
+        if r < r_recent:
+            return random.choice(local) if local else self.current_camera
+
+        if r < r_recent + r_covis:
+            if self._covisible_cache:
+                return random.choice(self._covisible_cache)
+            return random.choice(local) if local else self.current_camera
+
+        if r < r_recent + r_covis + r_reservoir:
+            reservoir_stride = getattr(self.args, "streaming_global_reservoir_stride", 0)
+            if reservoir_stride > 0 and self._global_reservoir:
+                return random.choice(self._global_reservoir)
+            if self._replay_buffer:
+                return random.choice(self._replay_buffer)
+            return random.choice(local) if local else self.current_camera
+
+        # Hard frames stratum
+        if self._hard_frames:
+            return random.choice(self._hard_frames)[1]
+        return random.choice(local) if local else self.current_camera
+
+    def update_stratified_state(self, cam, loss_val: float, gaussian_ids=None):
+        """Update hard-frame list and covisibility cache. Call once per training step."""
+        if getattr(self.args, "streaming_sampling_mode", "legacy") != "stratified":
+            return
+
+        # Hard frames: keep the K highest-loss cameras
+        max_hard = max(1, int(getattr(self.args, "streaming_hard_frame_history", 8)))
+        self._hard_frames.append((loss_val, cam))
+        self._hard_frames.sort(key=lambda x: -x[0])
+        self._hard_frames = self._hard_frames[:max_hard]
+
+        # Covisibility: cameras that share many Gaussians with the current view.
+        # We build a flat covisible list from the replay buffer cameras closest
+        # in index to the current train camera (cheap proxy for covisibility).
+        if len(self.train_cameras) > 0 and cam in self.train_cameras:
+            try:
+                cam_idx = self.train_cameras.index(cam)
+            except ValueError:
+                cam_idx = len(self.train_cameras) - 1
+            k_win = getattr(self.args, "streaming_keyframe_window", 8)
+            # Covisible = cameras within 2×window of current cam, excluding local window
+            lo = max(0, cam_idx - 2 * k_win)
+            hi = max(0, cam_idx - k_win)
+            self._covisible_cache = self.train_cameras[lo:hi] if lo < hi else []
 
     # ------------------------------------------------------------------
     # Compatibility shims for code that calls scene.getTrainCameras()

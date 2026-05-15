@@ -151,6 +151,62 @@ def _get_sensor_depth(cam, target_h: int, target_w: int) -> Optional[torch.Tenso
     return cam._sensor_depth_cache
 
 
+def _sync_streaming_state_lengths(gaussians):
+    """Keep streaming lifecycle tensors aligned with the current Gaussian count."""
+    count = int(gaussians.get_xyz.shape[0])
+    for name, fill_value in (
+        ("birth_frame", 0),
+        ("support_count", 0),
+        ("provisional", False),
+        ("anchor_iter", 0),
+        ("lifecycle_state", 0),
+        ("utility_ema", 0.0),
+    ):
+        tensor = getattr(gaussians, name, None)
+        if tensor is None:
+            continue
+        if tensor.shape[0] == count:
+            continue
+        if tensor.shape[0] > count:
+            setattr(gaussians, name, tensor[:count].contiguous())
+            continue
+        pad = torch.full(
+            (count - tensor.shape[0],),
+            fill_value,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        setattr(gaussians, name, torch.cat([tensor, pad], dim=0))
+    # anchor_xyz needs per-point 3-vector; pad with current positions so anchor=birth position
+    anchor_xyz = getattr(gaussians, "anchor_xyz", None)
+    if anchor_xyz is not None and anchor_xyz.shape[0] != count:
+        if anchor_xyz.shape[0] > count:
+            gaussians.anchor_xyz = anchor_xyz[:count].contiguous()
+        else:
+            deficit = count - anchor_xyz.shape[0]
+            new_means = gaussians.get_xyz[-deficit:].detach().clone()
+            gaussians.anchor_xyz = torch.cat([anchor_xyz, new_means], dim=0)
+    # anchor_scale_log / anchor_opacity_logit: pad with current param values
+    for attr, param_key, ndim in (
+        ("anchor_scale_log", "scales", 3),
+        ("anchor_opacity_logit", "opacities", 1),
+    ):
+        buf = getattr(gaussians, attr, None)
+        if buf is None:
+            continue
+        if buf.shape[0] == count:
+            continue
+        if buf.shape[0] > count:
+            setattr(gaussians, attr, buf[:count].contiguous())
+        else:
+            deficit = count - buf.shape[0]
+            if hasattr(gaussians, "params") and param_key in gaussians.params:
+                new_vals = gaussians.params[param_key][-deficit:].detach().clone()
+            else:
+                new_vals = torch.zeros((deficit, ndim) if ndim > 1 else (deficit,), device=buf.device, dtype=buf.dtype)
+            setattr(gaussians, attr, torch.cat([buf, new_vals], dim=0))
+
+
 def _load_depth_meters(frame) -> Optional[np.ndarray]:
     """Load and convert a frame's depth image to float32 metres array, or None on failure."""
     from utils.rgbd_frames import depth_to_meters
@@ -187,16 +243,21 @@ def insert_gaussians_from_frame(
     render_alpha: Optional[torch.Tensor] = None,
     render_depth: Optional[torch.Tensor] = None,
     current_frame_idx: int = 0,
-) -> int:
+) -> tuple:
     """
     Phase 2: backproject an RGB-D frame, voxel-filter, remove already-covered
     regions, and append new Gaussians as surface-aligned surfels.
+
+    Returns (n_inserted, stats_dict). stats_dict tracks per-filter-step counts.
     """
     from utils.rgbd_frames import depth_to_meters
     from PIL import Image as _Image
 
+    _debug = getattr(args, "streaming_insertion_debug", False)
+    _stats: dict = {}
+
     if frame.depth_path is None or not os.path.exists(frame.depth_path):
-        return 0
+        return 0, _stats
 
     depth_stride = getattr(args, "streaming_depth_stride", 8)
     min_depth = getattr(args, "streaming_min_depth", 0.1)
@@ -204,7 +265,8 @@ def insert_gaussians_from_frame(
     voxel_size = getattr(args, "streaming_insert_voxel_size", 0.02)
     cover_voxel = getattr(args, "streaming_cover_voxel_size", 0.0)
     if cover_voxel <= 0:
-        cover_voxel = voxel_size * 1.5
+        _cover_mult = getattr(args, "streaming_cover_voxel_multiplier", 1.0)
+        cover_voxel = voxel_size * max(_cover_mult, 0.1)
     max_new = getattr(args, "streaming_max_new_gaussians_per_frame", 2000)
     init_opacity = getattr(args, "streaming_insert_opacity", 0.05)
     edge_threshold = getattr(args, "streaming_depth_edge_threshold", 0.02)
@@ -215,13 +277,15 @@ def insert_gaussians_from_frame(
         depth = np.array(_Image.open(frame.depth_path))
         rgb = np.array(_Image.open(frame.rgb_path).convert("RGB")).astype(np.float32) / 255.0
     except Exception:
-        return 0
+        return 0, _stats
 
     z = depth_to_meters(depth, frame.depth_scale)
     h, w = z.shape
     ys, xs = np.mgrid[0:h:depth_stride, 0:w:depth_stride]
     z_v = z[ys, xs]
     valid = np.isfinite(z_v) & (z_v > min_depth) & (z_v < max_depth)
+    if _debug:
+        _stats["raw_candidates"] = int(valid.sum())
 
     # ---- Alpha & Residual masking (Step 4) ----------------------------------
     # Render may be at a different resolution than the raw sensor (--resolution
@@ -248,6 +312,8 @@ def insert_gaussians_from_frame(
         # or if there is no rendered depth at all.
         significant = (rend_d_v <= 0) | (rend_d_v - z_v > consistency_thresh)
         valid = valid & significant
+        if _debug:
+            _stats["after_alpha_depth_mask"] = int(valid.sum())
 
     # ---- Relative depth discontinuity masking (Step 5) ----------------------
     if edge_threshold > 0:
@@ -256,9 +322,11 @@ def insert_gaussians_from_frame(
         dzdy = np.abs(z[np.clip(ys + s, 0, h - 1), xs] - z[np.clip(ys - s, 0, h - 1), xs])
         edge_rel = (dzdx + dzdy) / np.maximum(z_v, 1e-6)
         valid = valid & (edge_rel < edge_threshold)
+        if _debug:
+            _stats["after_edge_filter"] = int(valid.sum())
 
     if not valid.any():
-        return 0
+        return 0, _stats
 
     # Sampling for normals
     s = depth_stride
@@ -279,8 +347,10 @@ def insert_gaussians_from_frame(
     cos_thresh = float(np.cos(np.deg2rad(max_view_angle)))
     angle_ok = nz > cos_thresh
     
+    if _debug:
+        _stats["after_grazing_filter"] = int(angle_ok.sum())
     if not angle_ok.any():
-        return 0
+        return 0, _stats
         
     xs_v = xs_vi[angle_ok].astype(np.float32)
     ys_v = ys_vi[angle_ok].astype(np.float32)
@@ -302,15 +372,53 @@ def insert_gaussians_from_frame(
     cols = cols[~occupied]
     nx = nx[~occupied]; ny = ny[~occupied]; nz = nz[~occupied]
     z_v = z_v[~occupied]
+    if _debug:
+        _stats["after_voxel_occupancy"] = pts.shape[0]
 
     if pts.shape[0] == 0:
-        return 0
+        return 0, _stats
 
     # Downsample remaining
     pts, indices = _voxel_downsample_indices(pts, voxel_size)
     cols = cols[indices]
     nx = nx[indices]; ny = ny[indices]; nz = nz[indices]
     z_v = z_v[indices]
+
+    # ---- KNN insertion dedup (Component E) ----------------------------------
+    # Reject candidates whose nearest existing Gaussian is within depth*radius_factor.
+    # Uses torch.cdist; subsamples existing set if too large for memory.
+    use_knn_dedup = getattr(args, "streaming_insert_knn_dedup", False)
+    if use_knn_dedup and pts.shape[0] > 0:
+        n_existing = gaussians.get_xyz.shape[0]
+        if n_existing > 0:
+            knn_radius_factor = float(getattr(args, "streaming_insert_knn_radius_factor", 0.005))
+            max_existing = int(getattr(args, "streaming_insert_knn_max_existing", 200_000))
+            with torch.no_grad():
+                cand_t = torch.from_numpy(pts).to(device="cuda", dtype=torch.float32)
+                exist_t = gaussians.get_xyz.detach()
+                if n_existing > max_existing:
+                    # Subsample via uniform stride to keep memory manageable
+                    stride = max(1, n_existing // max_existing)
+                    exist_t = exist_t[::stride]
+                # Chunk the distance computation to avoid OOM
+                chunk = 1024
+                min_dists = torch.full((cand_t.shape[0],), float("inf"), device="cuda")
+                for c_start in range(0, cand_t.shape[0], chunk):
+                    c_end = min(c_start + chunk, cand_t.shape[0])
+                    d = torch.cdist(cand_t[c_start:c_end].float(), exist_t.float())  # [chunk, M]
+                    min_dists[c_start:c_end] = d.min(dim=1).values
+                per_pt_radius = torch.from_numpy(z_v * knn_radius_factor).to(device="cuda", dtype=torch.float32)
+                too_close = min_dists < per_pt_radius
+                keep = ~too_close
+            if keep.any():
+                keep_np = keep.cpu().numpy()
+                pts = pts[keep_np]; cols = cols[keep_np]
+                nx = nx[keep_np]; ny = ny[keep_np]; nz = nz[keep_np]
+                z_v = z_v[keep_np]
+                if _debug:
+                    _stats["after_knn_dedup"] = pts.shape[0]
+            else:
+                return 0, _stats
 
     if max_new > 0 and pts.shape[0] > max_new:
         rng = np.random.default_rng(42)
@@ -339,6 +447,9 @@ def insert_gaussians_from_frame(
         tz = np.clip(normal_ratio * np.minimum(tx, ty), 1e-5, scale_max * normal_ratio)
         log_scales = np.log(np.stack([tx, ty, tz], axis=1))
 
+    if _debug:
+        _stats["after_per_frame_cap"] = pts.shape[0]
+
     added = gaussians.add_points_as_gaussians(
         torch.from_numpy(pts),
         torch.from_numpy(cols),
@@ -350,7 +461,9 @@ def insert_gaussians_from_frame(
     )
     if added > 0:
         streaming_scene.add_to_occupancy_hash(gaussians.get_xyz[-added:])
-    return added
+    if _debug:
+        _stats["inserted"] = added
+    return added, _stats
 
 
 # ---------------------------------------------------------------------------
@@ -1021,17 +1134,10 @@ def streaming_training(
     with open(os.path.join(args.model_path, "cfg_args"), "w") as f:
         f.write(str(Namespace(**{k: v for k, v in vars(args).items() if not k.startswith("_")})))
 
-    # Write reproduce.sh so the exact run can be replayed from the output dir
-    import shlex as _shlex
+    # Write reproduce.sh (includes docker compose wrapper when running in container)
     import sys as _sys
-    _repro_path = os.path.join(args.model_path, "reproduce.sh")
-    with open(_repro_path, "w") as _rf:
-        _cmd = " ".join(_shlex.quote(a) for a in _sys.argv)
-        _rf.write("#!/bin/bash\n")
-        _rf.write("# Reproduces the training run stored in this output directory.\n")
-        _rf.write("# Generated automatically at training start.\n")
-        _rf.write(f"python {_cmd}\n")
-    os.chmod(_repro_path, 0o755)
+    from utils.comparison_report import write_reproduce_sh
+    write_reproduce_sh(os.path.join(args.model_path, "reproduce.sh"), _sys.argv)
 
     tb_writer = None
     if _TB:
@@ -1081,7 +1187,10 @@ def streaming_training(
         fps=getattr(args, "streaming_input_fps", 30.0),
         steps_per_frame=max(1, getattr(args, "streaming_steps_per_frame", 50)),
         wallclock=getattr(args, "streaming_wallclock", False),
+        ingestion_mode=getattr(args, "streaming_ingestion_mode", "iter_based"),
+        fps_cap=getattr(args, "streaming_input_fps_cap", 30.0),
     )
+    _iter_wall_start: float = time.perf_counter()  # for per-iter dt in dataset_fps mode
 
     # --- MCMC / strategy setup ---------------------------------------------
     from utils.mcmc_schedule import MCMCScheduleConfig, get_mcmc_schedule
@@ -1116,7 +1225,10 @@ def streaming_training(
         target_tau=getattr(opt, "mcmc_target_tau", 0.45),
     )
     mcmc_strategy = make_mcmc_strategy(densification_strategy, gaussians=gaussians, args=args)
-    mcmc_strategy.initialize_state(gaussians=gaussians, args=args)
+    mcmc_strategy.initialize_state(
+        gaussians=gaussians, args=args,
+        scene_scale=float(getattr(streaming_scene, "cameras_extent", 1.0)),
+    )
     configure_torch_compile(args)
 
     optimizer_type = getattr(opt, "optimizer_type", "adam").lower()
@@ -1192,6 +1304,56 @@ def streaming_training(
     # H9: anchor loss parameters
     _anchor_loss_weight = float(getattr(args, "streaming_anchor_loss_weight", 0.0))
     _anchor_decay_steps = max(1, int(getattr(args, "streaming_anchor_decay_steps", 500)))
+
+    # Training-progress video setup
+    _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
+    _progress_video_fps = int(getattr(args, "progress_video_fps", 10))
+    _progress_cams: list = []     # 3 equally-spaced fixed cameras, locked in once enough are available
+    _progress_frames: list = []   # accumulated side-by-side uint8 HWC numpy frames
+
+    # Async render: renders go on a side CUDA stream; CPU work (numpy/cv2) goes to a daemon thread.
+    # This overlaps GPU renders and CPU image assembly with the next training iteration.
+    import threading as _threading
+    import queue as _queue_mod
+    _pv_stream = torch.cuda.Stream()
+    _pv_cpu_queue: _queue_mod.Queue = _queue_mod.Queue(maxsize=2)
+
+    def _pv_cpu_worker():
+        while True:
+            item = _pv_cpu_queue.get()
+            if item is None:
+                break
+            _gpu_panels, _pv_iter, _pv_total = item
+            _panels = []
+            for _t in _gpu_panels:
+                _arr = _t.cpu().numpy()  # waits for _pv_stream to finish this tensor
+                _arr = np.transpose(_arr, (1, 2, 0))
+                _arr = (_arr * 255 + 0.5).astype(np.uint8)
+                _panels.append(_arr)
+            _sep = np.ones((_panels[0].shape[0], 2, 3), dtype=np.uint8) * 80
+            _combined = np.concatenate([_panels[0], _sep, _panels[1], _sep, _panels[2]], axis=1)
+            try:
+                import cv2 as _cv2
+                _lbl = f"iter {_pv_iter:>6d} / {_pv_total}"
+                _cv2.putText(_combined, _lbl, (8, 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, _cv2.LINE_AA)
+                _cv2.putText(_combined, _lbl, (8, 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, _cv2.LINE_AA)
+            except Exception:
+                pass
+            _progress_frames.append(_combined)
+
+    _pv_thread = _threading.Thread(target=_pv_cpu_worker, daemon=True)
+    _pv_thread.start()
+
+    # Four-state lifecycle parameters (Component B/C)
+    _lifecycle_enabled = getattr(args, "streaming_lifecycle_enabled", False)
+    _mature_age_frames = max(1, int(getattr(args, "streaming_mature_age_frames", 15)))
+    _mature_min_utility = float(getattr(args, "streaming_mature_min_utility", 0.1))
+    _freeze_age_frames = int(getattr(args, "streaming_freeze_age_frames", -1))
+    _utility_ema_beta = float(getattr(args, "streaming_utility_ema_beta", 0.95))
+    # Mature-Gaussian anchor loss weights (Component C)
+    _mature_anchor_xyz_w = float(getattr(args, "streaming_mature_anchor_xyz_weight", 0.0))
+    _mature_anchor_scale_w = float(getattr(args, "streaming_mature_anchor_scale_weight", 0.0))
+    _mature_anchor_opacity_w = float(getattr(args, "streaming_mature_anchor_opacity_weight", 0.0))
     use_energy_mcmc = getattr(args, "energy_mcmc", True) and densification_strategy in {
         "mcmc", "hybrid", "gsplat_energy_mcmc"
     }
@@ -1244,8 +1406,13 @@ def streaming_training(
     for iteration in range(first_iter, opt.iterations + 1):
         set_compile_iteration(iteration)
 
+        # Measure per-iteration wall time for dataset_fps simulated clock
+        _now = time.perf_counter()
+        _iter_dt = _now - _iter_wall_start
+        _iter_wall_start = _now
+
         # ---- Frame ingestion -----------------------------------------------
-        if streaming_scene.has_next_frame() and scheduler.should_release(iteration):
+        if streaming_scene.has_next_frame() and scheduler.should_release(iteration, dt=_iter_dt):
             result = streaming_scene.ingest_next_frame()
             if result is not None:
                 new_cam, new_frame, is_train = result
@@ -1264,7 +1431,7 @@ def streaming_training(
                             alpha_new = pkg_new["alpha"]
                             depth_new = pkg_new.get("rendered_depth", None)
                         
-                        added = insert_gaussians_from_frame(
+                        added, _insert_stats = insert_gaussians_from_frame(
                             gaussians, new_frame, args,
                             streaming_scene=streaming_scene,
                             prev_frame=_prev_insert_frame,
@@ -1283,6 +1450,10 @@ def streaming_training(
                                 f"inserted={added} total_inserted={total_inserted} N={gaussians.get_xyz.shape[0]}",
                                 flush=True,
                             )
+                        # Log per-filter insertion telemetry
+                        if tb_writer and _insert_stats:
+                            for _k, _v in _insert_stats.items():
+                                tb_writer.add_scalar(f"streaming/insertion/{_k}", _v, iteration)
                     # Cache this frame as the previous frame for next insertion
                     _prev_insert_frame = new_frame
                     _prev_insert_depth_m = _load_depth_meters(new_frame)
@@ -1314,6 +1485,8 @@ def streaming_training(
                             render_depth=use_depth_loss)
         image = render_pkg["render"]
         
+        _sync_streaming_state_lengths(gaussians)
+
         # Support update for provisional Gaussians (Step 8)
         _update_provisional_support(gaussians, viewpoint_cam, render_pkg, args)
 
@@ -1341,6 +1514,11 @@ def streaming_training(
                     print(f"[streaming] iter={iteration} pruning {stale_mask.sum().item()} stale provisional points.", flush=True)
                     gaussians.prune_points(stale_mask)
                     # Force occupancy hash update after pruning
+                    streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
+
+                # Periodic rebuild regardless of pruning — frees voxels of relocated Gaussians
+                _occ_rebuild_every = getattr(args, "streaming_occupancy_rebuild_interval", 200)
+                if _occ_rebuild_every > 0 and iteration % _occ_rebuild_every == 0:
                     streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
 
         # ---- Loss ---------------------------------------------------------
@@ -1429,6 +1607,34 @@ def streaming_training(
                 loss = loss + _anchor_loss_weight * L_anchor
                 _anchor_loss_val = L_anchor.item()
 
+        # ---- Mature-Gaussian soft-anchor anti-fade losses (Component C) -----
+        # Constant-weight (non-decaying) anchor losses on xyz/scale/opacity for
+        # MATURE Gaussians. Prevents confirmed geometry from fading when old
+        # frames leave the training window.
+        _mature_anchor_val = None
+        if _lifecycle_enabled and _mature_anchor_xyz_w + _mature_anchor_scale_w + _mature_anchor_opacity_w > 0 and hasattr(gaussians, "lifecycle_state"):
+            with torch.no_grad():
+                mature_mask = (gaussians.lifecycle_state >= 2)  # MATURE or FROZEN
+            if mature_mask.any():
+                L_ma = torch.tensor(0.0, device="cuda")
+                if _mature_anchor_xyz_w > 0 and hasattr(gaussians, "anchor_xyz"):
+                    dxyz = gaussians.get_xyz[mature_mask] - gaussians.anchor_xyz[mature_mask]
+                    L_ma = L_ma + _mature_anchor_xyz_w * dxyz.pow(2).sum(dim=1).mean()
+                if _mature_anchor_scale_w > 0 and hasattr(gaussians, "anchor_scale_log"):
+                    if model_layout == "gsplat":
+                        d_scale = gaussians.params["scales"][mature_mask] - gaussians.anchor_scale_log[mature_mask]
+                    else:
+                        d_scale = gaussians._scaling[mature_mask] - gaussians.anchor_scale_log[mature_mask]
+                    L_ma = L_ma + _mature_anchor_scale_w * d_scale.pow(2).mean()
+                if _mature_anchor_opacity_w > 0 and hasattr(gaussians, "anchor_opacity_logit"):
+                    if model_layout == "gsplat":
+                        d_op = gaussians.params["opacities"][mature_mask] - gaussians.anchor_opacity_logit[mature_mask]
+                    else:
+                        d_op = gaussians._opacity.squeeze(-1)[mature_mask] - gaussians.anchor_opacity_logit[mature_mask]
+                    L_ma = L_ma + _mature_anchor_opacity_w * d_op.pow(2).mean()
+                loss = loss + L_ma
+                _mature_anchor_val = L_ma.item()
+
         # ---- Free-space / floater loss -------------------------------------
         # Penalise opacity that is rendered in front of the observed surface.
         # Targets mid-air splats that photometric loss would otherwise keep.
@@ -1457,6 +1663,10 @@ def streaming_training(
                     L_free = (rend_a_fs[floater] * (sensor_d_fs[floater] - rend_d_fs[floater]).detach()).mean()
                     loss = loss + free_space_weight * L_free
                     _free_loss_val = L_free.item()
+
+        # ---- Stratified sampling state update --------------------------------
+        _loss_val = loss.item()
+        streaming_scene.update_stratified_state(viewpoint_cam, _loss_val)
 
         # ---- Backward + optimizer step (skipped in placement_only mode) -----
         visible = render_pkg["visibility_filter"].detach().to(dtype=torch.bool).contiguous()
@@ -1496,6 +1706,24 @@ def streaming_training(
                                 if (_param.grad is not None
                                         and getattr(_param.grad, "layout", torch.strided) == torch.strided):
                                     _param.grad[_old] = 0.0
+
+            # Lifecycle: zero all gradients for FROZEN Gaussians (lifecycle_state==3)
+            if _lifecycle_enabled and hasattr(gaussians, "lifecycle_state"):
+                _frozen_mask = gaussians.lifecycle_state == 3
+                if _frozen_mask.any():
+                    with torch.no_grad():
+                        if model_layout == "gsplat":
+                            for _pg_name in ("means", "scales", "quats", "opacities", "sh0", "shN"):
+                                _p = gaussians.params.get(_pg_name)
+                                if (_p is not None and _p.grad is not None
+                                        and getattr(_p.grad, "layout", torch.strided) == torch.strided):
+                                    _p.grad[_frozen_mask] = 0.0
+                        else:
+                            for _param in (gaussians._xyz, gaussians._scaling, gaussians._rotation,
+                                           gaussians._opacity, gaussians._features_dc, gaussians._features_rest):
+                                if (_param.grad is not None
+                                        and getattr(_param.grad, "layout", torch.strided) == torch.strided):
+                                    _param.grad[_frozen_mask] = 0.0
 
             if iteration < opt.iterations:
                 if optimizer_type == "selective_adam":
@@ -1552,6 +1780,49 @@ def streaming_training(
         else:
             utility = None
             temperature = 1.0
+
+        # ---- Lifecycle: update utility_ema and advance states ---------------
+        if _lifecycle_enabled and iteration % 100 == 0 and hasattr(gaussians, "lifecycle_state"):
+            with torch.no_grad():
+                # Update per-Gaussian utility EMA using last computed utility score
+                if utility is not None and hasattr(gaussians, "utility_ema"):
+                    beta = _utility_ema_beta
+                    u_score = utility.detach().clamp(min=0.0)
+                    gaussians.utility_ema.mul_(beta).add_(u_score, alpha=(1.0 - beta))
+
+                lc = gaussians.lifecycle_state  # [N] int8
+                frame_age = (n_frames_ingested - gaussians.birth_frame.long()).clamp(min=0)
+
+                # PROVISIONAL (0) → YOUNG (1): existing promote logic already sets provisional=False;
+                # keep in sync by upgrading lifecycle_state to YOUNG for newly promoted.
+                newly_promoted = (~gaussians.provisional) & (lc == 0)
+                if newly_promoted.any():
+                    gaussians.lifecycle_state[newly_promoted] = 1  # YOUNG
+
+                # YOUNG (1) → MATURE (2)
+                young_mask = lc == 1
+                if young_mask.any():
+                    age_ok = frame_age >= _mature_age_frames
+                    if hasattr(gaussians, "utility_ema") and _mature_min_utility > 0:
+                        util_ok = gaussians.utility_ema >= _mature_min_utility
+                    else:
+                        util_ok = torch.ones_like(young_mask)
+                    to_mature = young_mask & age_ok & util_ok
+                    if to_mature.any():
+                        gaussians.lifecycle_state[to_mature] = 2  # MATURE
+                        # Re-snapshot anchors at the mature pose (lock-in target)
+                        if hasattr(gaussians, "anchor_scale_log"):
+                            gaussians.anchor_scale_log[to_mature] = gaussians.params["scales"][to_mature].detach().clone()
+                        if hasattr(gaussians, "anchor_opacity_logit"):
+                            gaussians.anchor_opacity_logit[to_mature] = gaussians.params["opacities"][to_mature].detach().clone()
+
+                # MATURE (2) → FROZEN (3): only when freeze_age_frames >= 0
+                if _freeze_age_frames >= 0:
+                    mature_mask = lc == 2
+                    if mature_mask.any():
+                        to_freeze = mature_mask & (frame_age >= _freeze_age_frames)
+                        if to_freeze.any():
+                            gaussians.lifecycle_state[to_freeze] = 3  # FROZEN
 
         # ---- MCMC mutation ------------------------------------------------
         sched = get_mcmc_schedule(
@@ -1610,6 +1881,39 @@ def streaming_training(
                 })
                 progress_bar.update(10)
 
+            # ---- Training-progress video capture (async) --------------------
+            if _progress_video_interval > 0 and iteration % _progress_video_interval == 0:
+                # Lock in 3 cameras once enough trajectory is covered.
+                # Require ≥3 test cameras AND ≥20% of frames ingested so the
+                # selected cameras span meaningfully different viewpoints.
+                if not _progress_cams:
+                    _total_frames_avail = len(streaming_scene._all_frames)
+                    _tcams = list(streaming_scene.getTestCameras())
+                    _trcams = list(streaming_scene.train_cameras)
+                    if len(_tcams) >= 3 and n_frames_ingested >= max(3, _total_frames_avail // 5):
+                        _pool = _tcams
+                    elif len(_trcams) >= 10 and n_frames_ingested >= 10:
+                        _pool = _trcams
+                    else:
+                        _pool = None
+                    if _pool is not None:
+                        _n = len(_pool)
+                        _progress_cams = [_pool[0], _pool[(_n - 1) // 2], _pool[_n - 1]]
+                if _progress_cams:
+                    # Submit 3 renders to side CUDA stream (non-blocking for main stream)
+                    _gpu_panels = []
+                    with torch.cuda.stream(_pv_stream):
+                        _pv_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.no_grad():
+                            for _pvc in _progress_cams:
+                                _pv_pkg = render(_pvc, gaussians, pipe, background)
+                                _gpu_panels.append(_pv_pkg["render"].detach().clamp(0, 1))
+                    # Hand off to CPU worker; drop frame if worker is still busy
+                    try:
+                        _pv_cpu_queue.put_nowait((_gpu_panels, iteration, opt.iterations))
+                    except _queue_mod.Full:
+                        pass
+
             should_log = tb_writer and iteration % scalar_log_interval == 0
             if should_log:
                 tb_writer.add_scalar("train/l1_loss", Ll1.item(), iteration)
@@ -1622,12 +1926,23 @@ def streaming_training(
                                      len(streaming_scene.get_local_cameras()), iteration)
                 tb_writer.add_scalar("streaming/replay_buffer",
                                      len(streaming_scene._replay_buffer), iteration)
+                if scheduler.frames_dropped > 0:
+                    tb_writer.add_scalar("streaming/frames_dropped", scheduler.frames_dropped, iteration)
                 if _depth_loss_val is not None:
                     tb_writer.add_scalar("train/depth_loss", _depth_loss_val, iteration)
                 if _free_loss_val is not None:
                     tb_writer.add_scalar("train/free_space_loss", _free_loss_val, iteration)
                 if _anchor_loss_val is not None:
                     tb_writer.add_scalar("train/anchor_loss", _anchor_loss_val, iteration)
+                if _mature_anchor_val is not None:
+                    tb_writer.add_scalar("train/mature_anchor_loss", _mature_anchor_val, iteration)
+                # Lifecycle state counts (when enabled)
+                if _lifecycle_enabled and hasattr(gaussians, "lifecycle_state"):
+                    lc = gaussians.lifecycle_state
+                    tb_writer.add_scalar("streaming/lifecycle/n_provisional", int((lc == 0).sum()), iteration)
+                    tb_writer.add_scalar("streaming/lifecycle/n_young", int((lc == 1).sum()), iteration)
+                    tb_writer.add_scalar("streaming/lifecycle/n_mature", int((lc == 2).sum()), iteration)
+                    tb_writer.add_scalar("streaming/lifecycle/n_frozen", int((lc == 3).sum()), iteration)
 
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -1720,6 +2035,21 @@ def streaming_training(
             )
     except Exception as e:
         print(f"[streaming-report] post-training report failed: {e}", flush=True)
+
+    # ---- Training-progress video write ---------------------------------------
+    # Signal the CPU worker to stop, then wait for it to finish any in-flight frames.
+    _pv_cpu_queue.put(None)
+    _pv_thread.join(timeout=120)
+    if _progress_frames:
+        from utils.comparison_report import _write_mp4
+        _prog_path = os.path.join(args.model_path, "training_progress.mp4")
+        print(f"[streaming] Writing training_progress.mp4 ({len(_progress_frames)} frames @ {_progress_video_fps}fps)…",
+              flush=True)
+        _err = _write_mp4(_prog_path, iter(_progress_frames), fps=_progress_video_fps)
+        if _err is None:
+            print(f"[streaming] training_progress.mp4 → {_prog_path}", flush=True)
+        else:
+            print(f"[streaming] training_progress.mp4 FAILED: {_err}", flush=True)
 
     save_worker.shutdown()
     print("\n[streaming] Training complete.", flush=True)
