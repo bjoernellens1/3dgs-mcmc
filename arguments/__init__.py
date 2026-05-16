@@ -106,6 +106,9 @@ class ModelParams(ParamGroup):
         self.replica_render_points = 300000
         self.replica_splat_radius = 1
         self.replica_random_num_pts = 250000
+        self.hypersim_cam_id = "cam_00"
+        self.hypersim_frame_stride = 1
+        self.hypersim_eval_hold = 8
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

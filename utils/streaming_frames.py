@@ -62,11 +62,15 @@ def load_frame_rgb(frame: "StreamingRGBDFrame"):
 
 
 def load_frame_depth_np(frame: "StreamingRGBDFrame"):
-    """Return raw uint16 depth numpy array, or None on failure."""
+    """Return raw depth numpy array (uint16 or float32), or None on failure."""
     import numpy as np
-    if frame._depth_bytes is not None and frame._sens_header is not None:
-        from scene.readers.scannet import _decode_sens_depth
-        return _decode_sens_depth(frame._depth_bytes, frame._sens_header)
+    if frame._depth_bytes is not None:
+        if frame._sens_header is not None:
+            from scene.readers.scannet import _decode_sens_depth
+            return _decode_sens_depth(frame._depth_bytes, frame._sens_header)
+        # Plain PNG bytes (e.g. Replica uint16 depth, HyperSim uint16 depth)
+        from PIL import Image
+        return np.array(Image.open(io.BytesIO(frame._depth_bytes)))
     if frame.depth_path is None or not os.path.exists(frame.depth_path):
         return None
     from PIL import Image
@@ -376,7 +380,302 @@ class ScanNetSensFrameSource:
         return self._frames
 
 
-def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMFrameSource | ScanNetFrameSource | ScanNetSensFrameSource":
+class ReplicaFrameSource:
+    """
+    Ordered frames synthesised from a Replica scene mesh (mesh.ply).
+
+    Generates a virtual camera trajectory around the mesh using the same
+    `_replica_camera_path` as the offline Replica reader, then renders RGB
+    and depth images using software point-splatting so no GPU / habitat-sim
+    is required at dataset-loading time.
+
+    depth_scale=1000.0 — depth stored as uint16 mm in _depth_bytes.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        num_views: int = 120,
+        width: int = 640,
+        height: int = 480,
+        fov_degrees: float = 70.0,
+        render_points: int = 300000,
+        splat_radius: int = 1,
+        max_frames: int = 0,
+        frame_stride: int = 1,
+    ):
+        import math
+        import numpy as np
+        from PIL import Image
+        from scene.readers.replica import _replica_camera_path, _render_point_splat
+        from scene.readers.common import fetchPlyFlexible
+
+        mesh_path = os.path.join(path, "mesh.ply")
+        if not os.path.exists(mesh_path):
+            raise FileNotFoundError(f"Replica mesh not found: {mesh_path}")
+
+        pcd = fetchPlyFlexible(mesh_path)
+
+        # Subsample for rendering speed
+        rng = np.random.default_rng(7)
+        n_pts = pcd.points.shape[0]
+        if n_pts > render_points:
+            idx = rng.choice(n_pts, size=int(render_points), replace=False)
+            pts = pcd.points[idx].astype(np.float32)
+            cols = pcd.colors[idx].astype(np.float32)
+        else:
+            pts = pcd.points.astype(np.float32)
+            cols = pcd.colors.astype(np.float32)
+
+        c2ws = _replica_camera_path(pcd.points, int(num_views))
+        if frame_stride > 1:
+            c2ws = c2ws[::frame_stride]
+        if max_frames > 0:
+            c2ws = c2ws[:max_frames]
+
+        fx = width / (2.0 * math.tan(math.radians(fov_degrees) * 0.5))
+        fy = fx
+        cx = width * 0.5
+        cy = height * 0.5
+
+        self._frames: List[StreamingRGBDFrame] = []
+        for idx, c2w in enumerate(c2ws):
+            # Render RGB
+            rgb_np = _render_point_splat(pts, cols, c2w, width, height, fx, fy, cx, cy, splat_radius=splat_radius)
+            rgb_img = Image.fromarray(rgb_np, mode="RGB")
+            import io as _io
+            rgb_buf = _io.BytesIO()
+            rgb_img.save(rgb_buf, format="JPEG", quality=90)
+            rgb_bytes = rgb_buf.getvalue()
+
+            # Render depth as uint16 mm PNG
+            depth_mm = _render_replica_depth(pts, c2w, width, height, fx, fy, cx, cy)
+            depth_img = Image.fromarray(depth_mm, mode="I;16")
+            depth_buf = _io.BytesIO()
+            depth_img.save(depth_buf, format="PNG")
+            depth_bytes = depth_buf.getvalue()
+
+            self._frames.append(StreamingRGBDFrame(
+                index=idx,
+                timestamp=float(idx),
+                rgb_path="",
+                depth_path=None,
+                c2w=c2w.astype(np.float32),
+                fx=fx, fy=fy, cx=cx, cy=cy,
+                width=int(width), height=int(height),
+                depth_scale=1000.0,
+                _rgb_bytes=rgb_bytes,
+                _depth_bytes=depth_bytes,
+            ))
+
+        print(f"[streaming] Replica: {len(self._frames)} synthetic frames rendered from {mesh_path}")
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def __iter__(self) -> Iterator[StreamingRGBDFrame]:
+        yield from self._frames
+
+    def get_all(self) -> List[StreamingRGBDFrame]:
+        return self._frames
+
+
+def _render_replica_depth(points, c2w, width, height, fx, fy, cx, cy):
+    """Render a uint16 depth image (mm units) from a point cloud and camera pose."""
+    import numpy as np
+    rot = c2w[:3, :3]
+    eye = c2w[:3, 3]
+    pts_cam = (points - eye) @ rot   # [N, 3]
+    z = pts_cam[:, 2]
+    valid = np.isfinite(z) & (z > 0.01) & (z < 65.535)  # max uint16 at 1mm = 65.535m
+    if not np.any(valid):
+        return np.zeros((height, width), dtype=np.uint16)
+
+    pts_cam = pts_cam[valid]
+    z_v = pts_cam[:, 2]
+    u = np.rint(fx * (pts_cam[:, 0] / z_v) + cx).astype(np.int32)
+    v = np.rint(fy * (pts_cam[:, 1] / z_v) + cy).astype(np.int32)
+    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+
+    depth_mm = np.zeros((height, width), dtype=np.uint16)
+    if not np.any(in_bounds):
+        return depth_mm
+
+    u = u[in_bounds]
+    v = v[in_bounds]
+    z_v = z_v[in_bounds]
+    depth_vals = np.round(z_v * 1000.0).astype(np.uint32).clip(0, 65535).astype(np.uint16)
+
+    # Depth buffer: keep nearest (smallest z) per pixel
+    flat = v * width + u
+    order = np.argsort(z_v)
+    flat_s = flat[order]
+    depth_s = depth_vals[order]
+    first_idx = np.unique(flat_s, return_index=True)[1]
+    chosen_flat = flat_s[first_idx]
+    chosen_depth = depth_s[first_idx]
+    depth_mm.flat[chosen_flat] = chosen_depth
+    return depth_mm
+
+
+class HyperSimFrameSource:
+    """
+    Ordered frames from an ML-HyperSim scene (ai_NNN_NNN/_detail/cam_00/).
+
+    Reads camera poses from HDF5 files and lazily loads color + depth at
+    __init__ time (all frames stored in-memory as JPEG/PNG bytes).
+    Requires h5py (pip install h5py).
+
+    depth_scale=1000.0 — depth stored as uint16 mm in _depth_bytes.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        cam_id: str = "cam_00",
+        max_frames: int = 0,
+        frame_stride: int = 1,
+    ):
+        import numpy as np
+        try:
+            import h5py
+        except ImportError:
+            raise ImportError(
+                "h5py is required for HyperSim streaming. "
+                "Install it with: pip install h5py"
+            )
+
+        cam_dir = os.path.join(path, "_detail", cam_id)
+        final_hdf5_dir = os.path.join(path, "images", f"scene_{cam_id}_final_hdf5")
+        geom_hdf5_dir = os.path.join(path, "images", f"scene_{cam_id}_geometry_hdf5")
+
+        for d in (cam_dir, final_hdf5_dir, geom_hdf5_dir):
+            if not os.path.isdir(d):
+                raise FileNotFoundError(f"HyperSim directory not found: {d}")
+
+        # Read scene scale: positions are in asset units; scale to meters
+        scene_meta = os.path.join(path, "_detail", "metadata_scene.csv")
+        meters_per_unit = 0.0254  # default: 1 inch
+        if os.path.exists(scene_meta):
+            import csv
+            with open(scene_meta) as f:
+                for row in csv.DictReader(f):
+                    if row.get("parameter_name") == "meters_per_asset_unit":
+                        meters_per_unit = float(row["parameter_value"])
+
+        # Camera poses
+        with h5py.File(os.path.join(cam_dir, "camera_keyframe_positions.hdf5"), "r") as f:
+            positions = f["dataset"][:].astype(np.float64)  # [N, 3] in asset units
+        with h5py.File(os.path.join(cam_dir, "camera_keyframe_orientations.hdf5"), "r") as f:
+            orientations = f["dataset"][:].astype(np.float64)  # [N, 3, 3]
+
+        n_keyframes = positions.shape[0]
+
+        # Map keyframe index → actual HDF5 file frame number
+        fi_hdf5 = os.path.join(cam_dir, "camera_keyframe_frame_indices.hdf5")
+        if os.path.exists(fi_hdf5):
+            with h5py.File(fi_hdf5, "r") as f:
+                file_frame_indices = f["dataset"][:].astype(int)  # [N]
+        else:
+            file_frame_indices = np.arange(n_keyframes, dtype=int)
+
+        # Intrinsics: HyperSim default is 1024×768, fov=60° horizontal
+        # (V-Ray renderer with standard settings; we use a fixed approximation)
+        import math
+        width, height = 1024, 768
+        fov_h_deg = 60.0
+        fx = width / (2.0 * math.tan(math.radians(fov_h_deg) * 0.5))
+        fy = fx
+        cx_f = width * 0.5
+        cy_f = height * 0.5
+
+        # Build keyframe index list (into positions/orientations arrays)
+        kf_indices = list(range(n_keyframes))
+        if frame_stride > 1:
+            kf_indices = kf_indices[::frame_stride]
+        if max_frames > 0:
+            kf_indices = kf_indices[:max_frames]
+
+        self._frames: List[StreamingRGBDFrame] = []
+        import io as _io
+        from PIL import Image
+
+        for out_idx, kfi in enumerate(kf_indices):
+            # kfi = index into positions/orientations; fi = HDF5 file frame number
+            fi = int(file_frame_indices[kfi])
+            # Build c2w from position + orientation
+            # HyperSim orientation: columns = [right, up, backward] in world space
+            # We use RDF convention: x=right, y=down, z=forward
+            ori = orientations[kfi]  # [3, 3]
+            pos = positions[kfi] * meters_per_unit  # convert to meters
+            right = ori[:, 0]
+            up = ori[:, 1]
+            backward = ori[:, 2]
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, 0] = right.astype(np.float32)
+            c2w[:3, 1] = (-up).astype(np.float32)       # down = -up
+            c2w[:3, 2] = (-backward).astype(np.float32) # forward = -backward
+            c2w[:3, 3] = pos.astype(np.float32)
+
+            if not np.isfinite(c2w).all():
+                continue
+
+            # Color: float32 linear HDR → uint8 gamma-corrected
+            color_path = os.path.join(final_hdf5_dir, f"frame.{fi:04d}.color.hdf5")
+            depth_path = os.path.join(geom_hdf5_dir, f"frame.{fi:04d}.depth_meters.hdf5")
+
+            if not os.path.exists(color_path) or not os.path.exists(depth_path):
+                continue
+
+            try:
+                with h5py.File(color_path, "r") as f:
+                    color_data = f["dataset"][:].astype(np.float32)  # [H, W, 3] linear
+                # Gamma correction + clip
+                color_uint8 = np.clip(np.power(np.maximum(color_data, 0.0), 1.0 / 2.2) * 255.0, 0, 255).astype(np.uint8)
+                rgb_img = Image.fromarray(color_uint8, mode="RGB")
+                rgb_buf = _io.BytesIO()
+                rgb_img.save(rgb_buf, format="JPEG", quality=90)
+                rgb_bytes = rgb_buf.getvalue()
+
+                with h5py.File(depth_path, "r") as f:
+                    depth_m = f["dataset"][:].astype(np.float32)  # [H, W] in meters
+                # Convert to uint16 mm; cap at 65.535m
+                depth_mm = np.round(depth_m * 1000.0).clip(0, 65535).astype(np.uint16)
+                depth_img = Image.fromarray(depth_mm, mode="I;16")
+                depth_buf = _io.BytesIO()
+                depth_img.save(depth_buf, format="PNG")
+                depth_bytes = depth_buf.getvalue()
+
+            except Exception as e:
+                print(f"[streaming] HyperSim: skipping frame {fi}: {e}", flush=True)
+                continue
+
+            self._frames.append(StreamingRGBDFrame(
+                index=out_idx,
+                timestamp=float(fi),
+                rgb_path="",
+                depth_path=None,
+                c2w=c2w,
+                fx=fx, fy=fy, cx=cx_f, cy=cy_f,
+                width=width, height=height,
+                depth_scale=1000.0,
+                _rgb_bytes=rgb_bytes,
+                _depth_bytes=depth_bytes,
+            ))
+
+        print(f"[streaming] HyperSim: {len(self._frames)} frames loaded from {path} (cam={cam_id})")
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def __iter__(self) -> Iterator[StreamingRGBDFrame]:
+        yield from self._frames
+
+    def get_all(self) -> List[StreamingRGBDFrame]:
+        return self._frames
+
+
+def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMFrameSource | ScanNetFrameSource | ScanNetSensFrameSource | ReplicaFrameSource | HyperSimFrameSource":
     """Auto-detect the RGB-D dataset layout and return an ordered frame source."""
     path = source_path
     if (
@@ -420,9 +719,35 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             frame_stride=getattr(args, "scannet_frame_stride", 10),
             depth_scale=getattr(args, "scannet_depth_scale", 1000.0),
         )
+    # HyperSim: _detail/ directory with at least one cam_XX subdirectory
+    _detail_dir = os.path.join(path, "_detail")
+    if os.path.isdir(_detail_dir):
+        cam_id = getattr(args, "hypersim_cam_id", "cam_00")
+        if os.path.isdir(os.path.join(_detail_dir, cam_id)):
+            return HyperSimFrameSource(
+                path,
+                cam_id=cam_id,
+                max_frames=getattr(args, "streaming_max_frames", 0),
+                frame_stride=getattr(args, "hypersim_frame_stride", 1),
+            )
+    # Replica: mesh.ply present (synthetic point-splat rendering)
+    if os.path.exists(os.path.join(path, "mesh.ply")):
+        return ReplicaFrameSource(
+            path,
+            num_views=getattr(args, "replica_num_views", 120),
+            width=getattr(args, "replica_width", 640),
+            height=getattr(args, "replica_height", 480),
+            fov_degrees=getattr(args, "replica_fov", 70.0),
+            render_points=getattr(args, "replica_render_points", 300000),
+            splat_radius=getattr(args, "replica_splat_radius", 1),
+            max_frames=getattr(args, "streaming_max_frames", 0),
+            frame_stride=getattr(args, "streaming_frame_stride", 1),
+        )
     raise ValueError(
         f"[streaming] No supported RGB-D dataset layout found at: {path}\n"
         "Supported: generic RGBDSequence (frames.jsonl + intrinsics.json), "
         "TUM (rgb.txt + depth.txt + groundtruth.txt), "
-        "ScanNet (color/ + pose/ + intrinsic/ or .sens file)."
+        "ScanNet (color/ + pose/ + intrinsic/ or .sens file), "
+        "HyperSim (_detail/cam_00/ with HDF5 frames), "
+        "Replica (mesh.ply)."
     )
