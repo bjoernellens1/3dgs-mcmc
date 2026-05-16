@@ -1489,6 +1489,31 @@ def streaming_training(
         "mcmc", "hybrid", "gsplat_energy_mcmc"
     }
 
+    # Taming-score-driven densification (taming / hybrid strategies)
+    taming_enabled = densification_strategy in {"taming", "hybrid"}
+    if taming_enabled:
+        from utils.taming_3dgs import (
+            compute_edge_map,
+            compute_taming_scores,
+            get_taming_budget,
+            get_taming_count_array,
+            get_taming_score_weights,
+            sample_taming_cameras,
+        )
+        _taming_weights = get_taming_score_weights(args)
+        _taming_edge_maps: dict = {}   # id(cam) → edge_map (CPU tensor)
+        _taming_counts = None
+        _taming_densify_step = 0
+        _taming_score_interval = max(1, getattr(args, "taming_score_interval", 100))
+        _taming_cams = getattr(args, "taming_cams", 3)
+    else:
+        _taming_weights = None
+        _taming_edge_maps = {}
+        _taming_counts = None
+        _taming_densify_step = 0
+        _taming_score_interval = 0
+        _taming_cams = 0
+
     print(
         f"[streaming] Starting: strategy={densification_strategy} "
         f"optimizer={optimizer_type} sparse={sparse_active_set} "
@@ -1550,6 +1575,12 @@ def streaming_training(
                 scheduler.mark_released()
                 n_frames_ingested += 1
                 _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
+
+                # Taming: compute and cache edge map for each arriving train camera
+                if taming_enabled and is_train and hasattr(new_cam, "original_image"):
+                    _taming_edge_maps[id(new_cam)] = compute_edge_map(
+                        new_cam.original_image
+                    ).detach().cpu()
 
                 # Phase 2: insert new Gaussians from depth
                 if is_train and getattr(args, "streaming_insert_from_depth", True):
@@ -2021,6 +2052,73 @@ def streaming_training(
                         gaussians.params["means"].data[_anchor_mask] = _anchor_pos
                     else:
                         gaussians._xyz.data[_anchor_mask] = _anchor_pos
+
+        # ---- Taming scoring + densification -----------------------------------
+        if taming_enabled and not _placement_only and iteration < opt.densify_until_iter:
+            _run_taming = (
+                _taming_score_interval > 0
+                and iteration >= getattr(opt, "densify_from_iter", 500)
+                and iteration % _taming_score_interval == 0
+                and len(_taming_edge_maps) > 0
+            )
+            if _run_taming:
+                _kcams = [c for c in streaming_scene.getTrainCameras() if id(c) in _taming_edge_maps]
+                if len(_kcams) > 0:
+                    _tcamlist = sample_taming_cameras(_kcams, _taming_cams)
+                    _tedge = [_taming_edge_maps[id(c)].to(gaussians.get_xyz.device) for c in _tcamlist]
+                    try:
+                        with torch.no_grad():
+                            _tscores = compute_taming_scores(
+                                scene=None,
+                                camlist=_tcamlist,
+                                edge_maps=_tedge,
+                                gaussians=gaussians,
+                                pipe=pipe,
+                                bg=background,
+                                weights=_taming_weights,
+                                opt=opt,
+                            )
+                    except Exception as _te:
+                        print(f"[taming] scoring failed iter={iteration}: {_te}", flush=True)
+                        _tscores = None
+
+                    if _tscores is not None:
+                        if _taming_counts is None:
+                            _taming_budget = get_taming_budget(args)
+                            _taming_counts = get_taming_count_array(
+                                start_count=gaussians.get_xyz.shape[0],
+                                budget=_taming_budget,
+                                opt=opt,
+                                mode=getattr(args, "taming_budget_mode", "final_count"),
+                            )
+                        _target_idx = min(_taming_densify_step + 1, len(_taming_counts) - 1)
+                        _target_count = _taming_counts[_target_idx]
+                        _before_taming = gaussians.get_xyz.shape[0]
+                        with torch.no_grad():
+                            _tresult = gaussians.densify_with_taming_scores(
+                                scores=_tscores,
+                                target_count=_target_count,
+                                extent=streaming_scene.cameras_extent,
+                                min_opacity=getattr(args, "taming_min_opacity", 0.005),
+                                max_screen_size=None,
+                                iteration=iteration,
+                                prune_stop_iter=getattr(args, "taming_prune_stop_iter", 3200),
+                                grad_threshold=opt.densify_grad_threshold,
+                            )
+                        _taming_densify_step += 1
+                        _after_taming = gaussians.get_xyz.shape[0]
+                        if tb_writer:
+                            tb_writer.add_scalar("taming/cloned_count", _tresult["cloned"], iteration)
+                            tb_writer.add_scalar("taming/pruned_count", _tresult["pruned"], iteration)
+                            tb_writer.add_scalar("taming/target_count", _target_count, iteration)
+                            tb_writer.add_scalar("mcmc/growth_delta_N", _after_taming - _before_taming, iteration)
+                        if iteration % max(1, getattr(args, "strategy_log_interval", 500)) == 0:
+                            print(
+                                f"[taming] iter={iteration} target={_target_count} "
+                                f"clone={_tresult['cloned']} prune={_tresult['pruned']} "
+                                f"N={_before_taming}->{_after_taming}",
+                                flush=True,
+                            )
 
         # ---- Logging ------------------------------------------------------
         with torch.no_grad():

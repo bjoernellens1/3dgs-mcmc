@@ -269,11 +269,13 @@ def apply_parallelism_profile(args):
         )
     args.densification_strategy = getattr(args, "densification_strategy", "gsplat_energy_mcmc").lower()
     gsplat_strategies = {"gsplat_mcmc", "gsplat_energy_mcmc", "gsplat_default"}
-    if args.model_layout == "gsplat" and args.densification_strategy not in gsplat_strategies:
+    # taming and hybrid now support gsplat layout via streaming path (densify_with_taming_scores)
+    gsplat_all_ok = gsplat_strategies | {"taming", "hybrid"}
+    if args.model_layout == "gsplat" and args.densification_strategy not in gsplat_all_ok:
         raise ValueError(
             "--model_layout gsplat currently supports only --densification_strategy "
-            "gsplat_mcmc, gsplat_energy_mcmc, or gsplat_default. "
-            "Use --model_layout legacy for mcmc, hybrid, or taming."
+            "gsplat_mcmc, gsplat_energy_mcmc, gsplat_default, taming, or hybrid. "
+            "Use --model_layout legacy for mcmc."
         )
     if args.model_layout == "legacy" and args.densification_strategy in gsplat_strategies:
         raise ValueError(

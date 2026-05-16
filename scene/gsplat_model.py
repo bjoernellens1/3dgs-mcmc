@@ -544,3 +544,120 @@ class GsplatGaussianModel:
         self.anchor_opacity_logit = torch.cat([self.anchor_opacity_logit, new_op_logit], dim=0)
 
         return N
+
+    def _clone_gaussians_by_indices(self, indices: torch.Tensor) -> int:
+        """Clone Gaussians at the given indices by copying all parameters.
+
+        Extends optimizer state with zeros for the new entries and appends
+        all running buffers so the model remains consistent.
+        """
+        N = indices.shape[0]
+        if N == 0:
+            return 0
+
+        for name, optimizer in self.optimizers.items():
+            group = optimizer.param_groups[0]
+            old_param = group["params"][0]
+            stored_state = optimizer.state.get(old_param, None)
+
+            clones = old_param[indices].detach().clone()
+            new_param = nn.Parameter(
+                torch.cat([old_param.detach(), clones], dim=0).requires_grad_(True)
+            )
+            if stored_state is not None:
+                new_state = {}
+                for k, v in stored_state.items():
+                    if isinstance(v, torch.Tensor) and v.dim() > 0:
+                        zeros = torch.zeros(N, *clones.shape[1:], dtype=v.dtype, device=v.device)
+                        new_state[k] = torch.cat([v, zeros], dim=0)
+                    else:
+                        new_state[k] = v
+                del optimizer.state[old_param]
+                optimizer.state[new_param] = new_state
+            group["params"][0] = new_param
+            self.params[name] = new_param
+
+        # Running buffers — copy from parents
+        self.max_radii2D = torch.cat([self.max_radii2D, self.max_radii2D[indices]])
+        self.xyz_gradient_accum = torch.cat([self.xyz_gradient_accum, torch.zeros(N, 1, device="cuda")])
+        self.denom = torch.cat([self.denom, torch.zeros(N, 1, device="cuda")])
+        self.visibility_ema = torch.cat([self.visibility_ema, self.visibility_ema[indices]])
+        self.birth_frame = torch.cat([self.birth_frame, self.birth_frame[indices]])
+        self.support_count = torch.cat([self.support_count, torch.zeros(N, dtype=torch.int16, device="cuda")])
+        self.provisional = torch.cat([self.provisional, torch.zeros(N, dtype=torch.bool, device="cuda")])
+        self.anchor_xyz = torch.cat([self.anchor_xyz, self.anchor_xyz[indices]])
+        self.anchor_iter = torch.cat([self.anchor_iter, self.anchor_iter[indices]])
+        if self.lifecycle_state.shape[0] >= indices.max().item() + 1:
+            self.lifecycle_state = torch.cat([self.lifecycle_state, self.lifecycle_state[indices]])
+        else:
+            self.lifecycle_state = torch.cat([self.lifecycle_state, torch.zeros(N, dtype=torch.int8, device="cuda")])
+        if self.utility_ema.shape[0] >= indices.max().item() + 1:
+            self.utility_ema = torch.cat([self.utility_ema, self.utility_ema[indices]])
+        else:
+            self.utility_ema = torch.cat([self.utility_ema, torch.zeros(N, dtype=torch.float32, device="cuda")])
+        if self.anchor_scale_log.shape[0] >= indices.max().item() + 1:
+            self.anchor_scale_log = torch.cat([self.anchor_scale_log, self.anchor_scale_log[indices]])
+        else:
+            self.anchor_scale_log = torch.cat([self.anchor_scale_log, self.params["scales"][indices].detach().clone()])
+        if self.anchor_opacity_logit.shape[0] >= indices.max().item() + 1:
+            self.anchor_opacity_logit = torch.cat([self.anchor_opacity_logit, self.anchor_opacity_logit[indices]])
+        else:
+            self.anchor_opacity_logit = torch.cat([self.anchor_opacity_logit, self.params["opacities"][indices].detach().clone()])
+        return N
+
+    def densify_with_taming_scores(
+        self,
+        scores: torch.Tensor,
+        target_count: int,
+        extent: float,
+        min_opacity: float = 0.005,
+        max_screen_size=None,
+        iteration=None,
+        prune_stop_iter: int = 3200,
+        grad_threshold: float = 0.0002,
+        split_children: int = 2,
+    ) -> dict:
+        """Score-driven clone/prune for taming-style densification.
+
+        Clones the top-scoring small Gaussians up to target_count, then prunes
+        low-opacity ones. No split implemented for gsplat layout — large Gaussians
+        are either left alone or pruned; MCMC relocation fills the gap.
+        """
+        current_count = self.get_xyz.shape[0]
+        target_count = int(target_count)
+
+        scores = scores.to(device="cuda", dtype=torch.float32)
+        if scores.shape[0] != current_count:
+            padded = torch.zeros(current_count, device="cuda", dtype=torch.float32)
+            n = min(current_count, scores.shape[0])
+            padded[:n] = scores[:n]
+            scores = padded
+
+        growth_budget = max(0, target_count - current_count)
+        # Clone small Gaussians; ignore large ones (no split for gsplat layout)
+        clone_qualifiers = (scores > 0) & (self.get_scaling.max(dim=1).values <= self.percent_dense * extent)
+
+        n_candidates = int(clone_qualifiers.sum().item())
+        if n_candidates > 0 and growth_budget > 0:
+            # Pick top-scoring up to growth_budget
+            cand_scores = scores.clone()
+            cand_scores[~clone_qualifiers] = -1.0
+            _, top_idx = torch.topk(cand_scores, min(growth_budget, n_candidates))
+            self._clone_gaussians_by_indices(top_idx)
+            cloned = top_idx.shape[0]
+        else:
+            cloned = 0
+
+        # Prune low-opacity Gaussians
+        pruned = 0
+        if iteration is None or iteration < prune_stop_iter:
+            prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
+            if max_screen_size is not None:
+                big_vs = self.max_radii2D > max_screen_size
+                big_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+                prune_mask = prune_mask | big_vs | big_ws
+            if prune_mask.any():
+                self.prune_points(prune_mask)
+                pruned = int(prune_mask.sum().item())
+
+        return {"cloned": cloned, "split": 0, "pruned": pruned, "target": target_count}

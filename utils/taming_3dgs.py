@@ -17,6 +17,16 @@ def _dense_grad(grad):
     return grad
 
 
+def _named_grad(gaussians, legacy_attr, gsplat_key=None):
+    """Get gradient from either gsplat params dict or legacy attr."""
+    params = getattr(gaussians, "params", None)
+    if params is not None and gsplat_key is not None and gsplat_key in params:
+        grad = _dense_grad(params[gsplat_key].grad)
+        if grad is not None:
+            return grad
+    return _dense_grad(getattr(gaussians, legacy_attr, torch.zeros(1)).grad)
+
+
 @dataclass
 class TamingScoreWeights:
     view_importance: float = 50.0
@@ -160,7 +170,7 @@ def compute_taming_scores(scene, camlist, edge_maps, gaussians, pipe, bg, weight
     scales = torch.prod(gaussians.get_scaling.detach(), dim=1)
     support = gaussians.visibility_ema.detach().squeeze(-1) if hasattr(gaussians, "visibility_ema") else torch.zeros_like(opacity)
 
-    grad = _dense_grad(gaussians._xyz.grad)
+    grad = _named_grad(gaussians, "_xyz", "means")
     if grad is not None:
         xyz_grad = grad.detach().norm(dim=1)
     else:

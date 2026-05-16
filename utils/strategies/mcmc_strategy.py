@@ -26,6 +26,7 @@ class ScheduledMCMCStrategy:
         self.name = name
         self._next_reloc_iter = None
         self._next_grow_iter = None
+        self._gsplat_delegate = None  # lazily-created GsplatEnergyMCMCStrategy for gsplat layout
 
     def initialize_state(self, **_kwargs):
         return {}
@@ -64,11 +65,16 @@ class ScheduledMCMCStrategy:
             def op_sigmoid(x, k=100, x0=0.995):
                 return 1 / (1 + torch.exp(-k * (x - x0)))
 
-            noise = torch.randn_like(gaussians._xyz[noise_idx]) * (
+            # Support both gsplat layout (params["means"]) and legacy layout (_xyz)
+            if hasattr(gaussians, "params") and "means" in gaussians.params:
+                xyz_param = gaussians.params["means"]
+            else:
+                xyz_param = gaussians._xyz
+            noise = torch.randn_like(xyz_param[noise_idx]) * (
                 op_sigmoid(1 - gaussians.get_opacity[noise_idx])
             ) * args.noise_lr * xyz_lr
             noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-            gaussians._xyz[noise_idx].add_(noise)
+            xyz_param.data[noise_idx].add_(noise)
 
     def step_post_backward(
         self,
@@ -88,6 +94,27 @@ class ScheduledMCMCStrategy:
             return
 
         should_log = should_log_strategy or (lambda _iteration: False)
+
+        # For gsplat layout: delegate to GsplatEnergyMCMCStrategy which handles
+        # gsplat-native params/ops.  Taming scoring runs separately in train_streaming.py.
+        if getattr(gaussians, "uses_gsplat_layout", False):
+            if self._gsplat_delegate is None:
+                self._gsplat_delegate = GsplatEnergyMCMCStrategy()
+                self._gsplat_delegate.initialize_state(gaussians=gaussians, args=args)
+                # Share the timing state so reloc/grow intervals are consistent
+                self._gsplat_delegate._next_reloc_iter = self._next_reloc_iter
+                self._gsplat_delegate._next_grow_iter = self._next_grow_iter
+            self._gsplat_delegate.step_post_backward(
+                gaussians=gaussians, args=args, sched=sched, iteration=iteration,
+                utility=utility, temperature=temperature, use_energy_mcmc=use_energy_mcmc,
+                tb_writer=tb_writer, should_log_strategy=should_log_strategy,
+                render_pkg=render_pkg, lr=lr,
+            )
+            # Sync timing state back
+            self._next_reloc_iter = self._gsplat_delegate._next_reloc_iter
+            self._next_grow_iter = self._gsplat_delegate._next_grow_iter
+            return
+
         if use_energy_mcmc:
             with torch.no_grad():
                 if sched["allow_relocation"] and self._due(
@@ -728,4 +755,6 @@ def make_mcmc_strategy(name, gaussians=None, args=None):
         if not getattr(gaussians, "uses_gsplat_layout", False):
             raise ValueError("--densification_strategy gsplat_default requires --model_layout gsplat.")
         return GsplatDefaultStrategy()
+    # "taming" and "hybrid" with gsplat layout: ScheduledMCMCStrategy handles
+    # noise injection / relocation; taming scoring is wired in train_streaming.py.
     return ScheduledMCMCStrategy(name)
