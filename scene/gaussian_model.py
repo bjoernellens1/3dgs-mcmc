@@ -170,6 +170,7 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+            print(f"[sh] SH degree raised to {self.active_sh_degree} (max={self.max_sh_degree})", flush=True)
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, init_scale_mode="fixed", init_scale=0.01, voxel_size=0.02):
         self.spatial_lr_scale = spatial_lr_scale

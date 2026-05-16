@@ -202,10 +202,10 @@ def compute_dead_mask(
 ):
     """
     Compute dead mask combining opacity, support, and optionally utility.
-    
-    dead_j = alpha_j < opacity_threshold AND support_j < support_threshold
-    optionally OR (low opacity AND utility_j < quantile(utility, q))
-    
+
+    dead_j = (alpha_j < opacity_threshold AND support_j < support_threshold)
+             OR (utility_j < quantile(utility, q))   ← pure utility, no opacity gate
+
     Args:
         gaussians: GaussianModel instance
         utility: [N] optional utility scores
@@ -220,16 +220,17 @@ def compute_dead_mask(
     # get_opacity is already activated (sigmoid applied)
     alpha = gaussians.get_opacity.squeeze(-1)
     support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else torch.ones_like(alpha)
-    
+
     # Core death: low opacity AND low support
     dead = (alpha < opacity_threshold) & (support < support_threshold)
-    
+
     if use_utility_quantile and utility is not None and utility.numel() > 0:
         q_val = torch.quantile(utility, utility_quantile)
-        dead = dead | ((alpha < opacity_threshold) & (utility < q_val))
-    
-    # NOTE: visibility tracking across iterations would require
-    # accumulating visibility counts. For now we use current frame only.
-    # Future enhancement: track xyz_gradient_accum as proxy for activity.
-    
+        # Pure utility gate — no opacity requirement.
+        # The previous version also required alpha < opacity_threshold, making
+        # this branch a no-op in streaming mode where all Gaussians maintain
+        # high opacity after depth insertion. Low-utility Gaussians should be
+        # relocatable regardless of their current opacity.
+        dead = dead | (utility < q_val)
+
     return dead
