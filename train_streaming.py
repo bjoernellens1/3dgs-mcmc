@@ -583,24 +583,24 @@ def _snapshot_for_ply(gaussians):
 
 def _snapshot_for_eval(gaussians):
     """Clone gaussian params on GPU for eval while training mutates live params."""
-    from collections import OrderedDict
     clone = type(gaussians).__new__(type(gaussians))
     for k in ("active_sh_degree", "max_sh_degree", "spatial_lr_scale"):
         if hasattr(gaussians, k):
             setattr(clone, k, getattr(gaussians, k))
-    if hasattr(gaussians, "params") and isinstance(gaussians.params, (dict, OrderedDict)):
+    if hasattr(gaussians, "params") and isinstance(gaussians.params, torch.nn.ParameterDict):
         clone.params = torch.nn.ParameterDict({
             k: torch.nn.Parameter(v.detach().clone(), requires_grad=False)
             for k, v in gaussians.params.items()
         })
     else:
-        clone._xyz           = gaussians._xyz.detach().clone()
-        clone._features_dc   = gaussians._features_dc.detach().clone()
-        clone._features_rest = gaussians._features_rest.detach().clone()
-        clone._opacity       = gaussians._opacity.detach().clone()
-        clone._scaling       = gaussians._scaling.detach().clone()
-        clone._rotation      = gaussians._rotation.detach().clone()
-    clone.optimizer = None
+        # Legacy GaussianModel layout: attrs are plain tensors, not properties
+        clone.__dict__["_xyz"]           = gaussians._xyz.detach().clone()
+        clone.__dict__["_features_dc"]   = gaussians._features_dc.detach().clone()
+        clone.__dict__["_features_rest"] = gaussians._features_rest.detach().clone()
+        clone.__dict__["_opacity"]       = gaussians._opacity.detach().clone()
+        clone.__dict__["_scaling"]       = gaussians._scaling.detach().clone()
+        clone.__dict__["_rotation"]      = gaussians._rotation.detach().clone()
+    clone.__dict__["optimizer"] = None
     return clone
 
 
@@ -2103,6 +2103,9 @@ def streaming_training(
                     try:
                         from utils.comparison_report import write_post_training_report
                         from gaussian_renderer.gsplat_backend import render_batch as _rb_mid
+                        # skip_train_metrics + skip_trajectory keeps mid-training eval
+                        # to test-only (PSNR + LPIPS + PNGs): avoids ~90% of GPU work
+                        # and minimises contention with the main training stream.
                         write_post_training_report(
                             model_path=args.model_path,
                             iteration=it,
@@ -2112,6 +2115,8 @@ def streaming_training(
                             tb_writer=tb_writer,
                             log_prefix="streaming_report",
                             batch_render_fn=_rb_mid,
+                            skip_train_metrics=True,
+                            skip_trajectory=True,
                         )
                     except Exception as _e:
                         print(f"[async-eval] report failed iter={it}: {_e}", flush=True)
