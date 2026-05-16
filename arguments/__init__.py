@@ -109,6 +109,11 @@ class ModelParams(ParamGroup):
         self.hypersim_cam_id = "cam_00"
         self.hypersim_frame_stride = 1
         self.hypersim_eval_hold = 8
+        self.orbbec_color_topic = "/camera/color/image_raw/compressed"
+        self.orbbec_depth_topic = "/camera/depth/image_raw/compressed"
+        self.orbbec_pose_topic = "/camera_pose"
+        self.orbbec_camera_info_topic = "/camera/color/camera_info"
+        self.orbbec_sync_threshold_ms = 33.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

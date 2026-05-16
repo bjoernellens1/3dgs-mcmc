@@ -141,8 +141,13 @@ def _raycast_replica_frame(scene, mesh_t, c2w, width, height, fx, fy, cx, cy):
     Miss pixels: rgb=(0,0,0), depth=0.
     """
     import io as _io
+    import sys as _sys
 
     import numpy as np
+    if not hasattr(_sys.stdout, "isatty"):
+        _sys.stdout.isatty = lambda: False  # type: ignore[attr-defined]
+    if not hasattr(_sys.stderr, "isatty"):
+        _sys.stderr.isatty = lambda: False  # type: ignore[attr-defined]
     import open3d as o3d
     import open3d.t.geometry as o3tg
     from PIL import Image

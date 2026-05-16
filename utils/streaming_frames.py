@@ -409,6 +409,11 @@ class ReplicaFrameSource:
         import numpy as np
 
         try:
+            import sys as _sys
+            if not hasattr(_sys.stdout, "isatty"):
+                _sys.stdout.isatty = lambda: False  # type: ignore[attr-defined]
+            if not hasattr(_sys.stderr, "isatty"):
+                _sys.stderr.isatty = lambda: False  # type: ignore[attr-defined]
             import open3d as o3d
             import open3d.t.geometry as o3tg
         except ImportError:
@@ -626,7 +631,257 @@ class HyperSimFrameSource:
         return self._frames
 
 
-def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMFrameSource | ScanNetFrameSource | ScanNetSensFrameSource | ReplicaFrameSource | HyperSimFrameSource":
+def _parse_icl_poses(poses_path: str):
+    """Parse poses.gt.sim: blank-separated 3×4 c2w blocks → list of (4,4) float32 arrays."""
+    import numpy as np
+    with open(poses_path) as f:
+        content = f.read()
+    poses = []
+    for block in content.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        rows = [list(map(float, r.split())) for r in block.split("\n") if r.strip()]
+        if len(rows) == 3 and all(len(r) == 4 for r in rows):
+            mat34 = np.array(rows, dtype=np.float32)
+            mat44 = np.eye(4, dtype=np.float32)
+            mat44[:3, :] = mat34
+            poses.append(mat44)
+    return poses
+
+
+def _icl_frame_index(filename: str) -> int:
+    """Extract sequential index N from ICL filenames like frame_TS_N.jpg or TS_N.png."""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return int(stem.rsplit("_", 1)[-1])
+
+
+class OrbbecExportFrameSource:
+    """Frames from an Orbbec Femto Bolt ICL export (rgbd_export2 tool).
+
+    Directory layout::
+        icl.yaml           — camera intrinsics + depth scale
+        poses.gt.sim       — blank-separated 3×4 c2w matrices (one per frame)
+        rgb/               — frame_TS_N.jpg  (JPEG colour)
+        depth/             — TS_N.png        (uint16 PNG, mm)
+    """
+
+    def __init__(
+        self,
+        path: str,
+        max_frames: int = 0,
+        frame_stride: int = 1,
+    ):
+        import yaml
+        import numpy as np
+
+        icl_yaml = os.path.join(path, "icl.yaml")
+        poses_file = os.path.join(path, "poses.gt.sim")
+        rgb_dir = os.path.join(path, "rgb")
+        depth_dir = os.path.join(path, "depth")
+
+        with open(icl_yaml) as f:
+            cfg = yaml.safe_load(f)
+        cam = cfg["camera_params"]
+        fx = float(cam["fx"])
+        fy = float(cam["fy"])
+        cx = float(cam["cx"])
+        cy = float(cam["cy"])
+        width = int(cam["image_width"])
+        height = int(cam["image_height"])
+        depth_scale = float(cam.get("png_depth_scale", 1000.0))
+
+        poses = _parse_icl_poses(poses_file)
+
+        rgb_files = sorted(
+            [f for f in os.listdir(rgb_dir) if f.lower().endswith((".jpg", ".jpeg"))],
+            key=_icl_frame_index,
+        )
+        depth_files = sorted(
+            [f for f in os.listdir(depth_dir) if f.lower().endswith(".png")],
+            key=_icl_frame_index,
+        )
+
+        # Match by sequential index
+        rgb_by_idx = {_icl_frame_index(f): f for f in rgb_files}
+        depth_by_idx = {_icl_frame_index(f): f for f in depth_files}
+        common = sorted(set(rgb_by_idx) & set(depth_by_idx) & set(range(len(poses))))
+
+        self._frames: List[StreamingRGBDFrame] = []
+        for pose_idx in common[::frame_stride]:
+            self._frames.append(StreamingRGBDFrame(
+                index=len(self._frames),
+                timestamp=float(pose_idx),
+                rgb_path=os.path.join(rgb_dir, rgb_by_idx[pose_idx]),
+                depth_path=os.path.join(depth_dir, depth_by_idx[pose_idx]),
+                c2w=poses[pose_idx],
+                fx=fx, fy=fy, cx=cx, cy=cy,
+                width=width, height=height,
+                depth_scale=depth_scale,
+            ))
+            if max_frames > 0 and len(self._frames) >= max_frames:
+                break
+
+        print(f"[streaming] OrbbecExport: {len(self._frames)} frames from {path}")
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def __iter__(self) -> Iterator[StreamingRGBDFrame]:
+        yield from self._frames
+
+    def get_all(self) -> List[StreamingRGBDFrame]:
+        return self._frames
+
+
+class OrbbecRosBagFrameSource:
+    """Frames from an Orbbec Femto Bolt slam MCAP rosbag (rosbag2 format).
+
+    Requires a slam bag that publishes ``/camera_pose``
+    (``geometry_msgs/msg/PoseStamped``). Pure navigation bags (no
+    ``/camera_pose``) are not supported — raise a clear error instead.
+
+    Topic conventions (Orbbec ROS2 nodes, default namespace)::
+        /camera_pose                         — PoseStamped (map frame, c2w)
+        /camera/color/image_raw/compressed   — CompressedImage (JPEG)
+        /camera/depth/image_raw/compressed   — CompressedImage (16UC1 PNG, mm)
+        /camera/color/camera_info            — CameraInfo
+    """
+
+    def __init__(
+        self,
+        path: str,
+        color_topic: str = "/camera/color/image_raw/compressed",
+        depth_topic: str = "/camera/depth/image_raw/compressed",
+        pose_topic: str = "/camera_pose",
+        camera_info_topic: str = "/camera/color/camera_info",
+        sync_threshold_ms: float = 33.0,
+        max_frames: int = 0,
+        frame_stride: int = 1,
+    ):
+        try:
+            from rosbags.rosbag2 import Reader
+            from rosbags.typesys import Stores, get_typestore
+        except ImportError:
+            raise ImportError(
+                "rosbags is required for OrbbecRosBagFrameSource. "
+                "Install it with: uv pip install rosbags"
+            )
+        import numpy as np
+
+        typestore = get_typestore(Stores.ROS2_HUMBLE)
+        sync_ns = int(sync_threshold_ms * 1e6)
+
+        # First pass: check /camera_pose exists
+        with Reader(path) as reader:
+            topics = {c.topic for c in reader.connections}
+        if pose_topic not in topics:
+            raise ValueError(
+                f"[streaming] OrbbecRosBagFrameSource: no '{pose_topic}' topic found in {path}.\n"
+                f"  Available topics: {sorted(topics)}\n"
+                "  Only slam bags (with /camera_pose) are supported. "
+                "Navigation bags do not provide camera poses."
+            )
+
+        # Read all messages in one pass
+        pose_msgs: list = []     # (ts_ns, c2w_4x4)
+        color_msgs: list = []    # (ts_ns, bytes)
+        depth_msgs: list = []    # (ts_ns, bytes)
+        intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy, W, H)
+
+        with Reader(path) as reader:
+            want = [color_topic, depth_topic, pose_topic, camera_info_topic]
+            conns = [c for c in reader.connections if c.topic in want]
+            for conn, ts, data in reader.messages(connections=conns):
+                topic = conn.topic
+                if topic == pose_topic:
+                    msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    p = msg.pose.position
+                    o = msg.pose.orientation
+                    qx, qy, qz, qw = o.x, o.y, o.z, o.w
+                    R = np.array([
+                        [1-2*(qy*qy+qz*qz),  2*(qx*qy-qz*qw),  2*(qx*qz+qy*qw)],
+                        [2*(qx*qy+qz*qw),  1-2*(qx*qx+qz*qz),  2*(qy*qz-qx*qw)],
+                        [2*(qx*qz-qy*qw),    2*(qy*qz+qx*qw),  1-2*(qx*qx+qy*qy)],
+                    ], dtype=np.float32)
+                    c2w = np.eye(4, dtype=np.float32)
+                    c2w[:3, :3] = R
+                    c2w[:3, 3] = [p.x, p.y, p.z]
+                    pose_msgs.append((ts, c2w))
+                elif topic == color_topic:
+                    msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    color_msgs.append((ts, bytes(msg.data)))
+                elif topic == depth_topic:
+                    msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    depth_msgs.append((ts, bytes(msg.data)))
+                elif topic == camera_info_topic and intrinsics is None:
+                    msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    K = msg.k  # row-major 3×3
+                    intrinsics = (
+                        float(K[0]), float(K[4]),   # fx, fy
+                        float(K[2]), float(K[5]),   # cx, cy
+                        int(msg.width), int(msg.height),
+                    )
+
+        if intrinsics is None:
+            raise RuntimeError(f"No '{camera_info_topic}' messages found in {path}")
+        fx, fy, cx, cy, width, height = intrinsics
+
+        # Build sorted timestamp arrays for O(log n) nearest-neighbour sync
+        pose_ts = np.array([m[0] for m in pose_msgs], dtype=np.int64)
+        depth_ts = np.array([m[0] for m in depth_msgs], dtype=np.int64)
+
+        self._frames: List[StreamingRGBDFrame] = []
+        for i, (color_ts, rgb_bytes) in enumerate(color_msgs[::frame_stride]):
+            # Find closest pose
+            pi = int(np.searchsorted(pose_ts, color_ts))
+            pi = min(pi, len(pose_ts) - 1)
+            if pi > 0 and abs(pose_ts[pi - 1] - color_ts) < abs(pose_ts[pi] - color_ts):
+                pi -= 1
+            if abs(pose_ts[pi] - color_ts) > sync_ns:
+                continue
+            c2w = pose_msgs[pi][1]
+
+            # Find closest depth
+            di = int(np.searchsorted(depth_ts, color_ts))
+            di = min(di, len(depth_ts) - 1)
+            if di > 0 and abs(depth_ts[di - 1] - color_ts) < abs(depth_ts[di] - color_ts):
+                di -= 1
+            depth_bytes: Optional[bytes] = None
+            if abs(depth_ts[di] - color_ts) <= sync_ns:
+                depth_bytes = depth_msgs[di][1]
+
+            self._frames.append(StreamingRGBDFrame(
+                index=len(self._frames),
+                timestamp=float(color_ts) * 1e-9,
+                rgb_path="",
+                depth_path=None,
+                c2w=c2w,
+                fx=fx, fy=fy, cx=cx, cy=cy,
+                width=width, height=height,
+                depth_scale=1000.0,
+                _rgb_bytes=rgb_bytes,
+                _depth_bytes=depth_bytes,
+            ))
+            if max_frames > 0 and len(self._frames) >= max_frames:
+                break
+
+        print(
+            f"[streaming] OrbbecRosBag: {len(self._frames)} synced frames from {path} "
+            f"(color={len(color_msgs)}, depth={len(depth_msgs)}, pose={len(pose_msgs)})"
+        )
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def __iter__(self) -> Iterator[StreamingRGBDFrame]:
+        yield from self._frames
+
+    def get_all(self) -> List[StreamingRGBDFrame]:
+        return self._frames
+
+
+def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMFrameSource | ScanNetFrameSource | ScanNetSensFrameSource | ReplicaFrameSource | HyperSimFrameSource | OrbbecExportFrameSource | OrbbecRosBagFrameSource":
     """Auto-detect the RGB-D dataset layout and return an ordered frame source."""
     path = source_path
     if (
@@ -694,11 +949,35 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             max_frames=getattr(args, "streaming_max_frames", 0),
             frame_stride=getattr(args, "streaming_frame_stride", 1),
         )
+    # Orbbec ICL export: icl.yaml + poses.gt.sim
+    if (
+        os.path.exists(os.path.join(path, "icl.yaml"))
+        and os.path.exists(os.path.join(path, "poses.gt.sim"))
+    ):
+        return OrbbecExportFrameSource(
+            path,
+            max_frames=getattr(args, "streaming_max_frames", 0),
+            frame_stride=getattr(args, "streaming_frame_stride", 1),
+        )
+    # Orbbec ROS2 slam bag: metadata.yaml (rosbag2 format)
+    if os.path.exists(os.path.join(path, "metadata.yaml")):
+        return OrbbecRosBagFrameSource(
+            path,
+            color_topic=getattr(args, "orbbec_color_topic", "/camera/color/image_raw/compressed"),
+            depth_topic=getattr(args, "orbbec_depth_topic", "/camera/depth/image_raw/compressed"),
+            pose_topic=getattr(args, "orbbec_pose_topic", "/camera_pose"),
+            camera_info_topic=getattr(args, "orbbec_camera_info_topic", "/camera/color/camera_info"),
+            sync_threshold_ms=getattr(args, "orbbec_sync_threshold_ms", 33.0),
+            max_frames=getattr(args, "streaming_max_frames", 0),
+            frame_stride=getattr(args, "streaming_frame_stride", 1),
+        )
     raise ValueError(
         f"[streaming] No supported RGB-D dataset layout found at: {path}\n"
         "Supported: generic RGBDSequence (frames.jsonl + intrinsics.json), "
         "TUM (rgb.txt + depth.txt + groundtruth.txt), "
         "ScanNet (color/ + pose/ + intrinsic/ or .sens file), "
         "HyperSim (_detail/cam_00/ with HDF5 frames), "
-        "Replica (mesh.ply)."
+        "Replica (mesh.ply), "
+        "OrbbecExport (icl.yaml + poses.gt.sim), "
+        "OrbbecRosBag (metadata.yaml with /camera_pose topic)."
     )
