@@ -1972,6 +1972,18 @@ def streaming_training(
                                      len(streaming_scene._replay_buffer), iteration)
                 if scheduler.frames_dropped > 0:
                     tb_writer.add_scalar("streaming/frames_dropped", scheduler.frames_dropped, iteration)
+                _vf = render_pkg.get("visibility_filter")
+                if _vf is not None and gaussians.get_xyz.shape[0] > 0:
+                    tb_writer.add_scalar(
+                        "streaming/visible_fraction",
+                        _vf.float().mean().item(),
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        "streaming/dead_fraction",
+                        (gaussians.get_opacity.squeeze(-1) < 0.05).float().mean().item(),
+                        iteration,
+                    )
                 if _depth_loss_val is not None:
                     tb_writer.add_scalar("train/depth_loss", _depth_loss_val, iteration)
                 if _free_loss_val is not None:
