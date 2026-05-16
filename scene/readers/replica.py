@@ -133,6 +133,72 @@ def _render_point_splat(points, colors, c2w, width, height, fx, fy, cx, cy, spla
     return image
 
 
+def _raycast_replica_frame(scene, mesh_t, c2w, width, height, fx, fy, cx, cy):
+    """Render one RGB + depth frame via open3d mesh raycasting.
+
+    Returns (rgb_jpeg_bytes, depth_png_bytes).
+    Depth is z-component in metres, stored as uint16 mm PNG.
+    Miss pixels: rgb=(0,0,0), depth=0.
+    """
+    import io as _io
+
+    import numpy as np
+    import open3d as o3d
+    import open3d.t.geometry as o3tg
+    from PIL import Image
+
+    w2c = np.linalg.inv(c2w)
+    K = o3d.core.Tensor(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=o3d.core.Dtype.Float64,
+    )
+    E = o3d.core.Tensor(w2c.astype(np.float64), dtype=o3d.core.Dtype.Float64)
+
+    rays = o3tg.RaycastingScene.create_rays_pinhole(K, E, width, height)
+    result = scene.cast_rays(rays)
+
+    t_hit = result["t_hit"].numpy()          # [H, W] float32
+    prim_id = result["primitive_ids"].numpy()  # [H, W] uint32
+    prim_uv = result["primitive_uvs"].numpy()  # [H, W, 2] float32
+
+    hit = np.isfinite(t_hit)
+
+    # ray-length → z-component
+    us, vs = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+    z_factor = 1.0 / np.sqrt(((us - cx) / fx) ** 2 + ((vs - cy) / fy) ** 2 + 1.0)
+    z_depth = t_hit * z_factor
+    z_depth[~hit] = 0.0
+
+    # barycentric vertex-color interpolation
+    vc = mesh_t.vertex["colors"].numpy()       # [N, 3] float32 in [0, 1]
+    tri = mesh_t.triangle["indices"].numpy()   # [M, 3] int32
+
+    rgb = np.zeros((height * width, 3), dtype=np.float32)
+    flat_hit = hit.ravel()
+    if flat_hit.any():
+        pids = prim_id.ravel()[flat_hit]
+        uvs = prim_uv.reshape(-1, 2)[flat_hit]
+        f = tri[pids]
+        u_b = uvs[:, 0:1]
+        v_b = uvs[:, 1:2]
+        rgb[flat_hit] = (1 - u_b - v_b) * vc[f[:, 0]] + u_b * vc[f[:, 1]] + v_b * vc[f[:, 2]]
+    rgb = rgb.reshape(height, width, 3)
+
+    buf_rgb = _io.BytesIO()
+    Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(
+        buf_rgb, format="JPEG", quality=92
+    )
+
+    depth_mm = np.round(z_depth * 1000.0).clip(0, 65535).astype(np.uint16)
+    buf_dep = _io.BytesIO()
+    Image.fromarray(depth_mm, mode="I;16").save(buf_dep, format="PNG")
+
+    return buf_rgb.getvalue(), buf_dep.getvalue()
+
+
 def _ensure_replica_views(path, pcd, c2ws, width, height, fov_degrees, render_points, splat_radius):
     view_dir = Path(path) / (
         f"replica_views_w{width}_h{height}_n{len(c2ws)}_fov{int(round(fov_degrees))}_r{splat_radius}"

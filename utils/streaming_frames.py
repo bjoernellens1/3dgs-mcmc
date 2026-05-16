@@ -399,35 +399,36 @@ class ReplicaFrameSource:
         width: int = 640,
         height: int = 480,
         fov_degrees: float = 70.0,
-        render_points: int = 300000,
-        splat_radius: int = 1,
+        render_points: int = 300000,   # kept for API compat; unused
+        splat_radius: int = 1,         # kept for API compat; unused
         max_frames: int = 0,
         frame_stride: int = 1,
     ):
         import math
+
         import numpy as np
-        from PIL import Image
-        from scene.readers.replica import _replica_camera_path, _render_point_splat
-        from scene.readers.common import fetchPlyFlexible
+
+        try:
+            import open3d as o3d
+            import open3d.t.geometry as o3tg
+        except ImportError:
+            raise ImportError(
+                "open3d is required for ReplicaFrameSource. "
+                "Install it with: pip install open3d"
+            )
+        from scene.readers.replica import _raycast_replica_frame, _replica_camera_path
 
         mesh_path = os.path.join(path, "mesh.ply")
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Replica mesh not found: {mesh_path}")
 
-        pcd = fetchPlyFlexible(mesh_path)
+        mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
+        mesh_t = o3tg.TriangleMesh.from_legacy(mesh_o3d)
+        scene = o3tg.RaycastingScene()
+        scene.add_triangles(mesh_t)
 
-        # Subsample for rendering speed
-        rng = np.random.default_rng(7)
-        n_pts = pcd.points.shape[0]
-        if n_pts > render_points:
-            idx = rng.choice(n_pts, size=int(render_points), replace=False)
-            pts = pcd.points[idx].astype(np.float32)
-            cols = pcd.colors[idx].astype(np.float32)
-        else:
-            pts = pcd.points.astype(np.float32)
-            cols = pcd.colors.astype(np.float32)
-
-        c2ws = _replica_camera_path(pcd.points, int(num_views))
+        vertices_np = np.asarray(mesh_o3d.vertices)
+        c2ws = _replica_camera_path(vertices_np, int(num_views))
         if frame_stride > 1:
             c2ws = c2ws[::frame_stride]
         if max_frames > 0:
@@ -440,21 +441,9 @@ class ReplicaFrameSource:
 
         self._frames: List[StreamingRGBDFrame] = []
         for idx, c2w in enumerate(c2ws):
-            # Render RGB
-            rgb_np = _render_point_splat(pts, cols, c2w, width, height, fx, fy, cx, cy, splat_radius=splat_radius)
-            rgb_img = Image.fromarray(rgb_np, mode="RGB")
-            import io as _io
-            rgb_buf = _io.BytesIO()
-            rgb_img.save(rgb_buf, format="JPEG", quality=90)
-            rgb_bytes = rgb_buf.getvalue()
-
-            # Render depth as uint16 mm PNG
-            depth_mm = _render_replica_depth(pts, c2w, width, height, fx, fy, cx, cy)
-            depth_img = Image.fromarray(depth_mm, mode="I;16")
-            depth_buf = _io.BytesIO()
-            depth_img.save(depth_buf, format="PNG")
-            depth_bytes = depth_buf.getvalue()
-
+            rgb_bytes, depth_bytes = _raycast_replica_frame(
+                scene, mesh_t, c2w, width, height, fx, fy, cx, cy
+            )
             self._frames.append(StreamingRGBDFrame(
                 index=idx,
                 timestamp=float(idx),
@@ -468,7 +457,7 @@ class ReplicaFrameSource:
                 _depth_bytes=depth_bytes,
             ))
 
-        print(f"[streaming] Replica: {len(self._frames)} synthetic frames rendered from {mesh_path}")
+        print(f"[streaming] Replica: {len(self._frames)} raycasted frames from {mesh_path}")
 
     def __len__(self) -> int:
         return len(self._frames)
@@ -478,44 +467,6 @@ class ReplicaFrameSource:
 
     def get_all(self) -> List[StreamingRGBDFrame]:
         return self._frames
-
-
-def _render_replica_depth(points, c2w, width, height, fx, fy, cx, cy):
-    """Render a uint16 depth image (mm units) from a point cloud and camera pose."""
-    import numpy as np
-    rot = c2w[:3, :3]
-    eye = c2w[:3, 3]
-    pts_cam = (points - eye) @ rot   # [N, 3]
-    z = pts_cam[:, 2]
-    valid = np.isfinite(z) & (z > 0.01) & (z < 65.535)  # max uint16 at 1mm = 65.535m
-    if not np.any(valid):
-        return np.zeros((height, width), dtype=np.uint16)
-
-    pts_cam = pts_cam[valid]
-    z_v = pts_cam[:, 2]
-    u = np.rint(fx * (pts_cam[:, 0] / z_v) + cx).astype(np.int32)
-    v = np.rint(fy * (pts_cam[:, 1] / z_v) + cy).astype(np.int32)
-    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
-
-    depth_mm = np.zeros((height, width), dtype=np.uint16)
-    if not np.any(in_bounds):
-        return depth_mm
-
-    u = u[in_bounds]
-    v = v[in_bounds]
-    z_v = z_v[in_bounds]
-    depth_vals = np.round(z_v * 1000.0).astype(np.uint32).clip(0, 65535).astype(np.uint16)
-
-    # Depth buffer: keep nearest (smallest z) per pixel
-    flat = v * width + u
-    order = np.argsort(z_v)
-    flat_s = flat[order]
-    depth_s = depth_vals[order]
-    first_idx = np.unique(flat_s, return_index=True)[1]
-    chosen_flat = flat_s[first_idx]
-    chosen_depth = depth_s[first_idx]
-    depth_mm.flat[chosen_flat] = chosen_depth
-    return depth_mm
 
 
 class HyperSimFrameSource:
