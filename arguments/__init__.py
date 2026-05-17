@@ -295,6 +295,9 @@ class StreamingParams(ParamGroup):
         self.streaming_insert_voxel_size = 0.02
         self.streaming_min_depth = 0.1
         self.streaming_max_depth = 8.0
+        # Compatibility mode: make depth insertion obey cap_max. Default False
+        # because SLAM map size is unknown and depth insertion is sensor-driven.
+        self.streaming_depth_respects_cap = False
         # Local MCMC: restrict noise/reloc to visible/active Gaussians only
         self.streaming_mcmc_local_only = True
         # Global maintenance: run full MCMC pass every N iterations (0 = never)
@@ -355,6 +358,8 @@ class StreamingParams(ParamGroup):
         self.streaming_free_space_loss_weight = 0.0
         # Depth supervision loss weight (0 = disabled)
         self.streaming_depth_loss_weight = 0.05
+        # Depth-filtering profile. "default" preserves the generic settings.
+        self.streaming_camera_profile = "default"
         # Depth loss type: "l1" or "huber"
         self.streaming_depth_loss_type = "huber"
         # H7: Freeze confirmed geometry gradients during streaming training.

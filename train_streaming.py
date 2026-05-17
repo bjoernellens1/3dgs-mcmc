@@ -24,6 +24,7 @@ import json
 import math
 import os
 import queue
+import sys
 import threading
 import time
 from argparse import Namespace
@@ -49,6 +50,75 @@ try:
     _TB = True
 except ImportError:
     _TB = False
+
+
+_STREAMING_PARAM_DEFAULTS = {
+    "streaming_min_depth": 0.1,
+    "streaming_max_depth": 8.0,
+    "streaming_depth_consistency_thresh": 0.05,
+    "streaming_depth_edge_threshold": 0.02,
+    "streaming_depth_stride": 8,
+    "streaming_depth_loss_weight": 0.05,
+    "streaming_free_space_loss_weight": 0.0,
+    "streaming_max_new_gaussians_per_frame": 1000,
+}
+
+
+_CAMERA_PROFILES = {
+    "tum_kinect_v1": {
+        # TUM RGB-D uses Kinect v1. Keep noisy-depth defaults, but reject
+        # depths outside the practical Kinect v1 operating range.
+        "streaming_min_depth": 0.4,
+        "streaming_max_depth": 3.5,
+    },
+    "kinect_v1": {
+        # Alias for non-TUM Kinect v1 RGB-D streaming runs.
+        "streaming_min_depth": 0.4,
+        "streaming_max_depth": 3.5,
+    },
+    "orbbec_femto_bolt": {
+        # Orbbec Femto Bolt: indirect ToF, <=17 mm sigma, 0.25-5.46 m range.
+        "streaming_min_depth": 0.3,
+        "streaming_max_depth": 5.0,
+        "streaming_depth_consistency_thresh": 0.03,
+        "streaming_depth_edge_threshold": 0.015,
+        "streaming_depth_stride": 4,
+        "streaming_depth_loss_weight": 0.1,
+        "streaming_free_space_loss_weight": 0.01,
+        "streaming_max_new_gaussians_per_frame": 2000,
+    },
+}
+
+
+def _cli_overrode_arg(key: str) -> bool:
+    """Return True when the current process argv includes --<key>."""
+    flag = "--" + key
+    return any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv[1:])
+
+
+def _apply_camera_profile(args) -> None:
+    """Apply known camera-profile defaults without clobbering CLI overrides."""
+    profile = getattr(args, "streaming_camera_profile", "default")
+    if profile == "default":
+        return
+
+    overrides = _CAMERA_PROFILES.get(profile)
+    if overrides is None:
+        print(f"[streaming] Warning: unknown camera profile '{profile}', ignoring.", flush=True)
+        return
+
+    applied = []
+    for key, profile_val in overrides.items():
+        current_val = getattr(args, key, None)
+        factory_val = _STREAMING_PARAM_DEFAULTS.get(key)
+        if current_val == factory_val and not _cli_overrode_arg(key):
+            setattr(args, key, profile_val)
+            applied.append(f"  {key}: {factory_val} -> {profile_val}")
+
+    if applied:
+        print(f"[streaming] Camera profile '{profile}':\n" + "\n".join(applied), flush=True)
+    else:
+        print(f"[streaming] Camera profile '{profile}': no default parameters to override.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1234,7 @@ def streaming_training(
     if run_args is None:
         raise ValueError("streaming_training() requires run_args.")
     args = run_args
+    _apply_camera_profile(args)
 
     # --- Output / logger ---------------------------------------------------
     os.makedirs(args.model_path, exist_ok=True)
@@ -1467,7 +1538,8 @@ def streaming_training(
                 if is_train and getattr(args, "streaming_insert_from_depth", True):
                     cap = getattr(args, "cap_max", -1)
                     current_n = gaussians.get_xyz.shape[0]
-                    if cap <= 0 or current_n < cap:
+                    depth_respects_cap = getattr(args, "streaming_depth_respects_cap", False)
+                    if (not depth_respects_cap) or cap <= 0 or current_n < cap:
                         # Step 4: render new_cam to get alpha/depth mask
                         with torch.no_grad():
                             pkg_new = render(new_cam, gaussians, pipe, background, render_depth=True)
@@ -1497,6 +1569,13 @@ def streaming_training(
                         if tb_writer and _insert_stats:
                             for _k, _v in _insert_stats.items():
                                 tb_writer.add_scalar(f"streaming/insertion/{_k}", _v, iteration)
+                    elif iteration % 500 == 0:
+                        print(
+                            f"[streaming] iter={iteration} frame={n_frames_ingested} "
+                            f"skipped depth insertion because N={current_n} >= cap_max={cap} "
+                            "and streaming_depth_respects_cap=True",
+                            flush=True,
+                        )
                     # Cache this frame as the previous frame for next insertion
                     _prev_insert_frame = new_frame
                     _prev_insert_depth_m = _load_depth_meters(new_frame)
