@@ -78,6 +78,55 @@ def load_frame_depth_np(frame: "StreamingRGBDFrame"):
     return np.array(Image.open(frame.depth_path))
 
 
+def _rot_to_quat(R):
+    import numpy as np
+    tr = float(np.trace(R))
+    if tr > 0.0:
+        s = np.sqrt(tr + 1.0) * 2.0
+        return np.array([
+            0.25 * s,
+            (R[2, 1] - R[1, 2]) / s,
+            (R[0, 2] - R[2, 0]) / s,
+            (R[1, 0] - R[0, 1]) / s,
+        ], dtype=np.float64)
+    i = int(np.argmax(np.diag(R)))
+    if i == 0:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        q = [((R[2, 1] - R[1, 2]) / s), 0.25 * s, ((R[0, 1] + R[1, 0]) / s), ((R[0, 2] + R[2, 0]) / s)]
+    elif i == 1:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        q = [((R[0, 2] - R[2, 0]) / s), ((R[0, 1] + R[1, 0]) / s), 0.25 * s, ((R[1, 2] + R[2, 1]) / s)]
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        q = [((R[1, 0] - R[0, 1]) / s), ((R[0, 2] + R[2, 0]) / s), ((R[1, 2] + R[2, 1]) / s), 0.25 * s]
+    q = np.asarray(q, dtype=np.float64)
+    return q / max(np.linalg.norm(q), 1e-12)
+
+def _quat_to_rot(q):
+    import numpy as np
+    q = q / max(np.linalg.norm(q), 1e-12)
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+def _slerp(q0, q1, t):
+    import numpy as np
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        out = q0 + t * (q1 - q0)
+        return out / max(np.linalg.norm(out), 1e-12)
+    theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+    theta = theta_0 * t
+    return (
+        np.sin(theta_0 - theta) * q0 + np.sin(theta) * q1
+    ) / np.sin(theta_0)
+
 class RGBDSequenceFrameSource:
     """
     Ordered frames from a generic RGB-D sequence (frames.jsonl + intrinsics.json).
@@ -812,6 +861,15 @@ class OrbbecRosBagFrameSource:
         depth_msgs: list = []    # (ts_ns, bytes)
         intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy, W, H)
 
+        def _msg_ns(msg, fallback_ns):
+            header = getattr(msg, "header", None)
+            stamp = getattr(header, "stamp", None)
+            if stamp is not None:
+                sec = getattr(stamp, "sec", getattr(stamp, "secs", 0))
+                nsec = getattr(stamp, "nanosec", getattr(stamp, "nsecs", 0))
+                return int(sec * 1e9 + nsec)
+            return fallback_ns
+
         with Reader(path) as reader:
             want = [color_topic, depth_topic, camera_info_topic]
             if pose_source == "camera_pose":
@@ -821,6 +879,7 @@ class OrbbecRosBagFrameSource:
                 topic = conn.topic
                 if topic == pose_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    msg_ts = _msg_ns(msg, ts)
                     p = msg.pose.position
                     o = msg.pose.orientation
                     qx, qy, qz, qw = o.x, o.y, o.z, o.w
@@ -832,12 +891,14 @@ class OrbbecRosBagFrameSource:
                     c2w = np.eye(4, dtype=np.float32)
                     c2w[:3, :3] = R
                     c2w[:3, 3] = [p.x, p.y, p.z]
-                    pose_msgs.append((ts, c2w))
+                    pose_msgs.append((msg_ts, c2w))
                 elif topic == color_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
-                    color_msgs.append((ts, bytes(msg.data)))
+                    msg_ts = _msg_ns(msg, ts)
+                    color_msgs.append((msg_ts, bytes(msg.data)))
                 elif topic == depth_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    msg_ts = _msg_ns(msg, ts)
                     fmt = getattr(msg, "format", "")
                     if fmt and "png" not in fmt.lower() and "16uc1" not in fmt.lower():
                         raise RuntimeError(
@@ -845,7 +906,7 @@ class OrbbecRosBagFrameSource:
                             "expected lossless PNG/16UC1, not JPEG. "
                             "JPEG-compressed depth corrupts metric values."
                         )
-                    depth_msgs.append((ts, bytes(msg.data)))
+                    depth_msgs.append((msg_ts, bytes(msg.data)))
                 elif topic == camera_info_topic and intrinsics is None:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     K = msg.k  # row-major 3×3
@@ -1225,50 +1286,13 @@ class OrbbecRosBagFrameSource:
             )
 
         def rot_to_quat(R):
-            tr = float(np.trace(R))
-            if tr > 0.0:
-                s = np.sqrt(tr + 1.0) * 2.0
-                return np.array([
-                    0.25 * s,
-                    (R[2, 1] - R[1, 2]) / s,
-                    (R[0, 2] - R[2, 0]) / s,
-                    (R[1, 0] - R[0, 1]) / s,
-                ], dtype=np.float64)
-            i = int(np.argmax(np.diag(R)))
-            if i == 0:
-                s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-                q = [((R[2, 1] - R[1, 2]) / s), 0.25 * s, ((R[0, 1] + R[1, 0]) / s), ((R[0, 2] + R[2, 0]) / s)]
-            elif i == 1:
-                s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-                q = [((R[0, 2] - R[2, 0]) / s), ((R[0, 1] + R[1, 0]) / s), 0.25 * s, ((R[1, 2] + R[2, 1]) / s)]
-            else:
-                s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-                q = [((R[1, 0] - R[0, 1]) / s), ((R[0, 2] + R[2, 0]) / s), ((R[1, 2] + R[2, 1]) / s), 0.25 * s]
-            q = np.asarray(q, dtype=np.float64)
-            return q / max(np.linalg.norm(q), 1e-12)
+            return _rot_to_quat(R)
 
         def quat_to_rot(q):
-            q = q / max(np.linalg.norm(q), 1e-12)
-            w, x, y, z = q
-            return np.array([
-                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-            ], dtype=np.float64)
+            return _quat_to_rot(q)
 
         def slerp(q0, q1, t):
-            dot = float(np.dot(q0, q1))
-            if dot < 0.0:
-                q1 = -q1
-                dot = -dot
-            if dot > 0.9995:
-                out = q0 + t * (q1 - q0)
-                return out / max(np.linalg.norm(out), 1e-12)
-            theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
-            theta = theta_0 * t
-            return (
-                np.sin(theta_0 - theta) * q0 + np.sin(theta) * q1
-            ) / np.sin(theta_0)
+            return _slerp(q0, q1, t)
 
         key_poses = [np.eye(4, dtype=np.float32)]
         prev_rgbd = to_rgbd(synced_frames[key_indices[0]][1], synced_frames[key_indices[0]][2])
@@ -1443,19 +1467,18 @@ class OrbbecRosBagFrameSource:
         )
         jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
 
-        target = min(index, len(self._frames) - 1)
+        target = index
+        if target > self._live_odom_stride and target % self._live_odom_stride != 0:
+            target = ((target + self._live_odom_stride - 1) // self._live_odom_stride) * self._live_odom_stride
+        target = min(target, len(self._frames) - 1)
+
         for idx in range(self._live_odom_computed_idx + 1, target + 1):
-            prev_pose = self._frames[idx - 1].c2w
-            # Bootstrap needs real baseline between the first few frames. After
-            # that, only run the configured fast-preset keyframe odometry.
             should_estimate = (
                 idx <= self._live_odom_stride
                 or (idx % self._live_odom_stride) == 0
                 or idx == len(self._frames) - 1
             )
             if not should_estimate:
-                self._frames[idx].c2w = prev_pose.copy()
-                self._live_odom_computed_idx = idx
                 continue
 
             curr_rgbd = self._live_odom_to_rgbd(self._frames[idx])
@@ -1468,20 +1491,29 @@ class OrbbecRosBagFrameSource:
                 option,
             )
             self._live_odom_pairs += 1
+            key_pose = self._frames[self._live_odom_prev_key_idx].c2w
             if success:
-                key_pose = self._frames[self._live_odom_prev_key_idx].c2w
-                self._frames[idx].c2w = (key_pose @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32)
-                self._live_odom_prev_key_idx = idx
-                self._live_odom_prev_key_rgbd = curr_rgbd
+                curr_pose = (key_pose @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32)
                 self._live_odom_successes += 1
             else:
-                self._frames[idx].c2w = prev_pose.copy()
-                # Always advance the reference frame even on failure so the next
-                # comparison stays bounded at one frame of gap rather than growing
-                # unboundedly (stale reference → cascade of increasingly hard matches).
-                self._live_odom_prev_key_idx = idx
-                self._live_odom_prev_key_rgbd = curr_rgbd
+                curr_pose = key_pose.copy()
                 self._live_odom_failures += 1
+
+            self._frames[idx].c2w = curr_pose
+
+            if idx > self._live_odom_prev_key_idx + 1:
+                qa = _rot_to_quat(key_pose[:3, :3])
+                qb = _rot_to_quat(curr_pose[:3, :3])
+                for i in range(self._live_odom_prev_key_idx + 1, idx):
+                    alpha = (i - self._live_odom_prev_key_idx) / float(idx - self._live_odom_prev_key_idx)
+                    pose = np.eye(4, dtype=np.float64)
+                    pose[:3, :3] = _quat_to_rot(_slerp(qa, qb, alpha))
+                    pose[:3, 3] = (1.0 - alpha) * key_pose[:3, 3] + alpha * curr_pose[:3, 3]
+                    self._frames[i].c2w = pose.astype(np.float32)
+
+            self._live_odom_prev_key_idx = idx
+            self._live_odom_prev_key_rgbd = curr_rgbd
+            
             failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
             if failure_ratio > self._live_odom_max_failure_ratio:
                 raise RuntimeError(
