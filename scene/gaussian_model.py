@@ -580,11 +580,18 @@ class GaussianModel:
         rotations: torch.Tensor = None,
         is_provisional: bool = False,
         birth_frame: int = 0,
+        opacities_raw: torch.Tensor = None,
+        sh_rest: torch.Tensor = None,
     ) -> int:
         """
         Append new Gaussians initialised from 3-D world-space points and RGB
         colours (float32, range [0, 1]).  Extends the optimizer with
         zero-initialised momentum state for the new entries.
+
+        opacities_raw: pre-logit opacity tensor shape (N,) or (N,1). When provided,
+        bypasses init_opacity.
+        sh_rest: higher-order SH coefficients shape (N, R-1, 3) in legacy transposed
+        layout (N, num_sh-1, 3). When provided, bypasses zeros init.
 
         use_knn_scale: derive per-Gaussian scale from k-NN distance (matches
         bootstrap quality); falls back to fixed init_scale when False.
@@ -597,17 +604,34 @@ class GaussianModel:
 
         from utils.sh_utils import RGB2SH
         fused_color = RGB2SH(colors.to(device="cuda", dtype=torch.float32))
+        num_sh = (self.max_sh_degree + 1) ** 2
         features = torch.zeros(
-            (N, 3, (self.max_sh_degree + 1) ** 2), device="cuda", dtype=torch.float32
+            (N, 3, num_sh), device="cuda", dtype=torch.float32
         )
         features[:, :3, 0] = fused_color
 
         new_xyz = points.to(device="cuda", dtype=torch.float32)
         new_f_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
-        new_f_rest = features[:, :, 1:].transpose(1, 2).contiguous()
-        new_opacities = inverse_sigmoid(
-            torch.full((N, 1), float(init_opacity), device="cuda", dtype=torch.float32)
-        )
+
+        if sh_rest is not None:
+            # sh_rest expected as (N, R-1, 3); convert to legacy (N, 3, R-1) then transpose
+            sr = sh_rest.to(device="cuda", dtype=torch.float32)
+            if sr.shape[1] != num_sh - 1:
+                padded = torch.zeros((N, num_sh - 1, 3), device="cuda")
+                copy_len = min(sr.shape[1], num_sh - 1)
+                padded[:, :copy_len, :] = sr[:, :copy_len, :]
+                sr = padded
+            # Legacy layout: _features_rest is (N, R-1, 3) — match that directly
+            new_f_rest = sr.contiguous()
+        else:
+            new_f_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+
+        if opacities_raw is not None:
+            new_opacities = opacities_raw.to(device="cuda", dtype=torch.float32).reshape(N, 1)
+        else:
+            new_opacities = inverse_sigmoid(
+                torch.full((N, 1), float(init_opacity), device="cuda", dtype=torch.float32)
+            )
 
         if scales is not None:
             new_scaling = scales.to(device="cuda", dtype=torch.float32)

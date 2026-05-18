@@ -375,12 +375,17 @@ def insert_gaussians_from_frame(
     render_alpha: Optional[torch.Tensor] = None,
     render_depth: Optional[torch.Tensor] = None,
     current_frame_idx: int = 0,
+    _collect_only: bool = False,
 ) -> tuple:
     """
     Phase 2: backproject an RGB-D frame, voxel-filter, remove already-covered
     regions, and append new Gaussians as surface-aligned surfels.
 
-    Returns (n_inserted, stats_dict). stats_dict tracks per-filter-step counts.
+    When _collect_only=True, returns (candidates_dict, stats_dict) where
+    candidates_dict holds the pre-commit numpy arrays (pts, cols, log_scales,
+    q_world, birth_frame) WITHOUT calling add_points_as_gaussians or updating
+    the occupancy hash.  The caller is responsible for committing the batch.
+    When False (default), returns (n_inserted, stats_dict) as before.
     """
     from utils.rgbd_frames import depth_to_meters
     from PIL import Image as _Image
@@ -604,6 +609,20 @@ def insert_gaussians_from_frame(
     if _debug:
         _stats["after_per_frame_cap"] = pts.shape[0]
 
+    if _collect_only:
+        # Return candidates without committing — caller will batch-flush.
+        candidates = {
+            "pts": pts,
+            "cols": cols,
+            "log_scales": log_scales,
+            "q_world": q_world,
+            "birth_frame": current_frame_idx,
+            "init_opacity": init_opacity,
+        }
+        if _debug:
+            _stats["collected"] = pts.shape[0]
+        return candidates, _stats
+
     added = gaussians.add_points_as_gaussians(
         torch.from_numpy(pts),
         torch.from_numpy(cols),
@@ -618,6 +637,53 @@ def insert_gaussians_from_frame(
     if _debug:
         _stats["inserted"] = added
     return added, _stats
+
+
+def _flush_insertion_batch(
+    pending: list,
+    gaussians,
+    streaming_scene: "StreamingScene",
+    iteration: int,
+    args,
+) -> int:
+    """
+    Commit a batch of pending insertion candidates collected via _collect_only=True.
+    Concatenates all candidates and calls add_points_as_gaussians once.
+    Returns the number of Gaussians actually added.
+    """
+    if not pending:
+        return 0
+
+    all_pts = np.concatenate([p["pts"] for p in pending], axis=0)
+    all_cols = np.concatenate([p["cols"] for p in pending], axis=0)
+    all_scales = np.concatenate([p["log_scales"] for p in pending], axis=0)
+    all_quats = np.concatenate([p["q_world"] for p in pending], axis=0)
+    # birth_frame: use the most common value (middle of batch) — per-point would
+    # need a buffer extension, but batch granularity is fine for lifecycle.
+    birth_frame_val = pending[len(pending) // 2]["birth_frame"]
+    init_opacity = pending[0]["init_opacity"]
+
+    max_new = getattr(args, "streaming_max_new_gaussians_per_frame", 2000) * len(pending)
+    if max_new > 0 and all_pts.shape[0] > max_new:
+        rng = np.random.default_rng(iteration)
+        idx = rng.choice(all_pts.shape[0], size=max_new, replace=False)
+        all_pts, all_cols = all_pts[idx], all_cols[idx]
+        all_scales, all_quats = all_scales[idx], all_quats[idx]
+
+    added = gaussians.add_points_as_gaussians(
+        torch.from_numpy(all_pts),
+        torch.from_numpy(all_cols),
+        init_opacity=init_opacity,
+        scales=torch.from_numpy(all_scales),
+        rotations=torch.from_numpy(all_quats),
+        is_provisional=True,
+        birth_frame=birth_frame_val,
+    )
+    if added > 0:
+        streaming_scene.add_to_occupancy_hash(gaussians.get_xyz[-added:])
+        if hasattr(gaussians, "anchor_iter"):
+            gaussians.anchor_iter[-added:] = iteration
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -1187,19 +1253,25 @@ def _run_submap_stitch(
     # --- Merge submaps into global model -----------------------------------
     print(f"[submap] Merging {len(all_gaussian_params)} submaps into global model...", flush=True)
 
-    # Use the pre-built gaussians object; extend it with all submap data
+    # Use the pre-built gaussians object; extend it with all submap data.
+    # Pass opacities_raw and sh_rest so trained submap values are preserved
+    # instead of being overwritten with init_opacity=0.3 / zero shN.
+    from utils.sh_utils import SH2RGB
     for sm_params in all_gaussian_params:
         pts   = sm_params["means"].to("cuda")
         cols  = sm_params["sh0"].squeeze(1).to("cuda")  # (N,3) SH DC
-        # Convert SH DC back to approximate RGB for add_points_as_gaussians API
-        from utils.sh_utils import SH2RGB
         rgb_approx = SH2RGB(cols).clamp(0, 1)
         log_scales = sm_params["scales"].to("cuda")
         quats = sm_params["quats"].to("cuda")
+        raw_opacities = sm_params["opacities"].to("cuda").reshape(-1)  # (N,) pre-logit
+        sh_rest_t = sm_params.get("shN", None)
+        if sh_rest_t is not None:
+            sh_rest_t = sh_rest_t.to("cuda")
         gaussians.add_points_as_gaussians(
             pts, rgb_approx,
             scales=log_scales, rotations=quats,
-            init_opacity=0.3,
+            opacities_raw=raw_opacities,
+            sh_rest=sh_rest_t,
             is_provisional=False, birth_frame=0,
         )
 
@@ -1494,6 +1566,11 @@ def streaming_training(
     total_inserted = 0
     _prev_insert_frame = None       # previous frame for depth consistency check
     _prev_insert_depth_m = None     # depth map (metres) for previous frame
+    # Phase 4.1: pending batch insertion buffer
+    _insertion_batch: list = []     # list of candidate dicts from _collect_only calls
+    _insertion_batch_frames: int = 0  # frames accumulated since last flush
+    _batch_frames = max(1, int(getattr(args, "streaming_insertion_batch_frames", 1)))
+    _batch_max_pts = int(getattr(args, "streaming_insertion_batch_max_points", 8000))
     depth_loss_weight = getattr(args, "streaming_depth_loss_weight", 0.0)
     use_depth_loss = depth_loss_weight > 0
     depth_loss_type = getattr(args, "streaming_depth_loss_type", "l1")
@@ -1506,8 +1583,11 @@ def streaming_training(
     _colors_only    = _training_mode == "colors_only"       # H2: geometry frozen, SH trains
     _skip_mcmc      = _placement_only or _colors_only
     if _colors_only:
+        # Freeze geometry params under both gsplat and legacy model layouts.
+        _geom_names_gsplat = {"means", "scales", "quats", "opacities"}
+        _geom_names_legacy = {"xyz", "scaling", "rotation", "opacity"}
         for _pg in gaussians.optimizer.param_groups:
-            if _pg.get("name") in ("means", "scales", "quats", "opacities"):
+            if _pg.get("name") in _geom_names_gsplat | _geom_names_legacy:
                 _pg["lr"] = 0.0
         gaussians.xyz_scheduler_args = lambda _step: 0.0
     if _training_mode == "submap_stitch":
@@ -1628,31 +1708,30 @@ def streaming_training(
     # render the SAME views with the trained Gaussians for a direct diff.
     _bootstrap_cams = list(streaming_scene.getTrainCameras())
 
-    # Pre-training snapshot: render the post-bootstrap state through the
-    # bootstrap cameras themselves (no holdout exists yet — those frames
-    # are only added as cameras stream in).
-    try:
-        from utils.comparison_report import write_post_training_report
-        print(
-            f"[streaming] Bootstrap (post-init) report at iter_0 over "
-            f"{len(_bootstrap_cams)} bootstrap views...",
-            flush=True,
-        )
-        write_post_training_report(
-            model_path=args.model_path,
-            iteration=0,
-            gaussians=gaussians,
-            train_cams=_bootstrap_cams,
-            test_cams=_bootstrap_cams,
-            render_fn=render,
-            pipe=pipe,
-            background=background,
-            tb_writer=tb_writer,
-            log_prefix="streaming_report",
-            subdir="iter_0_bootstrap_views",
-        )
-    except Exception as e:
-        print(f"[streaming-report] pre-training report failed: {e}", flush=True)
+    # Pre-training snapshot: render the post-bootstrap state (opt-in; adds startup overhead)
+    if getattr(args, "streaming_report_pre_training", False):
+        try:
+            from utils.comparison_report import write_post_training_report
+            print(
+                f"[streaming] Bootstrap (post-init) report at iter_0 over "
+                f"{len(_bootstrap_cams)} bootstrap views...",
+                flush=True,
+            )
+            write_post_training_report(
+                model_path=args.model_path,
+                iteration=0,
+                gaussians=gaussians,
+                train_cams=_bootstrap_cams,
+                test_cams=_bootstrap_cams,
+                render_fn=render,
+                pipe=pipe,
+                background=background,
+                tb_writer=tb_writer,
+                log_prefix="streaming_report",
+                subdir="iter_0_bootstrap_views",
+            )
+        except Exception as e:
+            print(f"[streaming-report] pre-training report failed: {e}", flush=True)
 
     progress_bar = tqdm(
         range(first_iter, opt.iterations),
@@ -1735,7 +1814,8 @@ def streaming_training(
                                     _sensor_d,
                                 )
 
-                        added, _insert_stats = insert_gaussians_from_frame(
+                        _use_batch = _batch_frames > 1
+                        cands_or_n, _insert_stats = insert_gaussians_from_frame(
                             gaussians, new_frame, args,
                             streaming_scene=streaming_scene,
                             prev_frame=_prev_insert_frame,
@@ -1743,10 +1823,26 @@ def streaming_training(
                             render_alpha=alpha_new,
                             render_depth=depth_new,
                             current_frame_idx=n_frames_ingested,
+                            _collect_only=_use_batch,
                         )
-                        # H9: record insertion iteration for anchor-loss decay
-                        if added > 0 and hasattr(gaussians, "anchor_iter"):
-                            gaussians.anchor_iter[-added:] = iteration
+                        if _use_batch:
+                            # Accumulate; flush when batch is full
+                            if isinstance(cands_or_n, dict) and cands_or_n.get("pts") is not None and cands_or_n["pts"].shape[0] > 0:
+                                _insertion_batch.append(cands_or_n)
+                            _insertion_batch_frames += 1
+                            _pending_pts = sum(c["pts"].shape[0] for c in _insertion_batch)
+                            if _insertion_batch_frames >= _batch_frames or _pending_pts >= _batch_max_pts:
+                                added = _flush_insertion_batch(
+                                    _insertion_batch, gaussians, streaming_scene, iteration, args)
+                                _insertion_batch = []
+                                _insertion_batch_frames = 0
+                            else:
+                                added = 0
+                        else:
+                            added = cands_or_n
+                            # H9: record insertion iteration for anchor-loss decay (non-batch path)
+                            if added > 0 and hasattr(gaussians, "anchor_iter"):
+                                gaussians.anchor_iter[-added:] = iteration
                         total_inserted += added
                         if added > 0 and (iteration % 100 == 0 or added > 1000):
                             print(
@@ -2458,6 +2554,13 @@ def streaming_training(
             print(f"[streaming] training_progress.mp4 → {_prog_path}", flush=True)
         else:
             print(f"[streaming] training_progress.mp4 FAILED: {_err}", flush=True)
+
+    # Flush any remaining pending batch insertions
+    if _insertion_batch:
+        _remaining = _flush_insertion_batch(
+            _insertion_batch, gaussians, streaming_scene, args.iterations, args)
+        if _remaining > 0:
+            print(f"[streaming] End-of-training batch flush: inserted {_remaining} Gaussians", flush=True)
 
     _signal.signal(_signal.SIGINT, _orig_sigint)
     save_worker.shutdown()

@@ -457,6 +457,8 @@ class GsplatGaussianModel:
         rotations: torch.Tensor = None,
         is_provisional: bool = False,
         birth_frame: int = 0,
+        opacities_raw: torch.Tensor = None,
+        sh_rest: torch.Tensor = None,
     ) -> int:
         """
         Append new Gaussians initialised from 3-D world-space points and RGB
@@ -498,13 +500,29 @@ class GsplatGaussianModel:
                 torch.zeros(N, 3, device="cuda"),
             ], dim=1)
 
+        if sh_rest is not None:
+            sh_rest_t = sh_rest.to(device="cuda", dtype=torch.float32)
+            if sh_rest_t.shape != (N, num_sh - 1, 3):
+                # Pad or truncate to match current max_sh_degree
+                padded = torch.zeros((N, num_sh - 1, 3), device="cuda")
+                copy_len = min(sh_rest_t.shape[1], num_sh - 1)
+                padded[:, :copy_len, :] = sh_rest_t[:, :copy_len, :]
+                sh_rest_t = padded
+        else:
+            sh_rest_t = torch.zeros((N, num_sh - 1, 3), device="cuda")
+
+        if opacities_raw is not None:
+            opacities_t = opacities_raw.to(device="cuda", dtype=torch.float32).reshape(N)
+        else:
+            opacities_t = inverse_sigmoid(torch.full((N,), float(init_opacity), device="cuda"))
+
         new_tensors = {
             "means": points.to(device="cuda", dtype=torch.float32).contiguous(),
             "sh0": fused_color[:, None, :].contiguous(),                          # (N, 1, 3)
-            "shN": torch.zeros((N, num_sh - 1, 3), device="cuda"),                # (N, R-1, 3)
+            "shN": sh_rest_t,                                                     # (N, R-1, 3)
             "scales": log_scales,
             "quats": new_quats,
-            "opacities": inverse_sigmoid(torch.full((N,), float(init_opacity), device="cuda")),
+            "opacities": opacities_t,
         }
 
         for name, ext in new_tensors.items():

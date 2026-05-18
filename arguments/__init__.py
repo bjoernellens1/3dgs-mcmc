@@ -266,7 +266,7 @@ class OptimizationParams(ParamGroup):
         self.record_video_preset = "veryfast"
         # Training-progress video: render a fixed camera every N iters,
         # write training_progress.mp4 at end of training.
-        self.progress_video_interval = 200   # 0 = disabled
+        self.progress_video_interval = 0     # 0 = disabled (default off; enable with --progress_video_interval 200)
         self.progress_video_fps = 10         # output FPS
         self.scalar_log_interval = 100
         self.geometry_log_interval = 500
@@ -344,6 +344,9 @@ class StreamingParams(ParamGroup):
         self.streaming_promote_opacity = 0.3      # opacity boost on promotion
         # Save renders at frame-PLY save milestones (opt-in to avoid overhead)
         self.streaming_render_at_saves = False
+        # Pre-training bootstrap snapshot: render bootstrap views before training starts
+        # and write to iter_0_bootstrap_views/ (opt-in; adds overhead on startup)
+        self.streaming_report_pre_training = False
         # Freeze bootstrap Gaussians (birth_frame==0) from MCMC noise displacement.
         # After each step_post_backward, their positions are restored to the pre-noise
         # values. Tests whether position displacement of early Gaussians causes forgetting.
