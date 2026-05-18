@@ -1062,6 +1062,11 @@ class OrbbecRosBagFrameSource:
         self._live_odom_computed_idx = -1
         self._live_odom_prev_key_idx = 0
         self._live_odom_prev_key_rgbd = None
+        # Constant-velocity prior: reuse last successful relative transform as
+        # the init guess for the next frame instead of identity.  Reset to None
+        # on failure so a bad estimate doesn't compound.
+        self._live_odom_last_trans: np.ndarray | None = None
+        self._live_odom_last_n_edges: int = 1
         self._live_odom_cache_path = None
         self._live_odom_cache_key = None
         self._live_odom_cache_enabled = bool(open3d_odom_cache)
@@ -1497,11 +1502,29 @@ class OrbbecRosBagFrameSource:
                 continue
 
             curr_rgbd = self._live_odom_to_rgbd(self._frames[idx])
+            # Constant-velocity prior: use the last successful relative transform
+            # as the initial guess instead of identity.  This dramatically improves
+            # convergence when the camera starts moving from rest, reducing the
+            # "double edge" artifact at depth discontinuities during motion onset.
+            # Scale by the number of elapsed frames so the prediction is correct
+            # for variable stride (for stride=1 last_trans is used as-is).
+            if self._live_odom_last_trans is not None:
+                n_prev = max(1, self._live_odom_last_n_edges)
+                n_curr = max(1, idx - self._live_odom_prev_key_idx)
+                if n_curr == n_prev:
+                    init_guess = self._live_odom_last_trans.copy()
+                else:
+                    # Scale translation proportionally; rotation stays same direction
+                    T = self._live_odom_last_trans.copy()
+                    T[:3, 3] *= float(n_curr) / float(n_prev)
+                    init_guess = T
+            else:
+                init_guess = np.eye(4, dtype=np.float64)
             success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
                 self._live_odom_prev_key_rgbd,
                 curr_rgbd,
                 intrinsic,
-                np.eye(4, dtype=np.float64),
+                init_guess,
                 jacobian,
                 option,
             )
@@ -1530,6 +1553,9 @@ class OrbbecRosBagFrameSource:
                 curr_pose = (key_pose @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32)
                 self._frames[idx]._odom_valid = True
                 self._live_odom_successes += 1
+                # Update constant-velocity prior with the successful transform
+                self._live_odom_last_trans = trans_prev_to_curr.copy()
+                self._live_odom_last_n_edges = max(1, idx - self._live_odom_prev_key_idx)
             else:
                 # Phase 2.2: on failure, keep the previous key pose but do NOT advance
                 # the odometry reference — the next estimate will still compare against
@@ -1539,6 +1565,8 @@ class OrbbecRosBagFrameSource:
                 self._frames[idx].c2w = curr_pose
                 self._frames[idx]._odom_valid = False
                 self._live_odom_failures += 1
+                # Reset the velocity prior so a bad estimate doesn't compound
+                self._live_odom_last_trans = None
                 failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
                 if failure_ratio > self._live_odom_max_failure_ratio:
                     raise RuntimeError(
