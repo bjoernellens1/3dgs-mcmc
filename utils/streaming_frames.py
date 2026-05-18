@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, List, Optional
 
 
@@ -386,8 +387,7 @@ class ReplicaFrameSource:
 
     Generates a virtual camera trajectory around the mesh using the same
     `_replica_camera_path` as the offline Replica reader, then renders RGB
-    and depth images using software point-splatting so no GPU / habitat-sim
-    is required at dataset-loading time.
+    and depth images using Open3D raycasting over a triangulated Replica mesh.
 
     depth_scale=1000.0 — depth stored as uint16 mm in _depth_bytes.
     """
@@ -421,19 +421,21 @@ class ReplicaFrameSource:
                 "open3d is required for ReplicaFrameSource. "
                 "Install it with: pip install open3d"
             )
-        from scene.readers.replica import _raycast_replica_frame, _replica_camera_path
+        from scene.readers.replica import (
+            _load_replica_raycast_mesh,
+            _raycast_replica_frame,
+            _replica_raycast_camera_path,
+        )
 
         mesh_path = os.path.join(path, "mesh.ply")
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Replica mesh not found: {mesh_path}")
 
-        mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
-        mesh_t = o3tg.TriangleMesh.from_legacy(mesh_o3d)
+        vertices_np, mesh_t = _load_replica_raycast_mesh(mesh_path)
         scene = o3tg.RaycastingScene()
         scene.add_triangles(mesh_t)
 
-        vertices_np = np.asarray(mesh_o3d.vertices)
-        c2ws = _replica_camera_path(vertices_np, int(num_views))
+        c2ws = _replica_raycast_camera_path(scene, vertices_np, int(num_views), fov_degrees=fov_degrees)
         if frame_stride > 1:
             c2ws = c2ws[::frame_stride]
         if max_frames > 0:
@@ -451,7 +453,7 @@ class ReplicaFrameSource:
             )
             self._frames.append(StreamingRGBDFrame(
                 index=idx,
-                timestamp=float(idx),
+                timestamp=float(idx) / 30.0,
                 rgb_path="",
                 depth_path=None,
                 c2w=c2w.astype(np.float32),
@@ -462,7 +464,10 @@ class ReplicaFrameSource:
                 _depth_bytes=depth_bytes,
             ))
 
-        print(f"[streaming] Replica: {len(self._frames)} raycasted frames from {mesh_path}")
+        print(
+            f"[streaming] Replica: {len(self._frames)} raycasted frames from triangulated {mesh_path} "
+            f"(vertices={len(vertices_np)})"
+        )
 
     def __len__(self) -> int:
         return len(self._frames)
@@ -754,10 +759,16 @@ class OrbbecRosBagFrameSource:
         color_topic: str = "/camera/color/image_raw/compressed",
         depth_topic: str = "/camera/depth/image_raw/compressed",
         pose_topic: str = "/camera_pose",
+        pose_source: str = "camera_pose",
         camera_info_topic: str = "/camera/color/camera_info",
         sync_threshold_ms: float = 33.0,
         max_frames: int = 0,
         frame_stride: int = 1,
+        open3d_odom_max_failure_ratio: float = 0.25,
+        open3d_odom_cache: bool = True,
+        open3d_odom_cache_dir: str = "",
+        open3d_odom_stride: int = 1,
+        open3d_odom_downscale: int = 1,
     ):
         try:
             from rosbags.rosbag2 import Reader
@@ -771,16 +782,28 @@ class OrbbecRosBagFrameSource:
 
         typestore = get_typestore(Stores.ROS2_HUMBLE)
         sync_ns = int(sync_threshold_ms * 1e6)
+        pose_source = str(pose_source or "camera_pose")
+        open3d_odom_stride = max(1, int(open3d_odom_stride))
+        open3d_odom_downscale = max(1, int(open3d_odom_downscale))
+        if pose_source not in {"camera_pose", "auto", "open3d_odometry", "open3d_odometry_live"}:
+            raise ValueError(
+                "orbbec_pose_source must be one of: camera_pose, auto, open3d_odometry, "
+                "open3d_odometry_live "
+                f"(got '{pose_source}')"
+            )
 
-        # First pass: check /camera_pose exists
+        # First pass: inspect topics and choose the pose source.
         with Reader(path) as reader:
             topics = {c.topic for c in reader.connections}
-        if pose_topic not in topics:
+        has_pose_topic = pose_topic in topics
+        if pose_source == "auto":
+            pose_source = "camera_pose" if has_pose_topic else "open3d_odometry_live"
+        if pose_source == "camera_pose" and not has_pose_topic:
             raise ValueError(
                 f"[streaming] OrbbecRosBagFrameSource: no '{pose_topic}' topic found in {path}.\n"
                 f"  Available topics: {sorted(topics)}\n"
-                "  Only slam bags (with /camera_pose) are supported. "
-                "Navigation bags do not provide camera poses."
+                "  Pass --orbbec_pose_source open3d_odometry_live to estimate poses from RGB-D, "
+                "or --orbbec_pose_source auto to use /camera_pose when present and Open3D otherwise."
             )
 
         # Read all messages in one pass
@@ -790,7 +813,9 @@ class OrbbecRosBagFrameSource:
         intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy, W, H)
 
         with Reader(path) as reader:
-            want = [color_topic, depth_topic, pose_topic, camera_info_topic]
+            want = [color_topic, depth_topic, camera_info_topic]
+            if pose_source == "camera_pose":
+                want.append(pose_topic)
             conns = [c for c in reader.connections if c.topic in want]
             for conn, ts, data in reader.messages(connections=conns):
                 topic = conn.topic
@@ -813,6 +838,13 @@ class OrbbecRosBagFrameSource:
                     color_msgs.append((ts, bytes(msg.data)))
                 elif topic == depth_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
+                    fmt = getattr(msg, "format", "")
+                    if fmt and "png" not in fmt.lower() and "16uc1" not in fmt.lower():
+                        raise RuntimeError(
+                            f"Depth topic '{depth_topic}' has format '{fmt}' — "
+                            "expected lossless PNG/16UC1, not JPEG. "
+                            "JPEG-compressed depth corrupts metric values."
+                        )
                     depth_msgs.append((ts, bytes(msg.data)))
                 elif topic == camera_info_topic and intrinsics is None:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
@@ -826,21 +858,30 @@ class OrbbecRosBagFrameSource:
         if intrinsics is None:
             raise RuntimeError(f"No '{camera_info_topic}' messages found in {path}")
         fx, fy, cx, cy, width, height = intrinsics
+        self._fx = fx
+        self._fy = fy
+        self._cx = cx
+        self._cy = cy
+        self._width = width
+        self._height = height
+        self._depth_scale = 1000.0
 
         # Build sorted timestamp arrays for O(log n) nearest-neighbour sync
         pose_ts = np.array([m[0] for m in pose_msgs], dtype=np.int64)
         depth_ts = np.array([m[0] for m in depth_msgs], dtype=np.int64)
 
-        self._frames: List[StreamingRGBDFrame] = []
+        synced: list = []
         for i, (color_ts, rgb_bytes) in enumerate(color_msgs[::frame_stride]):
-            # Find closest pose
-            pi = int(np.searchsorted(pose_ts, color_ts))
-            pi = min(pi, len(pose_ts) - 1)
-            if pi > 0 and abs(pose_ts[pi - 1] - color_ts) < abs(pose_ts[pi] - color_ts):
-                pi -= 1
-            if abs(pose_ts[pi] - color_ts) > sync_ns:
-                continue
-            c2w = pose_msgs[pi][1]
+            c2w = None
+            if pose_source == "camera_pose":
+                # Find closest pose
+                pi = int(np.searchsorted(pose_ts, color_ts))
+                pi = min(pi, len(pose_ts) - 1)
+                if pi > 0 and abs(pose_ts[pi - 1] - color_ts) < abs(pose_ts[pi] - color_ts):
+                    pi -= 1
+                if abs(pose_ts[pi] - color_ts) > sync_ns:
+                    continue
+                c2w = pose_msgs[pi][1]
 
             # Find closest depth
             di = int(np.searchsorted(depth_ts, color_ts))
@@ -850,7 +891,77 @@ class OrbbecRosBagFrameSource:
             depth_bytes: Optional[bytes] = None
             if abs(depth_ts[di] - color_ts) <= sync_ns:
                 depth_bytes = depth_msgs[di][1]
+            if depth_bytes is None:
+                continue
+            synced.append((color_ts, rgb_bytes, depth_bytes, c2w))
+            if max_frames > 0 and len(synced) >= max_frames:
+                break
 
+        if pose_source == "open3d_odometry":
+            cache_key = self._open3d_odom_cache_key(
+                path=path,
+                color_topic=color_topic,
+                depth_topic=depth_topic,
+                camera_info_topic=camera_info_topic,
+                sync_threshold_ms=sync_threshold_ms,
+                frame_stride=frame_stride,
+                max_frames=max_frames,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                width=width,
+                height=height,
+                synced=synced,
+                odom_stride=open3d_odom_stride,
+                odom_downscale=open3d_odom_downscale,
+                mode="precompute",
+            )
+            cache_path = self._open3d_odom_cache_path(
+                bag_path=path,
+                cache_dir=open3d_odom_cache_dir,
+                cache_key=cache_key,
+            )
+            odom_poses = None
+            odom_stats = None
+            if open3d_odom_cache:
+                odom_poses, odom_stats = self._load_open3d_odom_cache(
+                    cache_path,
+                    cache_key,
+                    expected_frames=len(synced),
+                )
+            if odom_poses is None:
+                odom_poses, odom_stats = self._estimate_open3d_odometry(
+                    synced,
+                    fx=fx,
+                    fy=fy,
+                    cx=cx,
+                    cy=cy,
+                    width=width,
+                    height=height,
+                    depth_scale=1000.0,
+                    max_failure_ratio=open3d_odom_max_failure_ratio,
+                    odom_stride=open3d_odom_stride,
+                    odom_downscale=open3d_odom_downscale,
+                )
+                if open3d_odom_cache:
+                    self._save_open3d_odom_cache(cache_path, cache_key, odom_poses, odom_stats)
+            synced = [
+                (color_ts, rgb_bytes, depth_bytes, odom_poses[idx])
+                for idx, (color_ts, rgb_bytes, depth_bytes, _) in enumerate(synced)
+            ]
+            path_len = odom_stats["path_length"]
+            bbox_min = odom_stats["bbox_min"]
+            bbox_max = odom_stats["bbox_max"]
+            print(
+                "[streaming] OrbbecRosBag: pose_source=open3d_odometry "
+                f"success={odom_stats['successes']} failures={odom_stats['failures']} "
+                f"path_length={path_len:.3f}m camera_bbox={bbox_min}->{bbox_max} "
+                f"stride={open3d_odom_stride} downscale={open3d_odom_downscale}"
+            )
+
+        self._frames: List[StreamingRGBDFrame] = []
+        for color_ts, rgb_bytes, depth_bytes, c2w in synced:
             self._frames.append(StreamingRGBDFrame(
                 index=len(self._frames),
                 timestamp=float(color_ts) * 1e-9,
@@ -863,22 +974,555 @@ class OrbbecRosBagFrameSource:
                 _rgb_bytes=rgb_bytes,
                 _depth_bytes=depth_bytes,
             ))
-            if max_frames > 0 and len(self._frames) >= max_frames:
-                break
+
+        self._pose_source = pose_source
+        self._live_odom_enabled = pose_source == "open3d_odometry_live"
+        self._live_odom_stride = open3d_odom_stride
+        self._live_odom_downscale = open3d_odom_downscale
+        self._live_odom_max_failure_ratio = float(open3d_odom_max_failure_ratio)
+        self._live_odom_successes = 0
+        self._live_odom_failures = 0
+        self._live_odom_pairs = 0
+        self._live_odom_computed_idx = -1
+        self._live_odom_prev_key_idx = 0
+        self._live_odom_prev_key_rgbd = None
+        self._live_odom_cache_path = None
+        self._live_odom_cache_key = None
+        self._live_odom_cache_enabled = bool(open3d_odom_cache)
+        self._live_odom_cached_full = False
+        if self._live_odom_enabled:
+            live_cache_key = self._open3d_odom_cache_key(
+                path=path,
+                color_topic=color_topic,
+                depth_topic=depth_topic,
+                camera_info_topic=camera_info_topic,
+                sync_threshold_ms=sync_threshold_ms,
+                frame_stride=frame_stride,
+                max_frames=max_frames,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                width=width,
+                height=height,
+                synced=synced,
+                odom_stride=open3d_odom_stride,
+                odom_downscale=open3d_odom_downscale,
+                mode="live",
+            )
+            live_cache_path = self._open3d_odom_cache_path(
+                bag_path=path,
+                cache_dir=open3d_odom_cache_dir,
+                cache_key=live_cache_key,
+            )
+            self._live_odom_cache_key = live_cache_key
+            self._live_odom_cache_path = live_cache_path
+            if open3d_odom_cache:
+                cached_poses, cached_stats = self._load_open3d_odom_cache(
+                    live_cache_path,
+                    live_cache_key,
+                    expected_frames=len(self._frames),
+                )
+                if cached_poses is not None:
+                    for idx, pose in enumerate(cached_poses):
+                        self._frames[idx].c2w = pose
+                    self._live_odom_cached_full = True
+                    self._live_odom_computed_idx = len(self._frames) - 1
+                    self._live_odom_successes = int(cached_stats.get("successes", 0))
+                    self._live_odom_failures = int(cached_stats.get("failures", 0))
+                    self._live_odom_pairs = self._live_odom_successes + self._live_odom_failures
+            if not self._live_odom_cached_full and self._frames:
+                self._frames[0].c2w = np.eye(4, dtype=np.float32)
 
         print(
             f"[streaming] OrbbecRosBag: {len(self._frames)} synced frames from {path} "
-            f"(color={len(color_msgs)}, depth={len(depth_msgs)}, pose={len(pose_msgs)})"
+            f"(color={len(color_msgs)}, depth={len(depth_msgs)}, pose={len(pose_msgs)}, "
+            f"pose_source={pose_source})"
         )
+
+    @staticmethod
+    def _open3d_odom_cache_key(
+        *,
+        path: str,
+        color_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        sync_threshold_ms: float,
+        frame_stride: int,
+        max_frames: int,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        width: int,
+        height: int,
+        synced,
+        odom_stride: int,
+        odom_downscale: int,
+        mode: str = "precompute",
+    ) -> str:
+        import hashlib
+        import json
+
+        metadata_path = os.path.join(path, "metadata.yaml")
+        try:
+            stat = os.stat(metadata_path)
+            metadata_sig = [int(stat.st_mtime_ns), int(stat.st_size)]
+        except OSError:
+            metadata_sig = [0, 0]
+        timestamps = [int(item[0]) for item in synced]
+        timestamps_digest = hashlib.sha256(
+            ",".join(str(ts) for ts in timestamps).encode("ascii")
+        ).hexdigest()[:16]
+        payload = {
+            "version": 1,
+            "mode": str(mode),
+            "path": os.path.abspath(path),
+            "metadata": metadata_sig,
+            "topics": [color_topic, depth_topic, camera_info_topic],
+            "sync_threshold_ms": float(sync_threshold_ms),
+            "frame_stride": int(frame_stride),
+            "max_frames": int(max_frames),
+            "intrinsics": [
+                round(float(fx), 6),
+                round(float(fy), 6),
+                round(float(cx), 6),
+                round(float(cy), 6),
+                int(width),
+                int(height),
+            ],
+            "odom_stride": int(odom_stride),
+            "odom_downscale": int(odom_downscale),
+            "n_frames": len(timestamps),
+            "first_ts": timestamps[0] if timestamps else None,
+            "last_ts": timestamps[-1] if timestamps else None,
+            "timestamps_digest": timestamps_digest,
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return digest[:24]
+
+    @staticmethod
+    def _open3d_odom_cache_path(bag_path: str, cache_dir: str, cache_key: str) -> Path:
+        if cache_dir:
+            root = Path(cache_dir).expanduser()
+        else:
+            root = Path(bag_path) / ".open3d_odometry_cache"
+        return root / f"{cache_key}.npz"
+
+    @staticmethod
+    def _load_open3d_odom_cache(cache_path: Path, cache_key: str, expected_frames: int):
+        if not cache_path.exists():
+            return None, None
+        try:
+            import json
+            import numpy as np
+
+            data = np.load(cache_path, allow_pickle=False)
+            if str(data["cache_key"]) != cache_key:
+                return None, None
+            poses = data["poses"].astype(np.float32)
+            if poses.shape != (expected_frames, 4, 4):
+                return None, None
+            stats = json.loads(str(data["stats_json"]))
+            stats["cache_hit"] = True
+            print(f"[streaming] OrbbecRosBag: loaded Open3D odometry cache {cache_path}", flush=True)
+            return [poses[i] for i in range(poses.shape[0])], stats
+        except Exception as exc:
+            print(f"[streaming] OrbbecRosBag: ignoring bad Open3D odometry cache {cache_path}: {exc}", flush=True)
+            return None, None
+
+    @staticmethod
+    def _save_open3d_odom_cache(cache_path: Path, cache_key: str, poses, stats) -> None:
+        try:
+            import json
+            import numpy as np
+
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(".tmp.npz")
+            np.savez_compressed(
+                tmp_path,
+                cache_key=np.asarray(cache_key),
+                poses=np.stack(poses, axis=0).astype(np.float32),
+                stats_json=np.asarray(json.dumps(stats, sort_keys=True)),
+            )
+            os.replace(tmp_path, cache_path)
+            print(f"[streaming] OrbbecRosBag: saved Open3D odometry cache {cache_path}", flush=True)
+        except Exception as exc:
+            print(f"[streaming] OrbbecRosBag: failed to save Open3D odometry cache: {exc}", flush=True)
+
+    @staticmethod
+    def _estimate_open3d_odometry(
+        synced_frames,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        width: int,
+        height: int,
+        depth_scale: float,
+        max_failure_ratio: float,
+        odom_stride: int = 1,
+        odom_downscale: int = 1,
+    ):
+        try:
+            import open3d as o3d
+        except ImportError as exc:
+            raise ImportError(
+                "--orbbec_pose_source open3d_odometry requires Open3D in the project container."
+            ) from exc
+        import numpy as np
+
+        if not synced_frames:
+            raise RuntimeError("Cannot estimate Open3D odometry: no synchronized RGB-D frames.")
+
+        odom_stride = max(1, int(odom_stride))
+        odom_downscale = max(1, int(odom_downscale))
+        odom_width = max(1, int(width) // odom_downscale)
+        odom_height = max(1, int(height) // odom_downscale)
+        odom_fx = float(fx) / odom_downscale
+        odom_fy = float(fy) / odom_downscale
+        odom_cx = float(cx) / odom_downscale
+        odom_cy = float(cy) / odom_downscale
+
+        key_indices = list(range(0, len(synced_frames), odom_stride))
+        if key_indices[-1] != len(synced_frames) - 1:
+            key_indices.append(len(synced_frames) - 1)
+
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            int(odom_width),
+            int(odom_height),
+            odom_fx,
+            odom_fy,
+            odom_cx,
+            odom_cy,
+        )
+        option = o3d.pipelines.odometry.OdometryOption(
+            depth_min=0.3,
+            depth_max=5.0,
+            depth_diff_max=0.07,
+        )
+        jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
+
+        def to_rgbd(rgb_bytes, depth_bytes):
+            from PIL import Image
+
+            color_img = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
+            depth_img = Image.open(io.BytesIO(depth_bytes))
+            if color_img.size != (odom_width, odom_height):
+                color_img = color_img.resize((odom_width, odom_height), Image.Resampling.BILINEAR)
+            if depth_img.size != (odom_width, odom_height):
+                depth_img = depth_img.resize((odom_width, odom_height), Image.Resampling.NEAREST)
+            color_np = np.asarray(color_img)
+            depth_np = np.asarray(depth_img)
+            color = o3d.geometry.Image(np.ascontiguousarray(color_np))
+            depth = o3d.geometry.Image(np.ascontiguousarray(depth_np))
+            return o3d.geometry.RGBDImage.create_from_color_and_depth(
+                color,
+                depth,
+                depth_scale=float(depth_scale),
+                depth_trunc=5.0,
+                convert_rgb_to_intensity=True,
+            )
+
+        def rot_to_quat(R):
+            tr = float(np.trace(R))
+            if tr > 0.0:
+                s = np.sqrt(tr + 1.0) * 2.0
+                return np.array([
+                    0.25 * s,
+                    (R[2, 1] - R[1, 2]) / s,
+                    (R[0, 2] - R[2, 0]) / s,
+                    (R[1, 0] - R[0, 1]) / s,
+                ], dtype=np.float64)
+            i = int(np.argmax(np.diag(R)))
+            if i == 0:
+                s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+                q = [((R[2, 1] - R[1, 2]) / s), 0.25 * s, ((R[0, 1] + R[1, 0]) / s), ((R[0, 2] + R[2, 0]) / s)]
+            elif i == 1:
+                s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+                q = [((R[0, 2] - R[2, 0]) / s), ((R[0, 1] + R[1, 0]) / s), 0.25 * s, ((R[1, 2] + R[2, 1]) / s)]
+            else:
+                s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+                q = [((R[1, 0] - R[0, 1]) / s), ((R[0, 2] + R[2, 0]) / s), ((R[1, 2] + R[2, 1]) / s), 0.25 * s]
+            q = np.asarray(q, dtype=np.float64)
+            return q / max(np.linalg.norm(q), 1e-12)
+
+        def quat_to_rot(q):
+            q = q / max(np.linalg.norm(q), 1e-12)
+            w, x, y, z = q
+            return np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ], dtype=np.float64)
+
+        def slerp(q0, q1, t):
+            dot = float(np.dot(q0, q1))
+            if dot < 0.0:
+                q1 = -q1
+                dot = -dot
+            if dot > 0.9995:
+                out = q0 + t * (q1 - q0)
+                return out / max(np.linalg.norm(out), 1e-12)
+            theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+            theta = theta_0 * t
+            return (
+                np.sin(theta_0 - theta) * q0 + np.sin(theta) * q1
+            ) / np.sin(theta_0)
+
+        key_poses = [np.eye(4, dtype=np.float32)]
+        prev_rgbd = to_rgbd(synced_frames[key_indices[0]][1], synced_frames[key_indices[0]][2])
+        failures = 0
+        successes = 0
+        total_pairs = max(1, len(key_indices) - 1)
+        for pair_idx, frame_idx in enumerate(key_indices[1:], start=1):
+            _, rgb_bytes, depth_bytes, _ = synced_frames[frame_idx]
+            curr_rgbd = to_rgbd(rgb_bytes, depth_bytes)
+            success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                prev_rgbd,
+                curr_rgbd,
+                intrinsic,
+                np.eye(4, dtype=np.float64),
+                jacobian,
+                option,
+            )
+            if success:
+                key_poses.append((key_poses[-1] @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32))
+                prev_rgbd = curr_rgbd
+                successes += 1
+            else:
+                key_poses.append(key_poses[-1].copy())
+                failures += 1
+            if pair_idx == 1 or pair_idx == total_pairs or pair_idx % 50 == 0:
+                print(
+                    "[streaming] Open3D odometry "
+                    f"{pair_idx}/{total_pairs} keyframe pairs "
+                    f"(source_frame={frame_idx}, successes={successes}, failures={failures})",
+                    flush=True,
+                )
+
+        failure_ratio = failures / total_pairs
+        if failure_ratio > float(max_failure_ratio):
+            raise RuntimeError(
+                "Open3D odometry failed too often: "
+                f"{failures}/{total_pairs} keyframe pairs "
+                f"({failure_ratio:.1%}) exceeds --orbbec_open3d_odom_max_failure_ratio={max_failure_ratio}"
+            )
+
+        poses = [None] * len(synced_frames)
+        for seg_idx in range(len(key_indices) - 1):
+            a = key_indices[seg_idx]
+            b = key_indices[seg_idx + 1]
+            pose_a = key_poses[seg_idx].astype(np.float64)
+            pose_b = key_poses[seg_idx + 1].astype(np.float64)
+            qa = rot_to_quat(pose_a[:3, :3])
+            qb = rot_to_quat(pose_b[:3, :3])
+            for frame_idx in range(a, b):
+                alpha = 0.0 if b == a else (frame_idx - a) / float(b - a)
+                pose = np.eye(4, dtype=np.float64)
+                pose[:3, :3] = quat_to_rot(slerp(qa, qb, alpha))
+                pose[:3, 3] = (1.0 - alpha) * pose_a[:3, 3] + alpha * pose_b[:3, 3]
+                poses[frame_idx] = pose.astype(np.float32)
+        poses[key_indices[-1]] = key_poses[-1].astype(np.float32)
+        for i in range(len(poses)):
+            if poses[i] is None:
+                poses[i] = poses[i - 1].copy() if i > 0 else np.eye(4, dtype=np.float32)
+
+        centers = np.stack([pose[:3, 3] for pose in poses], axis=0)
+        deltas = centers[1:] - centers[:-1]
+        path_length = float(np.linalg.norm(deltas, axis=1).sum()) if len(centers) > 1 else 0.0
+        stats = {
+            "successes": successes,
+            "failures": failures,
+            "path_length": path_length,
+            "bbox_min": centers.min(axis=0).round(4).tolist(),
+            "bbox_max": centers.max(axis=0).round(4).tolist(),
+            "odom_stride": odom_stride,
+            "odom_downscale": odom_downscale,
+            "keyframes": len(key_indices),
+            "cache_hit": False,
+        }
+        return poses, stats
+
+    def _live_odom_to_rgbd(self, frame: StreamingRGBDFrame):
+        try:
+            import sys as _sys
+            if not hasattr(_sys.stdout, "isatty"):
+                _sys.stdout.isatty = lambda: False  # type: ignore[attr-defined]
+            if not hasattr(_sys.stderr, "isatty"):
+                _sys.stderr.isatty = lambda: False  # type: ignore[attr-defined]
+            import open3d as o3d
+        except ImportError as exc:
+            raise ImportError(
+                "--orbbec_pose_source open3d_odometry_live requires Open3D in the project container."
+            ) from exc
+        import numpy as np
+        from PIL import Image
+
+        odom_width = max(1, int(self._width) // self._live_odom_downscale)
+        odom_height = max(1, int(self._height) // self._live_odom_downscale)
+        color_img = Image.open(io.BytesIO(frame._rgb_bytes)).convert("RGB")
+        depth_img = Image.open(io.BytesIO(frame._depth_bytes))
+        if color_img.size != (odom_width, odom_height):
+            color_img = color_img.resize((odom_width, odom_height), Image.Resampling.BILINEAR)
+        if depth_img.size != (odom_width, odom_height):
+            depth_img = depth_img.resize((odom_width, odom_height), Image.Resampling.NEAREST)
+        color = o3d.geometry.Image(np.ascontiguousarray(np.asarray(color_img)))
+        depth = o3d.geometry.Image(np.ascontiguousarray(np.asarray(depth_img)))
+        return o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color,
+            depth,
+            depth_scale=float(self._depth_scale),
+            depth_trunc=5.0,
+            convert_rgb_to_intensity=True,
+        )
+
+    def _save_live_odom_cache(self) -> None:
+        if not self._live_odom_cache_enabled or self._live_odom_cache_path is None:
+            return
+        if self._live_odom_computed_idx < len(self._frames) - 1:
+            return
+        import numpy as np
+
+        poses = [f.c2w if f.c2w is not None else np.eye(4, dtype=np.float32) for f in self._frames]
+        centers = np.stack([pose[:3, 3] for pose in poses], axis=0)
+        deltas = centers[1:] - centers[:-1]
+        stats = {
+            "successes": self._live_odom_successes,
+            "failures": self._live_odom_failures,
+            "path_length": float(np.linalg.norm(deltas, axis=1).sum()) if len(centers) > 1 else 0.0,
+            "bbox_min": centers.min(axis=0).round(4).tolist(),
+            "bbox_max": centers.max(axis=0).round(4).tolist(),
+            "odom_stride": self._live_odom_stride,
+            "odom_downscale": self._live_odom_downscale,
+            "keyframes": self._live_odom_pairs + 1,
+            "cache_hit": False,
+        }
+        self._save_open3d_odom_cache(
+            self._live_odom_cache_path,
+            self._live_odom_cache_key,
+            poses,
+            stats,
+        )
+
+    def _ensure_live_odom_until(self, index: int) -> None:
+        if not self._live_odom_enabled or self._live_odom_cached_full:
+            return
+        if index <= self._live_odom_computed_idx:
+            return
+        import sys as _sys
+        if not hasattr(_sys.stdout, "isatty"):
+            _sys.stdout.isatty = lambda: False  # type: ignore[attr-defined]
+        if not hasattr(_sys.stderr, "isatty"):
+            _sys.stderr.isatty = lambda: False  # type: ignore[attr-defined]
+        import numpy as np
+        import open3d as o3d
+
+        if not self._frames:
+            return
+        if self._live_odom_computed_idx < 0:
+            self._frames[0].c2w = np.eye(4, dtype=np.float32)
+            self._live_odom_prev_key_idx = 0
+            self._live_odom_prev_key_rgbd = self._live_odom_to_rgbd(self._frames[0])
+            self._live_odom_computed_idx = 0
+
+        odom_width = max(1, int(self._width) // self._live_odom_downscale)
+        odom_height = max(1, int(self._height) // self._live_odom_downscale)
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            int(odom_width),
+            int(odom_height),
+            float(self._fx) / self._live_odom_downscale,
+            float(self._fy) / self._live_odom_downscale,
+            float(self._cx) / self._live_odom_downscale,
+            float(self._cy) / self._live_odom_downscale,
+        )
+        option = o3d.pipelines.odometry.OdometryOption(
+            depth_min=0.3,
+            depth_max=5.0,
+            depth_diff_max=0.07,
+        )
+        jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
+
+        target = min(index, len(self._frames) - 1)
+        for idx in range(self._live_odom_computed_idx + 1, target + 1):
+            prev_pose = self._frames[idx - 1].c2w
+            # Bootstrap needs real baseline between the first few frames. After
+            # that, only run the configured fast-preset keyframe odometry.
+            should_estimate = (
+                idx <= self._live_odom_stride
+                or (idx % self._live_odom_stride) == 0
+                or idx == len(self._frames) - 1
+            )
+            if not should_estimate:
+                self._frames[idx].c2w = prev_pose.copy()
+                self._live_odom_computed_idx = idx
+                continue
+
+            curr_rgbd = self._live_odom_to_rgbd(self._frames[idx])
+            success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                self._live_odom_prev_key_rgbd,
+                curr_rgbd,
+                intrinsic,
+                np.eye(4, dtype=np.float64),
+                jacobian,
+                option,
+            )
+            self._live_odom_pairs += 1
+            if success:
+                key_pose = self._frames[self._live_odom_prev_key_idx].c2w
+                self._frames[idx].c2w = (key_pose @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32)
+                self._live_odom_prev_key_idx = idx
+                self._live_odom_prev_key_rgbd = curr_rgbd
+                self._live_odom_successes += 1
+            else:
+                self._frames[idx].c2w = prev_pose.copy()
+                # Always advance the reference frame even on failure so the next
+                # comparison stays bounded at one frame of gap rather than growing
+                # unboundedly (stale reference → cascade of increasingly hard matches).
+                self._live_odom_prev_key_idx = idx
+                self._live_odom_prev_key_rgbd = curr_rgbd
+                self._live_odom_failures += 1
+            failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
+            if failure_ratio > self._live_odom_max_failure_ratio:
+                raise RuntimeError(
+                    "Open3D live odometry failed too often: "
+                    f"{self._live_odom_failures}/{self._live_odom_pairs} keyframes "
+                    f"({failure_ratio:.1%}) exceeds --orbbec_open3d_odom_max_failure_ratio="
+                    f"{self._live_odom_max_failure_ratio}"
+                )
+            if self._live_odom_pairs == 1 or self._live_odom_pairs % 50 == 0:
+                print(
+                    "[streaming] live Open3D odometry "
+                    f"source_frame={idx} successes={self._live_odom_successes} "
+                    f"failures={self._live_odom_failures}",
+                    flush=True,
+                )
+            self._live_odom_computed_idx = idx
+
+        self._save_live_odom_cache()
 
     def __len__(self) -> int:
         return len(self._frames)
 
     def __iter__(self) -> Iterator[StreamingRGBDFrame]:
-        yield from self._frames
+        for idx in range(len(self._frames)):
+            yield self.get_frame(idx)
 
     def get_all(self) -> List[StreamingRGBDFrame]:
+        if self._live_odom_enabled:
+            self._ensure_live_odom_until(len(self._frames) - 1)
         return self._frames
+
+    @property
+    def lazy_frames(self) -> bool:
+        return self._live_odom_enabled and not self._live_odom_cached_full
+
+    def get_frame(self, index: int) -> StreamingRGBDFrame:
+        if index < 0 or index >= len(self._frames):
+            raise IndexError(index)
+        if self._live_odom_enabled:
+            self._ensure_live_odom_until(index)
+        return self._frames[index]
 
 
 def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMFrameSource | ScanNetFrameSource | ScanNetSensFrameSource | ReplicaFrameSource | HyperSimFrameSource | OrbbecExportFrameSource | OrbbecRosBagFrameSource":
@@ -966,10 +1610,16 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             color_topic=getattr(args, "orbbec_color_topic", "/camera/color/image_raw/compressed"),
             depth_topic=getattr(args, "orbbec_depth_topic", "/camera/depth/image_raw/compressed"),
             pose_topic=getattr(args, "orbbec_pose_topic", "/camera_pose"),
+            pose_source=getattr(args, "orbbec_pose_source", "camera_pose"),
             camera_info_topic=getattr(args, "orbbec_camera_info_topic", "/camera/color/camera_info"),
             sync_threshold_ms=getattr(args, "orbbec_sync_threshold_ms", 33.0),
             max_frames=getattr(args, "streaming_max_frames", 0),
             frame_stride=getattr(args, "streaming_frame_stride", 1),
+            open3d_odom_max_failure_ratio=getattr(args, "orbbec_open3d_odom_max_failure_ratio", 0.25),
+            open3d_odom_cache=getattr(args, "orbbec_open3d_odom_cache", True),
+            open3d_odom_cache_dir=getattr(args, "orbbec_open3d_odom_cache_dir", ""),
+            open3d_odom_stride=getattr(args, "orbbec_open3d_odom_stride", 1),
+            open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
         )
     raise ValueError(
         f"[streaming] No supported RGB-D dataset layout found at: {path}\n"

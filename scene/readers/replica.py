@@ -204,6 +204,167 @@ def _raycast_replica_frame(scene, mesh_t, c2w, width, height, fx, fy, cx, cy):
     return buf_rgb.getvalue(), buf_dep.getvalue()
 
 
+def _load_replica_raycast_mesh(mesh_path):
+    """Load Replica's quad PLY as a tensor triangle mesh.
+
+    Open3D's legacy PLY reader aborts on Replica quad faces and leaves a partial
+    mesh. Parse the binary PLY directly and fan-triangulate each face so the
+    raycaster receives valid geometry and RGB vertex colors.
+    """
+    import numpy as np
+    import open3d as o3d
+    import open3d.t.geometry as o3tg
+
+    with open(mesh_path, "rb") as f:
+        header = bytearray()
+        while True:
+            line = f.readline()
+            if not line:
+                raise RuntimeError(f"Replica PLY missing end_header: {mesh_path}")
+            header.extend(line)
+            if line == b"end_header\n":
+                break
+        header_text = header.decode("ascii", errors="replace")
+        if "format binary_little_endian 1.0" not in header_text:
+            raise RuntimeError(f"Replica PLY must be binary_little_endian: {mesh_path}")
+
+        n_vertices = None
+        n_faces = None
+        for line in header_text.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[:2] == ["element", "vertex"]:
+                n_vertices = int(parts[2])
+            elif len(parts) == 3 and parts[:2] == ["element", "face"]:
+                n_faces = int(parts[2])
+        if not n_vertices or not n_faces:
+            raise RuntimeError(f"Replica PLY header missing vertex/face counts: {mesh_path}")
+
+        vertex_dtype = np.dtype([
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("nx", "<f4"),
+            ("ny", "<f4"),
+            ("nz", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+        ])
+        vertices_raw = np.fromfile(f, dtype=vertex_dtype, count=n_vertices)
+        if vertices_raw.shape[0] != n_vertices:
+            raise RuntimeError(f"Replica PLY ended while reading vertices: {mesh_path}")
+
+        face_dtype = np.dtype([("count", "u1"), ("idx", "<i4", (4,))])
+        faces_raw = np.fromfile(f, dtype=face_dtype, count=n_faces)
+        if faces_raw.shape[0] != n_faces:
+            raise RuntimeError(f"Replica PLY ended while reading faces: {mesh_path}")
+        if not np.all(faces_raw["count"] == 4):
+            bad = np.unique(faces_raw["count"])
+            raise RuntimeError(
+                f"Replica PLY face parser expected quad faces, got counts={bad.tolist()}"
+            )
+
+    vertices = np.stack(
+        [vertices_raw["x"], vertices_raw["y"], vertices_raw["z"]],
+        axis=1,
+    ).astype(np.float32, copy=False)
+    colors = np.stack(
+        [vertices_raw["red"], vertices_raw["green"], vertices_raw["blue"]],
+        axis=1,
+    ).astype(np.float32) / 255.0
+    quads = faces_raw["idx"]
+    triangles = np.empty((quads.shape[0] * 2, 3), dtype=np.int32)
+    triangles[0::2] = quads[:, [0, 1, 2]]
+    triangles[1::2] = quads[:, [0, 2, 3]]
+
+    mesh_t = o3tg.TriangleMesh()
+    mesh_t.vertex["positions"] = o3d.core.Tensor(vertices, dtype=o3d.core.Dtype.Float32)
+    mesh_t.vertex["colors"] = o3d.core.Tensor(colors, dtype=o3d.core.Dtype.Float32)
+    mesh_t.triangle["indices"] = o3d.core.Tensor(triangles, dtype=o3d.core.Dtype.Int32)
+    return vertices, mesh_t
+
+
+def _replica_raycast_camera_path(scene, points, num_views, width=96, height=72, fov_degrees=70.0):
+    """Pick plausible indoor Replica viewpoints by scoring low-res raycasts."""
+    import math
+    import numpy as np
+    import open3d as o3d
+    import open3d.t.geometry as o3tg
+
+    points = np.asarray(points, dtype=np.float32)
+    x_lo, y_lo, z_lo = np.percentile(points, 8, axis=0)
+    x_hi, y_hi, z_hi = np.percentile(points, 92, axis=0)
+    z_candidates = [
+        float(np.percentile(points[:, 2], q))
+        for q in (18, 25, 32, 40)
+    ]
+    xs = np.linspace(float(x_lo), float(x_hi), 7)
+    ys = np.linspace(float(y_lo), float(y_hi), 9)
+    yaws = np.linspace(0.0, 2.0 * math.pi, 16, endpoint=False)
+    fx = width / (2.0 * math.tan(math.radians(fov_degrees) * 0.5))
+    fy = fx
+    cx = width * 0.5
+    cy = height * 0.5
+    K = o3d.core.Tensor(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=o3d.core.Dtype.Float64,
+    )
+
+    scored = []
+    for z in z_candidates:
+        for x in xs:
+            for y in ys:
+                eye = np.array([x, y, z], dtype=np.float32)
+                for yaw in yaws:
+                    target = eye + np.array([math.cos(yaw), math.sin(yaw), 0.0], dtype=np.float32)
+                    c2w = _look_at_c2w(eye, target)
+                    E = o3d.core.Tensor(np.linalg.inv(c2w).astype(np.float64), dtype=o3d.core.Dtype.Float64)
+                    rays = o3tg.RaycastingScene.create_rays_pinhole(K, E, width, height)
+                    t_hit = scene.cast_rays(rays)["t_hit"].numpy()
+                    valid = np.isfinite(t_hit)
+                    valid_ratio = float(valid.mean())
+                    if valid_ratio < 0.75:
+                        continue
+                    d = t_hit[valid]
+                    p10, median, p90 = np.percentile(d, [10, 50, 90])
+                    # Reject cameras inside/against surfaces and views that are mostly far walls.
+                    if p10 < 0.25 or median < 0.8 or median > 6.0:
+                        continue
+                    spread = float(p90 - p10)
+                    score = valid_ratio + 0.15 * min(spread, 6.0) - 0.05 * abs(median - 2.5)
+                    scored.append((score, yaw, c2w.astype(np.float32), median, spread))
+
+    if not scored:
+        print("[streaming] Replica: view sampler found no good poses; falling back to ellipse path.", flush=True)
+        return _replica_camera_path(points, num_views)
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = []
+    selected_xy = []
+    min_xy_dist = 0.6
+    for _, _, c2w, _, _ in scored:
+        xy = c2w[:2, 3]
+        if selected_xy and min(np.linalg.norm(xy - prev) for prev in selected_xy) < min_xy_dist:
+            continue
+        selected.append(c2w)
+        selected_xy.append(xy.copy())
+        if len(selected) >= num_views:
+            break
+
+    if len(selected) < num_views:
+        for _, _, c2w, _, _ in scored:
+            selected.append(c2w)
+            if len(selected) >= num_views:
+                break
+
+    print(
+        f"[streaming] Replica: selected {len(selected)} raycast-scored camera poses "
+        f"from {len(scored)} valid candidates.",
+        flush=True,
+    )
+    return selected[:num_views]
+
+
 def _ensure_replica_views(path, pcd, c2ws, width, height, fov_degrees, render_points, splat_radius):
     view_dir = Path(path) / (
         f"replica_views_w{width}_h{height}_n{len(c2ws)}_fov{int(round(fov_degrees))}_r{splat_radius}"

@@ -112,8 +112,14 @@ class ModelParams(ParamGroup):
         self.orbbec_color_topic = "/camera/color/image_raw/compressed"
         self.orbbec_depth_topic = "/camera/depth/image_raw/compressed"
         self.orbbec_pose_topic = "/camera_pose"
+        self.orbbec_pose_source = "camera_pose"
         self.orbbec_camera_info_topic = "/camera/color/camera_info"
         self.orbbec_sync_threshold_ms = 33.0
+        self.orbbec_open3d_odom_max_failure_ratio = 0.25
+        self.orbbec_open3d_odom_cache = True
+        self.orbbec_open3d_odom_cache_dir = ""
+        self.orbbec_open3d_odom_stride = 1
+        self.orbbec_open3d_odom_downscale = 1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -360,6 +366,14 @@ class StreamingParams(ParamGroup):
         self.streaming_depth_loss_weight = 0.05
         # Depth-filtering profile. "default" preserves the generic settings.
         self.streaming_camera_profile = "default"
+        self.streaming_frame_admission = "all"
+        self.streaming_keyframe_min_translation = 0.05
+        self.streaming_keyframe_min_rotation_deg = 5.0
+        self.streaming_keyframe_min_overlap = 0.25
+        self.streaming_keyframe_max_overlap = 0.90
+        self.streaming_keyframe_max_gap = 10
+        self.streaming_keyframe_coverage_alpha = 0.3
+        self.streaming_keyframe_admit_eval_holdouts = False
         # Depth loss type: "l1" or "huber"
         self.streaming_depth_loss_type = "huber"
         # H7: Freeze confirmed geometry gradients during streaming training.
@@ -418,6 +432,10 @@ class StreamingParams(ParamGroup):
         # Comma-separated ratios for [recent, covisible, global_reservoir, hard_frames]
         # Must sum to ~1.0. Only used when streaming_sampling_mode = "stratified".
         self.streaming_sampling_ratios = "0.70,0.15,0.10,0.05"
+        # Depth comparison export: save rendered_depth vs sensor_depth side-by-side PNGs
+        # for every ingested training frame. Output goes to <model_path>/depth_comparison/.
+        # Set to True to enable; requires streaming_depth_loss_weight > 0 (depth must be rendered).
+        self.streaming_export_depth_comparison = False
         # Minimum shared Gaussians to consider two frames covisible
         self.streaming_covisible_min_shared = 200
         # Number of recent high-loss frames to keep as "hard frames"

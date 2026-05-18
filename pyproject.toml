@@ -8,6 +8,7 @@ dependencies = [
     "plyfile",
     "tqdm",
     "opencv-python-headless",
+    "rosbags",
 ]
 
 [project.optional-dependencies]

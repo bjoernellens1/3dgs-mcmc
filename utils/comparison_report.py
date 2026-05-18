@@ -355,6 +355,32 @@ def _write_mp4(path: str, frames_iter: Iterable[np.ndarray], fps: int = 30) -> O
     return None
 
 
+def _infer_realtime_fps(cams: List, default_fps: int, max_fps: int = 60) -> int:
+    """Infer video FPS from camera timestamps when available.
+
+    Streaming datasets often carry real frame timestamps. Encoding one frame per
+    camera at a fixed 30 fps fast-forwards low-FPS sources, so use the median
+    timestamp spacing when it is sane.
+    """
+    timestamps = []
+    for cam in cams:
+        ts = getattr(cam, "_streaming_timestamp", None)
+        if ts is None:
+            return int(default_fps)
+        try:
+            timestamps.append(float(ts))
+        except Exception:
+            return int(default_fps)
+    if len(timestamps) < 2:
+        return int(default_fps)
+    deltas = np.diff(np.asarray(timestamps, dtype=np.float64))
+    deltas = deltas[np.isfinite(deltas) & (deltas > 1e-6)]
+    if deltas.size == 0:
+        return int(default_fps)
+    fps = int(round(1.0 / float(np.median(deltas))))
+    return max(1, min(int(max_fps), fps))
+
+
 def write_post_training_report(
     model_path: str,
     iteration: int,
@@ -400,6 +426,7 @@ def write_post_training_report(
         "mean_train_lpips": None,
         "min_train_lpips": None,
         "max_train_lpips": None,
+        "trajectory_fps": None,
         "output_dir": out_dir,
         "artifacts": artifacts,
     }
@@ -439,6 +466,70 @@ def write_post_training_report(
                 l_val = float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
                 lpips_list.append(l_val)
         return psnr_list, lpips_list
+
+    def _representative_cams(cams: List, max_items: int) -> List:
+        if not cams or max_items <= 0:
+            return []
+        if len(cams) <= max_items:
+            return list(cams)
+        idxs = np.linspace(0, len(cams) - 1, num=max_items, dtype=np.int64)
+        # Preserve order while removing duplicates from integer rounding.
+        seen = set()
+        out = []
+        for idx in idxs.tolist():
+            if idx in seen:
+                continue
+            seen.add(idx)
+            out.append(cams[idx])
+        return out
+
+    def _write_visual_sheet(cams: List, split: str, max_items: int) -> Optional[str]:
+        visual_cams = _representative_cams(cams, max_items=max_items)
+        if not visual_cams:
+            return None
+        split_dir = os.path.join(out_dir, split)
+        os.makedirs(split_dir, exist_ok=True)
+        if batch_render_fn is not None:
+            try:
+                batch_imgs_v = _batch_render_images(
+                    visual_cams, gaussians, pipe, background,
+                    batch_render_fn=batch_render_fn,
+                )
+            except Exception as e:
+                print(f"[report] batch {split} sheet render failed, falling back: {e}", flush=True)
+                batch_imgs_v = []
+        else:
+            batch_imgs_v = []
+        use_batch_v = len(batch_imgs_v) == len(visual_cams)
+        pairs_for_visual_sheet: List[Tuple[str, np.ndarray, np.ndarray]] = []
+        for i, cam in enumerate(visual_cams):
+            try:
+                if use_batch_v:
+                    img = batch_imgs_v[i].clamp(0.0, 1.0)
+                else:
+                    img = _render_image(cam, gaussians, render_fn, pipe, background)
+                gt = _gt_image(cam)
+            except Exception as e:
+                print(f"[report] {split} sheet render failed for {cam.image_name}: {e}", flush=True)
+                continue
+            r_u8 = _to_uint8_hwc(img)
+            g_u8 = _to_uint8_hwc(gt)
+            d_u8 = _abs_diff(img, gt)
+            name = str(getattr(cam, "image_name", f"view_{len(pairs_for_visual_sheet):04d}"))
+            side = _hconcat_with_gap([r_u8, g_u8, d_u8], gap_px=4)
+            _save_png(os.path.join(split_dir, f"{name}.png"), side)
+            pairs_for_visual_sheet.append((name, r_u8, g_u8))
+        if not pairs_for_visual_sheet:
+            return None
+        sheet = _build_contact_sheet(
+            pairs_for_visual_sheet,
+            cols=contact_sheet_cols,
+            cell_width=contact_sheet_cell_width,
+        )
+        sheet_path = os.path.join(out_dir, f"{split}_contact_sheet.png")
+        _save_png(sheet_path, sheet)
+        artifacts.append(sheet_path)
+        return sheet_path
 
     # --- Test split: side-by-side + contact sheet + metrics -----------------------------
     psnrs: List[float] = []
@@ -543,6 +634,17 @@ def write_post_training_report(
             print(msg, flush=True)
             if tb_writer is not None:
                 tb_writer.add_scalar(f"{log_prefix}/train_lpips_mean", summary["mean_train_lpips"], iteration)
+        # The held-out test sheet is useful for metrics, but in streaming runs it
+        # often shows future/unobserved cameras. A small representative train
+        # sheet gives visually meaningful render/GT pairs for already ingested
+        # views without changing the held-out evaluation numbers.
+        train_sheet_path = _write_visual_sheet(
+            train_cams,
+            split="train",
+            max_items=max(1, contact_sheet_cols * 2),
+        )
+        if train_sheet_path is not None:
+            summary["train_contact_sheet"] = train_sheet_path
 
     # --- Trajectory MP4 over train cameras ------------------------------------
     if train_cams:
@@ -576,11 +678,13 @@ def write_post_training_report(
                     continue
                 yield _to_uint8_hwc(img)
 
+        video_fps = _infer_realtime_fps(cams_for_video, mp4_fps)
+        summary["trajectory_fps"] = video_fps
         mp4_path = os.path.join(out_dir, "trajectory.mp4")
-        err = _write_mp4(mp4_path, _frames(), fps=mp4_fps)
+        err = _write_mp4(mp4_path, _frames(), fps=video_fps)
         if err is None:
             artifacts.append(mp4_path)
-            print(f"[report] trajectory.mp4 written ({len(cams_for_video)} frames @ {mp4_fps}fps)", flush=True)
+            print(f"[report] trajectory.mp4 written ({len(cams_for_video)} frames @ {video_fps}fps)", flush=True)
         else:
             print(f"[report] trajectory.mp4 SKIPPED: {err}", flush=True)
     else:

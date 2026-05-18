@@ -39,7 +39,12 @@ class StreamingScene:
         self.current_camera = None
         self.cameras_extent = 1.0  # updated during initialize_from_frames
         self._source_idx = 0
-        self._all_frames = list(frame_source)
+        self._frame_source = frame_source
+        self._lazy_frames = bool(getattr(frame_source, "lazy_frames", False))
+        self._all_frames = None if self._lazy_frames else list(frame_source)
+        self._frame_count = len(frame_source) if self._lazy_frames else len(self._all_frames)
+        self._keyframes_admitted = 0
+        self._keyframes_rejected = 0
 
         # Persistent occupancy hash for incremental insertion
         self.occupied_voxels = set()
@@ -130,6 +135,11 @@ class StreamingScene:
     # Initialisation
     # ------------------------------------------------------------------
 
+    def _get_source_frame(self, index: int) -> "StreamingRGBDFrame":
+        if self._lazy_frames:
+            return self._frame_source.get_frame(index)
+        return self._all_frames[index]
+
     def initialize_from_frames(self, n_frames: int) -> None:
         """
         Ingest the first n_frames as initial cameras and build the initial
@@ -140,12 +150,12 @@ class StreamingScene:
         """
         from scene.cameras import prepare_camera_for_render
 
-        n_frames = min(n_frames, len(self._all_frames))
+        n_frames = min(n_frames, self._frame_count)
         if n_frames == 0:
             raise RuntimeError("[streaming] No frames available for initialisation.")
 
         print(f"[streaming] Bootstrapping from {n_frames} frame(s)...", flush=True)
-        initial_frames = self._all_frames[:n_frames]
+        initial_frames = [self._get_source_frame(i) for i in range(n_frames)]
 
         for frame in initial_frames:
             cam = self._frame_to_camera(frame)
@@ -281,9 +291,9 @@ class StreamingScene:
     # ------------------------------------------------------------------
 
     def has_next_frame(self) -> bool:
-        return self._source_idx < len(self._all_frames)
+        return self._source_idx < self._frame_count
 
-    def ingest_next_frame(self) -> Optional[Tuple]:
+    def ingest_next_frame(self, admission_fn=None) -> Optional[Tuple]:
         """
         Load the next frame as a Camera and add it to the active window and
         replay buffer.  Returns (camera, StreamingRGBDFrame, is_train) or None
@@ -293,7 +303,7 @@ class StreamingScene:
             return None
         from scene.cameras import prepare_camera_for_render
 
-        frame = self._all_frames[self._source_idx]
+        frame = self._get_source_frame(self._source_idx)
         self._source_idx += 1
 
         cam = self._frame_to_camera(frame)
@@ -301,10 +311,22 @@ class StreamingScene:
         eval_hold = getattr(self.args, "streaming_eval_hold", 0)
         is_train = True
         if eval_hold > 0 and frame.index % eval_hold == 0:
+            if admission_fn is not None and not getattr(self.args, "streaming_keyframe_admit_eval_holdouts", False):
+                self._keyframes_rejected += 1
+                return None, frame, False
             # Hold-out frame: add to test set only, skip training/replay
             self._test_cameras.append(cam)
             is_train = False
         else:
+            if admission_fn is not None:
+                admit, admission_stats, admission_render_pkg = admission_fn(cam, frame)
+                frame._streaming_admission_stats = admission_stats
+                if not admit:
+                    self._keyframes_rejected += 1
+                    return None, frame, False
+                cam._streaming_admission_stats = admission_stats
+                cam._streaming_admission_render_pkg = admission_render_pkg
+            self._keyframes_admitted += 1
             self.train_cameras.append(cam)
             replay_size = getattr(self.args, "streaming_replay_buffer", 32)
             self._replay_buffer.append(cam)
@@ -462,6 +484,7 @@ class StreamingScene:
         cam._streaming_depth_path = frame.depth_path
         cam._streaming_depth_scale = frame.depth_scale
         cam._sensor_depth_cache = None  # populated on first access
+        cam._streaming_timestamp = float(frame.timestamp)
         # Keep reference to frame for in-memory depth access (.sens source)
         cam._streaming_frame = frame
         return cam

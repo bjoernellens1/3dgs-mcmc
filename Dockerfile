@@ -137,6 +137,7 @@ RUN uv pip install --no-cache \
     opencv-python-headless \
     rich \
     jaxtyping \
+    rosbags \
     tensorboard \
     open3d \
     h5py

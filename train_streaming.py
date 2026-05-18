@@ -188,6 +188,54 @@ def _filter_existing_coverage(
     return new_pts, new_cols
 
 
+def _save_depth_comparison(
+    out_dir: str,
+    frame_idx: int,
+    rgb_tensor: torch.Tensor,
+    rendered_depth: torch.Tensor,
+    sensor_depth: torch.Tensor,
+) -> None:
+    """Save a 3-panel depth comparison PNG: RGB | rendered depth | sensor depth."""
+    import numpy as np
+    try:
+        from PIL import Image as _PILImage
+    except ImportError:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    # Convert RGB [3, H, W] float to uint8
+    rgb_np = (rgb_tensor.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    H, W = rgb_np.shape[:2]
+
+    def _depth_to_color(d_tensor: torch.Tensor, vmax: float) -> np.ndarray:
+        d = d_tensor.detach().cpu().numpy().squeeze()
+        if d.shape != (H, W):
+            from PIL import Image as _I
+            d = np.array(_I.fromarray(d).resize((W, H), _I.Resampling.NEAREST))
+        valid = d > 0
+        norm = np.zeros_like(d, dtype=np.float32)
+        if valid.any() and vmax > 0:
+            norm[valid] = np.clip(d[valid] / vmax, 0, 1)
+        # Jet-like colormap via lookup: blue→cyan→green→yellow→red
+        r = np.clip(1.5 - abs(norm * 4 - 3), 0, 1)
+        g = np.clip(1.5 - abs(norm * 4 - 2), 0, 1)
+        b = np.clip(1.5 - abs(norm * 4 - 1), 0, 1)
+        out = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+        out[~valid] = 0  # black for invalid/zero depth
+        return out
+
+    vmax = float(sensor_depth[sensor_depth > 0].max()) if (sensor_depth > 0).any() else 5.0
+    rend_col = _depth_to_color(rendered_depth, vmax)
+    sens_col = _depth_to_color(sensor_depth, vmax)
+    diff = np.abs(
+        rendered_depth.detach().cpu().numpy().squeeze().astype(np.float32) -
+        sensor_depth.detach().cpu().numpy().squeeze().astype(np.float32)
+    )
+    diff_col = _depth_to_color(torch.from_numpy(diff.clip(0, vmax * 0.5)[None]), vmax * 0.5)
+
+    panel = np.concatenate([rgb_np, rend_col, sens_col, diff_col], axis=1)
+    _PILImage.fromarray(panel).save(os.path.join(out_dir, f"frame_{frame_idx:06d}.png"))
+
+
 def _get_sensor_depth(cam, target_h: int, target_w: int) -> Optional[torch.Tensor]:
     """
     Return the sensor depth for a streaming camera as a [1, H, W] float32 CPU tensor,
@@ -340,7 +388,7 @@ def insert_gaussians_from_frame(
     _debug = getattr(args, "streaming_insertion_debug", False)
     _stats: dict = {}
 
-    if frame.depth_path is None or not os.path.exists(frame.depth_path):
+    if frame._depth_bytes is None and (frame.depth_path is None or not os.path.exists(frame.depth_path)):
         return 0, _stats
 
     depth_stride = getattr(args, "streaming_depth_stride", 8)
@@ -358,8 +406,9 @@ def insert_gaussians_from_frame(
     use_knn_scale = getattr(args, "streaming_insert_knn_scale", True)
 
     try:
-        depth = np.array(_Image.open(frame.depth_path))
-        rgb = np.array(_Image.open(frame.rgb_path).convert("RGB")).astype(np.float32) / 255.0
+        from utils.streaming_frames import load_frame_depth_np, load_frame_rgb
+        depth = np.asarray(load_frame_depth_np(frame))
+        rgb = np.array(load_frame_rgb(frame)).astype(np.float32) / 255.0
     except Exception:
         return 0, _stats
 
@@ -1235,6 +1284,11 @@ def streaming_training(
         raise ValueError("streaming_training() requires run_args.")
     args = run_args
     _apply_camera_profile(args)
+    if (
+        getattr(args, "orbbec_pose_source", "") == "open3d_odometry_live"
+        and getattr(args, "streaming_frame_admission", "all") == "all"
+    ):
+        args.streaming_frame_admission = "hybrid_keyframe"
 
     # --- Output / logger ---------------------------------------------------
     os.makedirs(args.model_path, exist_ok=True)
@@ -1349,9 +1403,84 @@ def streaming_training(
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    def _pose_delta_from_last_train(frame) -> tuple[float, float, int]:
+        if not streaming_scene.train_cameras:
+            return 0.0, 0.0, 0
+        last_frame = getattr(streaming_scene.train_cameras[-1], "_streaming_frame", None)
+        if last_frame is None:
+            return 0.0, 0.0, 0
+        t_m = float(np.linalg.norm(frame.c2w[:3, 3] - last_frame.c2w[:3, 3]))
+        r_rel = last_frame.c2w[:3, :3].T @ frame.c2w[:3, :3]
+        cos_angle = np.clip((np.trace(r_rel) - 1.0) * 0.5, -1.0, 1.0)
+        r_deg = float(np.degrees(np.arccos(cos_angle)))
+        gap = int(frame.index - last_frame.index)
+        return t_m, r_deg, gap
+
+    def _hybrid_keyframe_admission(cam, frame):
+        mode = getattr(args, "streaming_frame_admission", "all")
+        if mode != "hybrid_keyframe":
+            return True, {"mode": mode, "admitted": 1}, None
+        t_m, r_deg, gap = _pose_delta_from_last_train(frame)
+        min_t = float(getattr(args, "streaming_keyframe_min_translation", 0.05))
+        min_r = float(getattr(args, "streaming_keyframe_min_rotation_deg", 5.0))
+        min_overlap = float(getattr(args, "streaming_keyframe_min_overlap", 0.25))
+        max_overlap = float(getattr(args, "streaming_keyframe_max_overlap", 0.90))
+        max_gap = max(1, int(getattr(args, "streaming_keyframe_max_gap", 10)))
+        alpha_thresh = float(getattr(args, "streaming_keyframe_coverage_alpha", 0.3))
+        render_pkg = None
+        overlap = 0.0
+        try:
+            with torch.no_grad():
+                render_pkg = render(cam, gaussians, pipe, background, render_depth=True)
+                alpha = render_pkg.get("alpha")
+                if alpha is not None:
+                    overlap = float((alpha.detach() > alpha_thresh).float().mean().item())
+        except Exception as exc:
+            stats = {
+                "mode": mode,
+                "admitted": int(gap >= max_gap or t_m >= min_t or r_deg >= min_r),
+                "reason": "render_failed",
+                "pose_delta_m": t_m,
+                "pose_delta_deg": r_deg,
+                "gap": gap,
+                "overlap": overlap,
+                "error": str(exc)[:160],
+            }
+            return bool(stats["admitted"]), stats, None
+
+        forced = gap >= max_gap
+        moved = t_m >= min_t or r_deg >= min_r
+        overlap_ok = overlap >= min_overlap
+        novel = overlap <= max_overlap
+        admitted = forced or (overlap_ok and (moved or novel))
+        if forced:
+            reason = "max_gap"
+        elif not overlap_ok:
+            reason = "low_overlap"
+        elif moved:
+            reason = "pose_delta"
+        elif novel:
+            reason = "new_content"
+        else:
+            reason = "redundant"
+        stats = {
+            "mode": mode,
+            "admitted": int(admitted),
+            "reason": reason,
+            "pose_delta_m": t_m,
+            "pose_delta_deg": r_deg,
+            "gap": gap,
+            "overlap": overlap,
+            "forced": int(forced),
+            "moved": int(moved),
+            "novel": int(novel),
+        }
+        return admitted, stats, render_pkg
+
     # --- Loop state --------------------------------------------------------
     ema_loss = 0.0
     n_frames_ingested = n_init  # already ingested during init
+    _n_frames_trained = 0       # frames that received at least one training iteration
     total_inserted = 0
     _prev_insert_frame = None       # previous frame for depth consistency check
     _prev_insert_depth_m = None     # depth map (metres) for previous frame
@@ -1415,13 +1544,8 @@ def streaming_training(
     # Training-progress video setup
     _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
     _progress_video_fps = int(getattr(args, "progress_video_fps", 10))
+    _progress_cams: list = []     # fixed camera objects once selected
     _progress_frames: list = []   # accumulated side-by-side uint8 HWC numpy frames
-
-    # Pre-compute 3 target frame indices from the FULL trajectory (start/mid/end).
-    # At each render trigger we pick the closest arrived camera to each target —
-    # renders start from iteration 1 without waiting for a coverage threshold.
-    _n_total_frames = len(streaming_scene._all_frames)
-    _progress_target_idxs = [0, max(0, _n_total_frames // 2), max(0, _n_total_frames - 1)]
 
     from gaussian_renderer.gsplat_backend import render_batch as _render_batch
 
@@ -1472,11 +1596,21 @@ def streaming_training(
         "mcmc", "hybrid", "gsplat_energy_mcmc"
     }
 
+    _n_total_frames = len(streaming_scene._all_frames) if streaming_scene._all_frames is not None else streaming_scene._frame_count
+    _spf = scheduler.steps_per_frame
+    _min_iters_all = (getattr(args, "streaming_initial_frames", 5) * _spf) + _n_total_frames * _spf
     print(
         f"[streaming] Starting: strategy={densification_strategy} "
         f"optimizer={optimizer_type} sparse={sparse_active_set} "
-        f"steps_per_frame={scheduler.steps_per_frame} "
+        f"steps_per_frame={_spf} "
         f"wallclock={scheduler.wallclock}",
+        flush=True,
+    )
+    print(
+        f"[streaming] Dataset: {_n_total_frames} frames. "
+        f"Iterations to cover all frames: {_min_iters_all} "
+        f"(budget={opt.iterations}, covers {min(opt.iterations, _min_iters_all) * 100 // _min_iters_all}%). "
+        + ("Remaining frames will be flushed post-loop." if opt.iterations < _min_iters_all else "All frames covered."),
         flush=True,
     )
 
@@ -1527,12 +1661,42 @@ def streaming_training(
 
         # ---- Frame ingestion -----------------------------------------------
         if streaming_scene.has_next_frame() and scheduler.should_release(iteration, dt=_iter_dt):
-            result = streaming_scene.ingest_next_frame()
+            admission_fn = None
+            if getattr(args, "streaming_frame_admission", "all") == "hybrid_keyframe":
+                admission_fn = _hybrid_keyframe_admission
+            result = streaming_scene.ingest_next_frame(admission_fn=admission_fn)
             if result is not None:
                 new_cam, new_frame, is_train = result
                 scheduler.mark_released()
                 n_frames_ingested += 1
+                if is_train:
+                    _n_frames_trained += 1
                 _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
+                _admission_stats = getattr(new_frame, "_streaming_admission_stats", None)
+                if tb_writer and _admission_stats:
+                    tb_writer.add_scalar(
+                        "streaming/keyframes_admitted",
+                        int(getattr(streaming_scene, "_keyframes_admitted", 0)),
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        "streaming/keyframes_rejected",
+                        int(getattr(streaming_scene, "_keyframes_rejected", 0)),
+                        iteration,
+                    )
+                    for _k in ("overlap", "pose_delta_m", "pose_delta_deg", "gap", "admitted"):
+                        if _k in _admission_stats:
+                            tb_writer.add_scalar(f"streaming/keyframe/{_k}", float(_admission_stats[_k]), iteration)
+                if new_cam is None:
+                    if iteration % 100 == 0 or (
+                        _admission_stats and _admission_stats.get("reason") == "max_gap"
+                    ):
+                        print(
+                            f"[streaming] iter={iteration} frame={n_frames_ingested} "
+                            f"pose-only skip reason={_admission_stats.get('reason') if _admission_stats else 'unknown'}",
+                            flush=True,
+                        )
+                    is_train = False
 
                 # Phase 2: insert new Gaussians from depth
                 if is_train and getattr(args, "streaming_insert_from_depth", True):
@@ -1542,10 +1706,25 @@ def streaming_training(
                     if (not depth_respects_cap) or cap <= 0 or current_n < cap:
                         # Step 4: render new_cam to get alpha/depth mask
                         with torch.no_grad():
-                            pkg_new = render(new_cam, gaussians, pipe, background, render_depth=True)
+                            pkg_new = getattr(new_cam, "_streaming_admission_render_pkg", None)
+                            if pkg_new is None:
+                                pkg_new = render(new_cam, gaussians, pipe, background, render_depth=True)
                             alpha_new = pkg_new["alpha"]
                             depth_new = pkg_new.get("rendered_depth", None)
-                        
+
+                        # Depth comparison export
+                        if getattr(args, "streaming_export_depth_comparison", False) and depth_new is not None:
+                            _sensor_d = _get_sensor_depth(new_cam, new_cam.image_height, new_cam.image_width)
+                            if _sensor_d is not None:
+                                _dc_dir = os.path.join(args.model_path, "depth_comparison")
+                                _save_depth_comparison(
+                                    _dc_dir,
+                                    n_frames_ingested,
+                                    pkg_new["render"],
+                                    depth_new,
+                                    _sensor_d,
+                                )
+
                         added, _insert_stats = insert_gaussians_from_frame(
                             gaussians, new_frame, args,
                             streaming_scene=streaming_scene,
@@ -2014,22 +2193,25 @@ def streaming_training(
 
             # ---- Training-progress video capture (async) --------------------
             if _progress_video_interval > 0 and iteration % _progress_video_interval == 0:
-                # Dynamically pick 3 cameras from the arrived pool that are
-                # closest to the 0%, 50%, 100% positions of the FULL trajectory.
-                # Renders start from iteration 1 with whatever cameras exist.
-                _arrived_trcams = list(streaming_scene.train_cameras)
-                _n_arr = len(_arrived_trcams)
-                if _n_arr >= 1:
-                    _progress_cams_now = []
-                    for _tidx in _progress_target_idxs:
-                        _cam_idx = min(_tidx, _n_arr - 1)
-                        _progress_cams_now.append(_arrived_trcams[_cam_idx])
+                # Lock the progress-video cameras once. Recomputing "closest"
+                # cameras as more frames arrive makes the exported video cycle
+                # through different camera IDs, which is misleading.
+                if not _progress_cams:
+                    _arrived_trcams = list(streaming_scene.train_cameras)
+                    if len(_arrived_trcams) >= 3:
+                        _n_arr = len(_arrived_trcams)
+                        _progress_cams = [
+                            _arrived_trcams[0],
+                            _arrived_trcams[(_n_arr - 1) // 2],
+                            _arrived_trcams[_n_arr - 1],
+                        ]
+                if _progress_cams:
                     # Submit batched render to side CUDA stream
                     with torch.cuda.stream(_pv_stream):
                         _pv_stream.wait_stream(torch.cuda.current_stream())
                         with torch.no_grad():
                             _gpu_panels = _render_batch(
-                                _progress_cams_now, gaussians, pipe, background
+                                _progress_cams, gaussians, pipe, background
                             )
                     # Hand off to CPU worker; drop frame if worker is still busy
                     try:
@@ -2136,6 +2318,68 @@ def streaming_training(
             _state = gaussians.capture()
             _chk = os.path.join(args.model_path, f"chkpnt{iteration}.pth")
             save_worker.enqueue(lambda s=_state, i=iteration, p=_chk: torch.save((s, i), p))
+
+    # ---- Post-loop frame flush -----------------------------------------------
+    # Ingest any frames that weren't reached within the iteration budget.
+    # Each frame is added as a camera (for eval coverage) and gets depth
+    # insertion, but NO RGB optimization runs — the training budget is spent.
+    if streaming_scene.has_next_frame():
+        _flush_admission_fn = None
+        if getattr(args, "streaming_frame_admission", "all") == "hybrid_keyframe":
+            _flush_admission_fn = _hybrid_keyframe_admission
+        _flush_start = n_frames_ingested
+        _flush_insert_total = 0
+        print(
+            f"[streaming] Post-loop flush: ingesting remaining frames "
+            f"(depth insertion only, no optimization)...",
+            flush=True,
+        )
+        while streaming_scene.has_next_frame():
+            _f_result = streaming_scene.ingest_next_frame(admission_fn=_flush_admission_fn)
+            if _f_result is None:
+                continue
+            _f_cam, _f_frame, _f_is_train = _f_result
+            n_frames_ingested += 1
+            if _f_is_train and getattr(args, "streaming_insert_from_depth", True):
+                cap = getattr(args, "cap_max", -1)
+                _n_now = gaussians.get_xyz.shape[0]
+                if not getattr(args, "streaming_depth_respects_cap", False) or cap <= 0 or _n_now < cap:
+                    with torch.no_grad():
+                        _f_pkg = render(_f_cam, gaussians, pipe, background, render_depth=True)
+                    _f_alpha = _f_pkg["alpha"]
+                    _f_depth = _f_pkg.get("rendered_depth", None)
+                    if getattr(args, "streaming_export_depth_comparison", False) and _f_depth is not None:
+                        _f_sensor_d = _get_sensor_depth(_f_cam, _f_cam.image_height, _f_cam.image_width)
+                        if _f_sensor_d is not None:
+                            _save_depth_comparison(
+                                os.path.join(args.model_path, "depth_comparison"),
+                                n_frames_ingested,
+                                _f_pkg["render"],
+                                _f_depth,
+                                _f_sensor_d,
+                            )
+                    _f_added, _ = insert_gaussians_from_frame(
+                        gaussians, _f_frame, args,
+                        streaming_scene=streaming_scene,
+                        prev_frame=_prev_insert_frame,
+                        prev_depth_meters=_prev_insert_depth_m,
+                        render_alpha=_f_alpha,
+                        render_depth=_f_depth,
+                        current_frame_idx=n_frames_ingested,
+                    )
+                    _flush_insert_total += _f_added
+                    _prev_insert_frame = _f_frame
+                    _prev_insert_depth_m = _load_depth_meters(_f_frame)
+        total_inserted += _flush_insert_total
+        _eff_spf = opt.iterations / max(1, _n_frames_trained)
+        print(
+            f"[streaming] Post-loop flush complete: flushed {n_frames_ingested - _flush_start} frames, "
+            f"inserted {_flush_insert_total} Gaussians, N={gaussians.get_xyz.shape[0]}\n"
+            f"[streaming] Coverage: {_n_frames_trained} frames optimized × "
+            f"{_eff_spf:.1f} avg steps/frame + {n_frames_ingested - _flush_start} flush-only frames = "
+            f"{n_frames_ingested} total / {_n_total_frames} dataset frames",
+            flush=True,
+        )
 
     # Mandatory post-training report: test PSNR + side-by-side PNGs +
     # contact sheet + trajectory MP4. Always runs (independent of the

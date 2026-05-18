@@ -17,6 +17,7 @@ services:
     volumes:
       - ./output:/workspace/3dgs-mcmc/output
       - ./data:/data
+      - ${HOME}/.cache/torch:/root/.cache/torch
     working_dir: /workspace/3dgs-mcmc
     command: bash
     build:
