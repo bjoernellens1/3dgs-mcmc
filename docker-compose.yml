@@ -15,9 +15,11 @@ services:
       HSA_ENABLE_SDMA: "0"
       PYTORCH_ROCM_ARCH: "gfx1151"
     volumes:
-      - ./output:/workspace/3dgs-mcmc/output
+      # - ./output:/workspace/3dgs-mcmc/output
       - ./data:/data
       - ${HOME}/.cache/torch:/root/.cache/torch
+      - ./:/workspace/3dgs-mcmc
+      - /mnt/cps_persistent1_shared/datasets:/mnt/cps_persistent1_shared/datasets
     working_dir: /workspace/3dgs-mcmc
     command: bash
     build:
