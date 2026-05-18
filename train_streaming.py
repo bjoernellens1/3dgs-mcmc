@@ -395,10 +395,9 @@ def insert_gaussians_from_frame(
     min_depth = getattr(args, "streaming_min_depth", 0.1)
     max_depth = getattr(args, "streaming_max_depth", 8.0)
     voxel_size = getattr(args, "streaming_insert_voxel_size", 0.02)
-    cover_voxel = getattr(args, "streaming_cover_voxel_size", 0.0)
-    if cover_voxel <= 0:
-        _cover_mult = getattr(args, "streaming_cover_voxel_multiplier", 1.0)
-        cover_voxel = voxel_size * max(_cover_mult, 0.1)
+    # Occupancy check always uses the same voxel_size as the hash (cover_voxel_size /
+    # cover_voxel_multiplier are deprecated; the hash enforces a single voxel size).
+    cover_voxel = voxel_size
     max_new = getattr(args, "streaming_max_new_gaussians_per_frame", 2000)
     init_opacity = getattr(args, "streaming_insert_opacity", 0.05)
     edge_threshold = getattr(args, "streaming_depth_edge_threshold", 0.02)
@@ -819,8 +818,8 @@ def _run_rolling_seed(
 
     print(f"[rolling_seed] mode: {submap_frames} frames/window, {refine_iters} global refine iters", flush=True)
 
-    # Collect all frames
-    all_frames = list(streaming_scene._all_frames)
+    # Collect all frames (use iter_all_frames to support lazy/live sources)
+    all_frames = list(streaming_scene.iter_all_frames())
     all_train_cameras = list(streaming_scene.train_cameras)
     while streaming_scene.has_next_frame():
         result = streaming_scene.ingest_next_frame()
@@ -1084,7 +1083,7 @@ def _run_submap_stitch(
           f"{submap_iters} iters/submap, {refine_iters} global refine iters", flush=True)
 
     # Collect all frames; ingest any remaining ones
-    all_frames = list(streaming_scene._all_frames)  # full ordered frame list
+    all_frames = list(streaming_scene.iter_all_frames())  # full ordered frame list
     all_train_cameras = list(streaming_scene.train_cameras)  # bootstrap already ingested
     while streaming_scene.has_next_frame():
         result = streaming_scene.ingest_next_frame()
@@ -1307,6 +1306,17 @@ def streaming_training(
         print("[streaming] TensorBoard not available.")
 
     save_worker = _AsyncSaveWorker()
+
+    import signal as _signal
+    _orig_sigint = _signal.getsignal(_signal.SIGINT)
+
+    def _graceful_shutdown(sig, frame):
+        print("\n[streaming] Interrupted — flushing save worker...", flush=True)
+        save_worker.shutdown()
+        _signal.signal(_signal.SIGINT, _orig_sigint)
+        raise KeyboardInterrupt
+
+    _signal.signal(_signal.SIGINT, _graceful_shutdown)
 
     # --- Build Gaussian model ----------------------------------------------
     model_layout = getattr(args, "model_layout", "gsplat").lower()
@@ -1596,7 +1606,7 @@ def streaming_training(
         "mcmc", "hybrid", "gsplat_energy_mcmc"
     }
 
-    _n_total_frames = len(streaming_scene._all_frames) if streaming_scene._all_frames is not None else streaming_scene._frame_count
+    _n_total_frames = streaming_scene._frame_count
     _spf = scheduler.steps_per_frame
     _min_iters_all = (getattr(args, "streaming_initial_frames", 5) * _spf) + _n_total_frames * _spf
     print(
@@ -1791,16 +1801,20 @@ def streaming_training(
         # Support update for provisional Gaussians (Step 8)
         _update_provisional_support(gaussians, viewpoint_cam, render_pkg, args)
 
-        # SLAM Lifecycle: Promote / Prune (Step 8)
-        # Skipped in placement_only — pruning would invalidate render_pkg tensors
-        # before the loss computation reads visibility_filter.
+        # SLAM Lifecycle: Promote non-structurally before forward pass consumption.
+        # Promotion only modifies in-place tensor values (opacities, provisional flag)
+        # and does NOT change N, so it is safe before backward.
+        # PRUNING is deferred to after optimizer.step() + MCMC so the render/loss/
+        # backward graph is never built on one parameter tensor set while the
+        # optimizer references a different (sliced) one.
+        _deferred_stale_mask = None
+        _deferred_stale_count = 0
         if not _placement_only and iteration % 100 == 0:
             with torch.no_grad():
-                # Promote
+                # Promote (in-place, no structural change)
                 promote_mask = gaussians.provisional & (gaussians.support_count >= args.streaming_min_support_views)
                 if promote_mask.any():
                     gaussians.provisional[promote_mask] = False
-                    # Boost opacity to signal permanence
                     target_op = inverse_sigmoid(torch.tensor(args.streaming_promote_opacity, device="cuda"))
                     if model_layout == "gsplat":
                         gaussians.params["opacities"].data[promote_mask] = target_op
@@ -1808,28 +1822,12 @@ def streaming_training(
                         gaussians._opacity.data[promote_mask] = target_op
                     print(f"[streaming] iter={iteration} promoted {promote_mask.sum().item()} points to permanent structure.", flush=True)
 
-                # Prune stale low-support points
+                # Compute stale mask but defer the actual prune to after backward.
                 age = n_frames_ingested - gaussians.birth_frame
                 stale_mask = gaussians.provisional & (age > args.streaming_provisional_max_age)
                 if stale_mask.any():
-                    print(f"[streaming] iter={iteration} pruning {stale_mask.sum().item()} stale provisional points.", flush=True)
-                    gaussians.prune_points(stale_mask)
-                    # Force occupancy hash update after pruning
-                    streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
-
-                # Periodic rebuild regardless of pruning — frees voxels of relocated Gaussians
-                _occ_rebuild_every = getattr(args, "streaming_occupancy_rebuild_interval", 200)
-                if _occ_rebuild_every > 0 and iteration % _occ_rebuild_every == 0:
-                    streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
-
-        # If N changed this iteration (insertion or pruning), resize render_pkg visibility
-        # so all downstream code (loss, MCMC, energy, grad-zeroing) sees a consistent size.
-        _cur_n_after = gaussians.get_xyz.shape[0]
-        _vf = render_pkg.get("visibility_filter")
-        if _vf is not None and _vf.shape[0] != _cur_n_after:
-            _vf_safe = torch.zeros(_cur_n_after, dtype=torch.bool, device=_vf.device)
-            _vf_safe[:min(_vf.shape[0], _cur_n_after)] = _vf[:min(_vf.shape[0], _cur_n_after)]
-            render_pkg["visibility_filter"] = _vf_safe
+                    _deferred_stale_mask = stale_mask
+                    _deferred_stale_count = int(stale_mask.sum().item())
 
         # ---- Loss ---------------------------------------------------------
         gt_image = viewpoint_cam.original_image
@@ -1980,6 +1978,7 @@ def streaming_training(
 
         # ---- Backward + optimizer step (skipped in placement_only mode) -----
         visible = render_pkg["visibility_filter"].detach().to(dtype=torch.bool).contiguous()
+        _step_mask = visible  # default; overridden below when sparse_active_set
         if not _placement_only:
             mcmc_strategy.step_pre_backward(
                 gaussians=gaussians, args=args, iteration=iteration,
@@ -1989,20 +1988,29 @@ def streaming_training(
 
             # Zero invisible grad rows in strided grads (active-set safety)
             if sparse_active_set and getattr(args, "selective_adam_zero_invisible_grads", True):
-                _mask = visible  # already resized above
+                # Use the same active mask as the regularizer (visible | provisional)
+                # so provisional Gaussians that aren't visible keep their gradients.
+                _step_mask = visible | gaussians.provisional.detach()
                 for group in gaussians.optimizer.param_groups:
                     p = group["params"][0]
                     if p.grad is not None and getattr(p.grad, "layout", torch.strided) == torch.strided:
-                        p.grad[~_mask] = 0.0
+                        p.grad[~_step_mask] = 0.0
 
             # H7: freeze confirmed old geometry — zero geometry gradients for splats
             # that are old enough not to be "young" and are not provisional.
             # Prevents optimizer from dragging confirmed good splats to explain new views.
+            # streaming_freeze_new_frame_steps: for this many steps after a new frame,
+            # treat ALL non-provisional splats as "old" (stricter than frame-age test).
             _iter_since_new_frame += 1
             if _freeze_old and hasattr(gaussians, "birth_frame") and hasattr(gaussians, "provisional"):
                 with torch.no_grad():
                     _frame_age = n_frames_ingested - gaussians.birth_frame.long()
-                    _young = gaussians.provisional | (_frame_age <= _young_age_frames)
+                    _strict_new_frame_phase = (_freeze_new_frame_steps > 0 and
+                                               _iter_since_new_frame < _freeze_new_frame_steps)
+                    if _strict_new_frame_phase:
+                        _young = gaussians.provisional
+                    else:
+                        _young = gaussians.provisional | (_frame_age <= _young_age_frames)
                     _old = ~_young
                     if _old.any():
                         if model_layout == "gsplat":
@@ -2040,12 +2048,12 @@ def streaming_training(
                     gaussians.prepare_selective_adam_step(
                         allow_dense_grads=getattr(args, "selective_adam_allow_dense_grads", False)
                     )
-                    gaussians.optimizer.step(visibility=visible)
+                    gaussians.optimizer.step(visibility=_step_mask if sparse_active_set else visible)
                 else:
                     gaussians.optimizer.step()
                 if pipe.gsplat_sparse_grad:
                     gaussians.normalize_rotation_params(
-                        mask=visible if sparse_active_set else None
+                        mask=_step_mask if sparse_active_set else None
                     )
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
@@ -2178,6 +2186,22 @@ def streaming_training(
                         gaussians.params["means"].data[_anchor_mask] = _anchor_pos
                     else:
                         gaussians._xyz.data[_anchor_mask] = _anchor_pos
+
+        # ---- Deferred lifecycle pruning (safe: optimizer/MCMC already done) --
+        if _deferred_stale_mask is not None and _deferred_stale_count > 0:
+            with torch.no_grad():
+                # Re-check mask validity: N may have changed if MCMC grew/relocated.
+                if _deferred_stale_mask.shape[0] == gaussians.get_xyz.shape[0]:
+                    print(f"[streaming] iter={iteration} pruning {_deferred_stale_count} stale provisional points.", flush=True)
+                    gaussians.prune_points(_deferred_stale_mask)
+                    streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
+                # else: N changed due to MCMC; skip prune this iter; will re-evaluate next cycle
+
+        # Periodic occupancy rebuild (independent of pruning)
+        with torch.no_grad():
+            _occ_rebuild_every = getattr(args, "streaming_occupancy_rebuild_interval", 200)
+            if _occ_rebuild_every > 0 and iteration % _occ_rebuild_every == 0:
+                streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
 
         # ---- Logging ------------------------------------------------------
         with torch.no_grad():
@@ -2435,6 +2459,7 @@ def streaming_training(
         else:
             print(f"[streaming] training_progress.mp4 FAILED: {_err}", flush=True)
 
+    _signal.signal(_signal.SIGINT, _orig_sigint)
     save_worker.shutdown()
     print("\n[streaming] Training complete.", flush=True)
 

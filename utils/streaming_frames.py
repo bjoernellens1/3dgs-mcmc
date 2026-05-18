@@ -818,6 +818,8 @@ class OrbbecRosBagFrameSource:
         open3d_odom_cache_dir: str = "",
         open3d_odom_stride: int = 1,
         open3d_odom_downscale: int = 1,
+        open3d_odom_max_trans_per_edge: float = 0.15,
+        open3d_odom_max_rot_deg_per_edge: float = 8.0,
     ):
         try:
             from rosbags.rosbag2 import Reader
@@ -861,14 +863,25 @@ class OrbbecRosBagFrameSource:
         depth_msgs: list = []    # (ts_ns, bytes)
         intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy, W, H)
 
-        def _msg_ns(msg, fallback_ns):
+        _msg_ns_zero_warned: set = set()
+
+        def _msg_ns(msg, fallback_ns, topic=""):
             header = getattr(msg, "header", None)
             stamp = getattr(header, "stamp", None)
-            if stamp is not None:
-                sec = getattr(stamp, "sec", getattr(stamp, "secs", 0))
-                nsec = getattr(stamp, "nanosec", getattr(stamp, "nsecs", 0))
-                return int(sec * 1e9 + nsec)
-            return fallback_ns
+            if stamp is None:
+                return fallback_ns
+            sec = int(getattr(stamp, "sec", getattr(stamp, "secs", 0)))
+            nsec = int(getattr(stamp, "nanosec", getattr(stamp, "nsecs", 0)))
+            if sec == 0 and nsec == 0:
+                if topic not in _msg_ns_zero_warned:
+                    _msg_ns_zero_warned.add(topic)
+                    print(
+                        f"[streaming] Warning: {topic!r} has unset header.stamp (sec=0, nsec=0); "
+                        "falling back to bag receive timestamp for this topic.",
+                        flush=True,
+                    )
+                return fallback_ns
+            return sec * 1_000_000_000 + nsec
 
         with Reader(path) as reader:
             want = [color_topic, depth_topic, camera_info_topic]
@@ -879,7 +892,7 @@ class OrbbecRosBagFrameSource:
                 topic = conn.topic
                 if topic == pose_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
-                    msg_ts = _msg_ns(msg, ts)
+                    msg_ts = _msg_ns(msg, ts, topic)
                     p = msg.pose.position
                     o = msg.pose.orientation
                     qx, qy, qz, qw = o.x, o.y, o.z, o.w
@@ -894,11 +907,11 @@ class OrbbecRosBagFrameSource:
                     pose_msgs.append((msg_ts, c2w))
                 elif topic == color_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
-                    msg_ts = _msg_ns(msg, ts)
+                    msg_ts = _msg_ns(msg, ts, topic)
                     color_msgs.append((msg_ts, bytes(msg.data)))
                 elif topic == depth_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
-                    msg_ts = _msg_ns(msg, ts)
+                    msg_ts = _msg_ns(msg, ts, topic)
                     fmt = getattr(msg, "format", "")
                     if fmt and "png" not in fmt.lower() and "16uc1" not in fmt.lower():
                         raise RuntimeError(
@@ -1041,6 +1054,8 @@ class OrbbecRosBagFrameSource:
         self._live_odom_stride = open3d_odom_stride
         self._live_odom_downscale = open3d_odom_downscale
         self._live_odom_max_failure_ratio = float(open3d_odom_max_failure_ratio)
+        self._live_odom_max_trans = float(open3d_odom_max_trans_per_edge) if open3d_odom_max_trans_per_edge > 0 else float("inf")
+        self._live_odom_max_rot = float(open3d_odom_max_rot_deg_per_edge) if open3d_odom_max_rot_deg_per_edge > 0 else float("inf")
         self._live_odom_successes = 0
         self._live_odom_failures = 0
         self._live_odom_pairs = 0
@@ -1492,12 +1507,48 @@ class OrbbecRosBagFrameSource:
             )
             self._live_odom_pairs += 1
             key_pose = self._frames[self._live_odom_prev_key_idx].c2w
+
+            # Phase 2.3: sanity-gate on estimated per-edge motion
+            if success:
+                delta = np.linalg.inv(trans_prev_to_curr)
+                edge_t = float(np.linalg.norm(delta[:3, 3]))
+                cos_r = float(np.clip((np.trace(delta[:3, :3]) - 1.0) * 0.5, -1.0, 1.0))
+                edge_r = float(np.degrees(np.arccos(cos_r)))
+                n_edges = max(1, idx - self._live_odom_prev_key_idx)
+                if (edge_t > self._live_odom_max_trans * n_edges or
+                        edge_r > self._live_odom_max_rot * n_edges):
+                    print(
+                        f"[live-o3d] idx={idx} sanity-gate reject: "
+                        f"dt={edge_t:.3f}m dr={edge_r:.1f}° over {n_edges} edges "
+                        f"(limits {self._live_odom_max_trans * n_edges:.3f}m "
+                        f"/ {self._live_odom_max_rot * n_edges:.1f}°)",
+                        flush=True,
+                    )
+                    success = False
+
             if success:
                 curr_pose = (key_pose @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32)
+                self._frames[idx]._odom_valid = True
                 self._live_odom_successes += 1
             else:
+                # Phase 2.2: on failure, keep the previous key pose but do NOT advance
+                # the odometry reference — the next estimate will still compare against
+                # the last good keyframe, preventing one bad edge from corrupting
+                # the rest of the trajectory.
                 curr_pose = key_pose.copy()
+                self._frames[idx].c2w = curr_pose
+                self._frames[idx]._odom_valid = False
                 self._live_odom_failures += 1
+                failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
+                if failure_ratio > self._live_odom_max_failure_ratio:
+                    raise RuntimeError(
+                        "Open3D live odometry failed too often: "
+                        f"{self._live_odom_failures}/{self._live_odom_pairs} keyframes "
+                        f"({failure_ratio:.1%}) exceeds --orbbec_open3d_odom_max_failure_ratio="
+                        f"{self._live_odom_max_failure_ratio}"
+                    )
+                self._live_odom_computed_idx = idx
+                continue  # skip reference advance
 
             self._frames[idx].c2w = curr_pose
 
@@ -1510,10 +1561,11 @@ class OrbbecRosBagFrameSource:
                     pose[:3, :3] = _quat_to_rot(_slerp(qa, qb, alpha))
                     pose[:3, 3] = (1.0 - alpha) * key_pose[:3, 3] + alpha * curr_pose[:3, 3]
                     self._frames[i].c2w = pose.astype(np.float32)
+                    self._frames[i]._odom_valid = True
 
             self._live_odom_prev_key_idx = idx
             self._live_odom_prev_key_rgbd = curr_rgbd
-            
+
             failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
             if failure_ratio > self._live_odom_max_failure_ratio:
                 raise RuntimeError(
@@ -1652,6 +1704,8 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_cache_dir=getattr(args, "orbbec_open3d_odom_cache_dir", ""),
             open3d_odom_stride=getattr(args, "orbbec_open3d_odom_stride", 1),
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
+            open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
+            open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
         )
     raise ValueError(
         f"[streaming] No supported RGB-D dataset layout found at: {path}\n"

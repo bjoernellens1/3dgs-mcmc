@@ -77,45 +77,74 @@ class GaussianModel:
         self.anchor_iter = torch.empty(0, dtype=torch.int32, device="cuda")
         self.setup_functions()
 
+    _STREAMING_BUFFER_NAMES: tuple = (
+        "birth_frame", "support_count", "provisional", "anchor_iter",
+        "lifecycle_state", "utility_ema", "anchor_scale_log", "anchor_opacity_logit",
+        "anchor_xyz",
+    )
+
     def capture(self):
-        return (
-            self.active_sh_degree,
-            self._xyz,
-            self._features_dc,
-            self._features_rest,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            self.xyz_gradient_accum,
-            self.denom,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-            self.birth_frame,
-            self.support_count,
-            self.provisional,
-        )
-    
+        streaming_state = {}
+        for name in self._STREAMING_BUFFER_NAMES:
+            buf = getattr(self, name, None)
+            if buf is not None:
+                streaming_state[name] = buf.detach().cpu()
+        return {
+            "layout": "legacy",
+            "active_sh_degree": self.active_sh_degree,
+            "xyz": self._xyz,
+            "features_dc": self._features_dc,
+            "features_rest": self._features_rest,
+            "scaling": self._scaling,
+            "rotation": self._rotation,
+            "opacity": self._opacity,
+            "max_radii2D": self.max_radii2D,
+            "xyz_gradient_accum": self.xyz_gradient_accum,
+            "denom": self.denom,
+            "optimizer": self.optimizer.state_dict(),
+            "spatial_lr_scale": self.spatial_lr_scale,
+            "streaming_state": streaming_state,
+        }
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale,
-        self.birth_frame,
-        self.support_count,
-        self.provisional) = model_args
+        if isinstance(model_args, tuple):
+            # Backward-compat: old tuple-format checkpoint
+            (self.active_sh_degree,
+             self._xyz, self._features_dc, self._features_rest,
+             self._scaling, self._rotation, self._opacity,
+             self.max_radii2D, xyz_gradient_accum, denom,
+             opt_dict, self.spatial_lr_scale,
+             *_legacy_extras) = model_args
+            self.training_setup(training_args)
+            self.xyz_gradient_accum = xyz_gradient_accum
+            self.denom = denom
+            self.optimizer.load_state_dict(opt_dict)
+            if len(_legacy_extras) >= 3:
+                self.birth_frame, self.support_count, self.provisional = _legacy_extras[:3]
+            return
+        self.active_sh_degree = model_args["active_sh_degree"]
+        self._xyz = model_args["xyz"]
+        self._features_dc = model_args["features_dc"]
+        self._features_rest = model_args["features_rest"]
+        self._scaling = model_args["scaling"]
+        self._rotation = model_args["rotation"]
+        self._opacity = model_args["opacity"]
+        self.max_radii2D = model_args["max_radii2D"]
+        self.spatial_lr_scale = model_args["spatial_lr_scale"]
         self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        self.xyz_gradient_accum = model_args["xyz_gradient_accum"]
+        self.denom = model_args["denom"]
+        self.optimizer.load_state_dict(model_args["optimizer"])
+        streaming_state = model_args.get("streaming_state", {})
+        if streaming_state:
+            for name, buf in streaming_state.items():
+                setattr(self, name, buf.to(device="cuda"))
+        elif any(hasattr(self, n) for n in self._STREAMING_BUFFER_NAMES):
+            print(
+                "[checkpoint] Warning: checkpoint has no streaming_state; "
+                "lifecycle/anchor/support buffers reset to defaults.",
+                flush=True,
+            )
 
     @property
     def get_scaling(self):

@@ -120,6 +120,8 @@ class ModelParams(ParamGroup):
         self.orbbec_open3d_odom_cache_dir = ""
         self.orbbec_open3d_odom_stride = 1
         self.orbbec_open3d_odom_downscale = 1
+        self.orbbec_open3d_odom_max_trans_per_edge = 0.15
+        self.orbbec_open3d_odom_max_rot_deg_per_edge = 8.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -312,9 +314,13 @@ class StreamingParams(ParamGroup):
         self.streaming_save_frame_interval = 50
         # Initial opacity for depth-inserted Gaussians — high enough for gradient signal
         self.streaming_insert_opacity = 0.05
-        # Coverage voxel multiplier (0 = use 1.5× insert_voxel_size)
+        # Batch N frames of depth-insertion candidates into a single add_points_as_gaussians
+        # call, reducing O(N²) optimizer-state rebuild to O(N/batch) calls. 0 = disable batching.
+        self.streaming_insertion_batch_frames = 5
+        # Flush the insertion batch early if it exceeds this many pending points (0 = no early flush).
+        self.streaming_insertion_batch_max_points = 8000
+        # Coverage voxel multiplier (deprecated — occupancy hash enforces a single voxel size)
         self.streaming_cover_voxel_size = 0.0
-        # Multiplier on insert_voxel_size for the occupancy exclusion check (replaces hardcoded 1.5)
         self.streaming_cover_voxel_multiplier = 1.0
         # Rebuild occupancy hash from current Gaussian positions every N iters (0 = only on stale prune)
         self.streaming_occupancy_rebuild_interval = 200

@@ -254,7 +254,21 @@ class GsplatGaussianModel:
                         if key in stored_state and not stored_state[key].is_contiguous():
                             stored_state[key] = stored_state[key].contiguous()
 
+    # Names of streaming lifecycle buffers saved in capture() and restored in restore().
+    # Kept as a class constant so capture/restore and _sync_streaming_state_lengths all
+    # reference the same list.
+    _STREAMING_BUFFER_NAMES: tuple = (
+        "birth_frame", "support_count", "provisional", "anchor_iter",
+        "lifecycle_state", "utility_ema", "anchor_scale_log", "anchor_opacity_logit",
+        "anchor_xyz",
+    )
+
     def capture(self):
+        streaming_state = {}
+        for name in self._STREAMING_BUFFER_NAMES:
+            buf = getattr(self, name, None)
+            if buf is not None:
+                streaming_state[name] = buf.detach().cpu()
         return {
             "layout": "gsplat",
             "active_sh_degree": self.active_sh_degree,
@@ -262,6 +276,7 @@ class GsplatGaussianModel:
             "optimizers": self.optimizer.state_dict(),
             "spatial_lr_scale": self.spatial_lr_scale,
             "visibility_ema": self.visibility_ema,
+            "streaming_state": streaming_state,
         }
 
     def restore(self, model_args, training_args):
@@ -279,6 +294,16 @@ class GsplatGaussianModel:
             "visibility_ema",
             torch.zeros((self.get_xyz.shape[0], 1), device="cuda"),
         ).to(device="cuda")
+        streaming_state = model_args.get("streaming_state", {})
+        if streaming_state:
+            for name, buf in streaming_state.items():
+                setattr(self, name, buf.to(device="cuda"))
+        elif any(hasattr(self, n) for n in self._STREAMING_BUFFER_NAMES):
+            print(
+                "[checkpoint] Warning: checkpoint has no streaming_state; "
+                "lifecycle/anchor/support buffers reset to defaults.",
+                flush=True,
+            )
 
     def construct_list_of_attributes(self):
         names = ["x", "y", "z", "nx", "ny", "nz"]

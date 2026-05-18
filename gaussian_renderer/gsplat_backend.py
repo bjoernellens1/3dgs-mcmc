@@ -229,13 +229,9 @@ def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor,
         means2d = meta.get("means2d", torch.zeros(N, 2, device=device, dtype=torch.float32))
         is_used = radii > 0
 
-    # Old code creates a dummy screenspace_points tensor for gradient hooks.
-    # The MCMC training loop does not use it, but we keep it for API parity.
-    screenspace_points = torch.zeros_like(means, dtype=means.dtype, requires_grad=True, device=device)
-    try:
-        screenspace_points.retain_grad()
-    except Exception:
-        pass
+    # Dummy screenspace_points for API parity. NOT connected to rasterisation —
+    # gradient-based densification strategies must not read viewspace_points.grad.
+    screenspace_points = torch.zeros_like(means, dtype=means.dtype, requires_grad=False, device=device)
 
     visibility_filter = radii > 0
 
