@@ -237,7 +237,7 @@ class StreamingScene:
     def _build_pcd_from_frames(self, frames: List["StreamingRGBDFrame"]):
         """Backproject depth into a BasicPointCloud for create_from_pcd()."""
         from utils.graphics_utils import BasicPointCloud
-        from utils.rgbd_frames import depth_to_meters
+        from utils.rgbd_frames import depth_to_meters, backproject_depth_pixels
         from PIL import Image as _Image
 
         depth_stride = getattr(self.args, "streaming_depth_stride", 8)
@@ -274,15 +274,10 @@ class StreamingScene:
             d_fy = frame.depth_fy if frame.depth_fy is not None else frame.fy
             d_cx = frame.depth_cx if frame.depth_cx is not None else frame.cx
             d_cy = frame.depth_cy if frame.depth_cy is not None else frame.cy
-            x_c = (xs_v - d_cx) / d_fx * z_v
-            y_c = (ys_v - d_cy) / d_fy * z_v
-            pts_cam = np.stack([x_c, y_c, z_v], axis=1)
-            pts_world = (frame.c2w[:3, :3] @ pts_cam.T).T + frame.c2w[:3, 3]
-            rgb_h, rgb_w = rgb.shape[:2]
-            rx = np.clip((xs_v / max(w - 1, 1) * (rgb_w - 1)).round().astype(np.int32), 0, rgb_w - 1)
-            ry = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
-            points_all.append(pts_world.astype(np.float32))
-            colors_all.append(rgb[ry, rx].astype(np.float32))
+            pts_world, cols = backproject_depth_pixels(
+                z_v, xs_v, ys_v, d_fx, d_fy, d_cx, d_cy, frame.c2w, rgb, (h, w))
+            points_all.append(pts_world)
+            colors_all.append(cols)
 
         if not points_all:
             # Fall back to random scatter inside the estimated scene extent

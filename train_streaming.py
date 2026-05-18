@@ -515,15 +515,10 @@ def insert_gaussians_from_frame(
     ys_v = ys_vi[angle_ok].astype(np.float32)
     z_v = z_vi[angle_ok].astype(np.float32)
     nx = nx[angle_ok]; ny = ny[angle_ok]; nz = nz[angle_ok]
-    
-    x_c = (xs_v - d_cx) / d_fx * z_v
-    y_c = (ys_v - d_cy) / d_fy * z_v
-    pts = ((frame.c2w[:3, :3] @ np.stack([x_c, y_c, z_v], axis=1).T).T + frame.c2w[:3, 3]).astype(np.float32)
-    
-    rgb_h, rgb_w = rgb.shape[:2]
-    rx = np.clip((xs_v / max(w - 1, 1) * (rgb_w - 1)).round().astype(np.int32), 0, rgb_w - 1)
-    ry = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
-    cols = rgb[ry, rx].astype(np.float32)
+
+    from utils.rgbd_frames import backproject_depth_pixels
+    pts, cols = backproject_depth_pixels(
+        z_v, xs_v, ys_v, d_fx, d_fy, d_cx, d_cy, frame.c2w, rgb, (h, w))
 
     # ---- Persistent Voxel coverage filter (Step 7) --------------------------
     occupied = streaming_scene.check_occupancy(pts, cover_voxel, check_neighbors=True)

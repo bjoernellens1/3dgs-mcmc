@@ -160,6 +160,49 @@ def decode_depth_image(data, encoding):
     raise ValueError(f"Unsupported depth image encoding: {encoding}")
 
 
+def backproject_depth_pixels(
+    z_v: "np.ndarray",
+    xs_v: "np.ndarray",
+    ys_v: "np.ndarray",
+    d_fx: float,
+    d_fy: float,
+    d_cx: float,
+    d_cy: float,
+    c2w: "np.ndarray",
+    rgb: "np.ndarray",
+    depth_hw: tuple,
+) -> tuple:
+    """
+    Project a set of valid depth pixels into world-space points and sample RGB.
+
+    Parameters
+    ----------
+    z_v, xs_v, ys_v : 1-D float32 arrays of valid pixel depth, column, row.
+    d_fx, d_fy, d_cx, d_cy : depth camera intrinsics.
+    c2w : (4, 4) float32 camera-to-world transform.
+    rgb : (H_rgb, W_rgb, 3) float32 [0, 1] color image.
+    depth_hw : (H_depth, W_depth) — used to map depth pixel coords to rgb coords.
+
+    Returns
+    -------
+    pts_world : (N, 3) float32 world-space points.
+    cols      : (N, 3) float32 RGB colors sampled from rgb.
+    """
+    import numpy as np
+
+    x_c = (xs_v - d_cx) / d_fx * z_v
+    y_c = (ys_v - d_cy) / d_fy * z_v
+    pts_cam = np.stack([x_c, y_c, z_v], axis=1)
+    pts_world = (c2w[:3, :3] @ pts_cam.T).T + c2w[:3, 3]
+
+    h, w = depth_hw
+    rgb_h, rgb_w = rgb.shape[:2]
+    rx = np.clip((xs_v / max(w - 1, 1) * (rgb_w - 1)).round().astype(np.int32), 0, rgb_w - 1)
+    ry = np.clip((ys_v / max(h - 1, 1) * (rgb_h - 1)).round().astype(np.int32), 0, rgb_h - 1)
+    cols = rgb[ry, rx].astype(np.float32)
+    return pts_world.astype(np.float32), cols
+
+
 def depth_to_meters(depth, depth_scale):
     arr = np.asarray(depth)
     if arr.dtype == np.float32 or arr.dtype == np.float64:
