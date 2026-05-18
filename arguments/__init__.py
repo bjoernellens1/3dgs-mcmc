@@ -316,7 +316,7 @@ class StreamingParams(ParamGroup):
         self.streaming_insert_opacity = 0.05
         # Batch N frames of depth-insertion candidates into a single add_points_as_gaussians
         # call, reducing O(N²) optimizer-state rebuild to O(N/batch) calls. 0 = disable batching.
-        self.streaming_insertion_batch_frames = 5
+        self.streaming_insertion_batch_frames = 1
         # Flush the insertion batch early if it exceeds this many pending points (0 = no early flush).
         self.streaming_insertion_batch_max_points = 8000
         # Coverage voxel multiplier (deprecated — occupancy hash enforces a single voxel size)

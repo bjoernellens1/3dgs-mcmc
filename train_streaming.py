@@ -394,7 +394,7 @@ def insert_gaussians_from_frame(
     _stats: dict = {}
 
     if frame._depth_bytes is None and (frame.depth_path is None or not os.path.exists(frame.depth_path)):
-        return 0, _stats
+        return ({} if _collect_only else 0), _stats
 
     depth_stride = getattr(args, "streaming_depth_stride", 8)
     min_depth = getattr(args, "streaming_min_depth", 0.1)
@@ -414,7 +414,7 @@ def insert_gaussians_from_frame(
         depth = np.asarray(load_frame_depth_np(frame))
         rgb = np.array(load_frame_rgb(frame)).astype(np.float32) / 255.0
     except Exception:
-        return 0, _stats
+        return ({} if _collect_only else 0), _stats
 
     # Use sensor-specific depth intrinsics when available (e.g. ScanNet has
     # separate color (1296×968) and depth (640×480) cameras).
@@ -485,7 +485,7 @@ def insert_gaussians_from_frame(
             _stats["after_edge_filter"] = int(valid.sum())
 
     if not valid.any():
-        return 0, _stats
+        return ({} if _collect_only else 0), _stats
 
     # Sampling for normals
     s = depth_stride
@@ -509,7 +509,7 @@ def insert_gaussians_from_frame(
     if _debug:
         _stats["after_grazing_filter"] = int(angle_ok.sum())
     if not angle_ok.any():
-        return 0, _stats
+        return ({} if _collect_only else 0), _stats
         
     xs_v = xs_vi[angle_ok].astype(np.float32)
     ys_v = ys_vi[angle_ok].astype(np.float32)
@@ -530,7 +530,7 @@ def insert_gaussians_from_frame(
         _stats["after_voxel_occupancy"] = pts.shape[0]
 
     if pts.shape[0] == 0:
-        return 0, _stats
+        return ({} if _collect_only else 0), _stats
 
     # Downsample remaining
     pts, indices = _voxel_downsample_indices(pts, voxel_size)
@@ -572,7 +572,7 @@ def insert_gaussians_from_frame(
                 if _debug:
                     _stats["after_knn_dedup"] = pts.shape[0]
             else:
-                return 0, _stats
+                return ({} if _collect_only else 0), _stats
 
     if max_new > 0 and pts.shape[0] > max_new:
         rng = np.random.default_rng(42)
@@ -2281,12 +2281,18 @@ def streaming_training(
         # ---- Deferred lifecycle pruning (safe: optimizer/MCMC already done) --
         if _deferred_stale_mask is not None and _deferred_stale_count > 0:
             with torch.no_grad():
-                # Re-check mask validity: N may have changed if MCMC grew/relocated.
-                if _deferred_stale_mask.shape[0] == gaussians.get_xyz.shape[0]:
+                current_n = gaussians.get_xyz.shape[0]
+                mask_n = _deferred_stale_mask.shape[0]
+                if mask_n < current_n:
+                    # MCMC growth added entries after mask was computed; pad with False
+                    pad = torch.zeros(current_n - mask_n, dtype=torch.bool, device=_deferred_stale_mask.device)
+                    _deferred_stale_mask = torch.cat([_deferred_stale_mask, pad])
+                if _deferred_stale_mask.shape[0] == current_n:
                     print(f"[streaming] iter={iteration} pruning {_deferred_stale_count} stale provisional points.", flush=True)
                     gaussians.prune_points(_deferred_stale_mask)
                     streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
-                # else: N changed due to MCMC; skip prune this iter; will re-evaluate next cycle
+                else:
+                    print(f"[streaming] WARNING: deferred prune mask shape mismatch ({_deferred_stale_mask.shape[0]} vs {current_n}), skipping", flush=True)
 
         # Periodic occupancy rebuild (independent of pruning)
         with torch.no_grad():
