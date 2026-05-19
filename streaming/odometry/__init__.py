@@ -1,7 +1,12 @@
 """
-Odometry sub-package (placeholder for Phase 4 async worker).
+Odometry sub-package.
 
-Live Open3D odometry is currently implemented inside
-utils/streaming_frames.OrbbecRosBagFrameSource.  Phase 4 will extract it
-into streaming.odometry.async_worker.
+Shared types (OdometryStats, PoseReadyFrame) are in async_worker and used
+by both the live OrbbecRosBagFrameSource and the Phase 5+ async queue path.
 """
+from streaming.odometry.async_worker import (  # noqa: F401
+    OdometryStats,
+    PoseReadyFrame,
+    AsyncOdometryWorker,
+    log_odom_stats,
+)
