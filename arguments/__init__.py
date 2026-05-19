@@ -518,6 +518,9 @@ class StreamingParams(ParamGroup):
         # to <model_path>/trajectory_eval/. Default on.
         self.streaming_trajectory_eval = True
         self.streaming_resolution = 1  # integer divisor: scale input frames before odometry and splatting
+        # Benchmark mode: disable final report, progress video, LPIPS, and train metrics.
+        # Use for core-training throughput profiling to avoid report VRAM overhead.
+        self.streaming_benchmark_mode = False
         super().__init__(parser, "Streaming Parameters")
 
 

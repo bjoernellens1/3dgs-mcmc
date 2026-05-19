@@ -662,30 +662,41 @@ def write_post_training_report(
             print(f"[report] iter={iteration} no trajectory views selected — skipping trajectory MP4", flush=True)
             cams_for_video = []
 
-        if cams_for_video and batch_render_fn is not None:
-            try:
-                traj_imgs = _batch_render_images(
-                    cams_for_video, gaussians, pipe, background,
-                    batch_render_fn=batch_render_fn, chunk_size=32,
-                )
-            except Exception as e:
-                print(f"[report] batch trajectory render failed, falling back: {e}", flush=True)
-                traj_imgs = []
-        else:
-            traj_imgs = []
-        use_traj_batch = len(traj_imgs) == len(cams_for_video)
+        # Render trajectory in small chunks to avoid holding all GPU frames at once.
+        # Each chunk is rendered via batched rasterization for throughput, then
+        # immediately converted to CPU uint8 before the next chunk is fetched.
+        _traj_chunk = 8
 
         def _frames():
-            for idx, cam in enumerate(cams_for_video):
-                try:
-                    if use_traj_batch:
-                        img = traj_imgs[idx].clamp(0.0, 1.0)
-                    else:
-                        img = _render_image(cam, gaussians, render_fn, pipe, background)
-                except Exception as e:
-                    print(f"[report] trajectory render failed for {cam.image_name}: {e}", flush=True)
-                    continue
-                yield _to_uint8_hwc(img)
+            for start in range(0, len(cams_for_video), _traj_chunk):
+                chunk = cams_for_video[start:start + _traj_chunk]
+                if batch_render_fn is not None:
+                    try:
+                        chunk_imgs = batch_render_fn(chunk, gaussians, pipe, background,
+                                                     chunk_size=_traj_chunk)
+                    except Exception as e:
+                        print(f"[report] batch trajectory render failed, falling back: {e}",
+                              flush=True)
+                        chunk_imgs = []
+                    if len(chunk_imgs) != len(chunk):
+                        chunk_imgs = []
+                else:
+                    chunk_imgs = []
+                for i, cam in enumerate(chunk):
+                    try:
+                        if chunk_imgs:
+                            img = chunk_imgs[i].clamp(0.0, 1.0)
+                        else:
+                            img = _render_image(cam, gaussians, render_fn, pipe, background)
+                    except Exception as e:
+                        print(f"[report] trajectory render failed for {cam.image_name}: {e}",
+                              flush=True)
+                        continue
+                    yield _to_uint8_hwc(img)
+                    del img
+                del chunk_imgs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         if cams_for_video:
             video_fps = _infer_realtime_fps(cams_for_video, mp4_fps)

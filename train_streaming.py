@@ -2008,9 +2008,11 @@ def streaming_training(
     _bootstrap_anchor_decay = max(1, int(getattr(args, "streaming_bootstrap_anchor_decay_steps", 2000)))
     _insertion_anchor_weight = float(getattr(args, "streaming_insertion_anchor_weight", 1.0))
     _insertion_anchor_decay  = max(1, int(getattr(args, "streaming_insertion_anchor_decay_steps", 200)))
+    # Disable report, trajectory eval, and progress video for throughput profiling.
+    _benchmark_mode = getattr(args, "streaming_benchmark_mode", False)
 
-    # Training-progress video setup
-    _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
+    # Training-progress video setup (disabled in benchmark_mode to save VRAM/CPU overhead)
+    _progress_video_interval = 0 if _benchmark_mode else max(0, int(getattr(args, "progress_video_interval", 200)))
     _progress_video_fps = int(getattr(args, "progress_video_fps", 10))
     _progress_cams: list = []     # fixed camera objects once selected
     _progress_frames: list = []   # accumulated side-by-side uint8 HWC numpy frames
@@ -3048,7 +3050,8 @@ def streaming_training(
 
     # Post-training report: bounded test/train metrics + side-by-side PNGs +
     # contact sheet + trajectory MP4. Can be disabled for core-training profiling.
-    _report_final = getattr(args, "streaming_report_final", True)
+    # _benchmark_mode was resolved earlier; report is skipped when it is active.
+    _report_final = getattr(args, "streaming_report_final", True) and not _benchmark_mode
     # Bootstrap-view comparison renders are always written when the bootstrap-motion
     # diagnostic is active — even if --no-streaming_report_final was passed.
     _force_bootstrap_views = _debug_bootstrap_motion and bool(_bootstrap_cams)
@@ -3096,7 +3099,7 @@ def streaming_training(
         print("[streaming-report] final report disabled by --no-streaming_report_final", flush=True)
 
     # ---- Trajectory evaluation -----------------------------------------------
-    if getattr(args, "streaming_trajectory_eval", True):
+    if getattr(args, "streaming_trajectory_eval", True) and not _benchmark_mode:
         try:
             from utils.trajectory_eval import run_trajectory_eval
             run_trajectory_eval(
