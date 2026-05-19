@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3DGS-MCMC Viewer</title>
+<script src="/vendor/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #111827;
+    color: #e5e7eb;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    border-bottom: 1px solid #263244;
+    background: #151d2b;
+  }
+  h1 { font-size: 1rem; margin: 0; color: #f9fafb; }
+  button, select {
+    background: #243244;
+    color: #e5e7eb;
+    border: 1px solid #39485d;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font: inherit;
+  }
+  button { cursor: pointer; }
+  button.active { background: #0ea5e9; border-color: #38bdf8; color: #06111a; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(360px, 1fr) 360px;
+    gap: 16px;
+    padding: 16px;
+  }
+  .surface, .side {
+    background: #1f2937;
+    border: 1px solid #334155;
+    border-radius: 8px;
+  }
+  .surface { min-height: 520px; overflow: hidden; }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 10px;
+    border-bottom: 1px solid #334155;
+  }
+  .viewer-pane { display: none; height: 560px; background: #05070a; }
+  .viewer-pane.active { display: block; }
+  #renderCanvas, #splatCanvas, #videoPlayer {
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: #000;
+  }
+  #renderCanvas { object-fit: contain; }
+  #videoPlayer { object-fit: contain; }
+  .side { padding: 12px; }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #aab6c7;
+    font-size: 0.85rem;
+    margin-left: auto;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 999px; background: #ef4444; }
+  .dot.on { background: #22c55e; }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .stat {
+    background: #172033;
+    border: 1px solid #2a3950;
+    border-radius: 8px;
+    padding: 10px;
+    min-height: 64px;
+  }
+  .stat .value { font-size: 1.2rem; font-weight: 650; color: #f8fafc; }
+  .stat .label { font-size: 0.72rem; color: #8fa0b8; text-transform: uppercase; margin-top: 4px; }
+  .chart-box { height: 170px; margin-top: 12px; }
+  .meta { color: #8fa0b8; font-size: 0.82rem; line-height: 1.45; margin-top: 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 160px; }
+  @media (max-width: 980px) {
+    main { grid-template-columns: 1fr; }
+    .viewer-pane { height: 420px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>3DGS-MCMC Viewer</h1>
+  <div class="row" role="group" aria-label="Viewer mode">
+    <button class="mode active" data-mode="live">Live Render</button>
+    <button class="mode" data-mode="video">Videos</button>
+    <button class="mode" data-mode="scene">Scene PLY</button>
+  </div>
+  <div class="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">disconnected</span>
+  </div>
+</header>
+
+<main>
+  <section class="surface">
+    <div class="toolbar">
+      <div class="row" id="liveControls">
+        <button id="camPrev">Prev</button>
+        <span id="camDisplay">cam 0/1</span>
+        <button id="camNext">Next</button>
+      </div>
+      <div class="row" id="videoControls" style="display:none">
+        <select id="videoSelect" class="grow"></select>
+      </div>
+      <div class="row" id="sceneControls" style="display:none">
+        <select id="sceneSelect" class="grow"></select>
+        <button id="loadScene">Load</button>
+      </div>
+    </div>
+    <div id="livePane" class="viewer-pane active">
+      <canvas id="renderCanvas"></canvas>
+    </div>
+    <div id="videoPane" class="viewer-pane">
+      <video id="videoPlayer" controls playsinline></video>
+    </div>
+    <div id="scenePane" class="viewer-pane">
+      <canvas id="splatCanvas"></canvas>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="stats">
+      <div class="stat"><div class="value" id="statIter">-</div><div class="label">Iteration</div></div>
+      <div class="stat"><div class="value" id="statGaussians">-</div><div class="label">Gaussians</div></div>
+      <div class="stat"><div class="value" id="statLoss">-</div><div class="label">Loss</div></div>
+      <div class="stat"><div class="value" id="statIters">-</div><div class="label">Iterations/s</div></div>
+    </div>
+    <div class="chart-box"><canvas id="lossChart"></canvas></div>
+    <div class="chart-box"><canvas id="countChart"></canvas></div>
+    <div class="meta" id="mediaInfo">waiting for training data</div>
+  </aside>
+</main>
+
+<script type="module">
+import * as pc from '/vendor/playcanvas.mjs';
+
+const WS_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+const MAX_POINTS = 1200;
+let ws = null;
+let camIdx = 0;
+let totalCams = 1;
+let state = {};
+let currentMode = 'live';
+let pendingImage = null;
+
+const charts = (() => {
+  const opts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { type: 'linear', ticks: { color: '#8fa0b8', maxTicksLimit: 6 }, grid: { color: '#2b374a' } },
+      y: { ticks: { color: '#8fa0b8' }, grid: { color: '#2b374a' } }
+    }
+  };
+  const make = (id, color) => new Chart(document.getElementById(id), {
+    type: 'scatter',
+    data: { datasets: [{ data: [], showLine: true, pointRadius: 1.5, borderColor: color, backgroundColor: color }] },
+    options: opts
+  });
+  return {
+    loss: make('lossChart', '#f97316'),
+    count: make('countChart', '#38bdf8')
+  };
+})();
+
+function addPoint(chart, x, y) {
+  const ds = chart.data.datasets[0];
+  ds.data.push({ x, y });
+  if (ds.data.length > MAX_POINTS) ds.data.shift();
+  chart.update('none');
+}
+
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll('.mode').forEach(btn => btn.classList.toggle('active', btn.dataset.mode === mode));
+  document.querySelectorAll('.viewer-pane').forEach(p => p.classList.remove('active'));
+  document.getElementById(`${mode}Pane`).classList.add('active');
+  document.getElementById('liveControls').style.display = mode === 'live' ? 'flex' : 'none';
+  document.getElementById('videoControls').style.display = mode === 'video' ? 'flex' : 'none';
+  document.getElementById('sceneControls').style.display = mode === 'scene' ? 'flex' : 'none';
+  if (mode === 'scene') resizeSplat();
+}
+
+document.querySelectorAll('.mode').forEach(btn => btn.addEventListener('click', () => setMode(btn.dataset.mode)));
+
+function updateState(next) {
+  state = next || state || {};
+  const camera = state.camera || {};
+  camIdx = camera.cam_idx ?? camIdx;
+  totalCams = camera.total_cams ?? totalCams;
+  document.getElementById('camDisplay').textContent = `cam ${camIdx}/${totalCams}`;
+  populateMedia();
+}
+
+function populateMedia() {
+  const videoSelect = document.getElementById('videoSelect');
+  const currentVideo = videoSelect.value;
+  videoSelect.innerHTML = '';
+  for (const video of state.videos || []) {
+    const opt = document.createElement('option');
+    opt.value = video.url;
+    opt.textContent = `${video.name || video.label} (${video.frame_count || 0} frames)`;
+    videoSelect.appendChild(opt);
+  }
+  if (currentVideo) videoSelect.value = currentVideo;
+
+  const sceneSelect = document.getElementById('sceneSelect');
+  const currentScene = sceneSelect.value;
+  sceneSelect.innerHTML = '';
+  for (const scene of state.scenes || []) {
+    const opt = document.createElement('option');
+    opt.value = scene.url;
+    const mb = scene.size_bytes ? `, ${(scene.size_bytes / 1048576).toFixed(1)} MB` : '';
+    opt.textContent = `${scene.name || ('iter ' + scene.iteration)}${mb}`;
+    sceneSelect.appendChild(opt);
+  }
+  if (currentScene) sceneSelect.value = currentScene;
+  const status = state.status || {};
+  document.getElementById('mediaInfo').textContent =
+    `status: ${status.state || 'unknown'} · scenes: ${(state.scenes || []).length} · videos: ${(state.videos || []).length}`;
+}
+
+document.getElementById('videoSelect').addEventListener('change', (event) => {
+  document.getElementById('videoPlayer').src = event.target.value;
+});
+
+document.getElementById('loadScene').addEventListener('click', () => {
+  const url = document.getElementById('sceneSelect').value;
+  if (url) loadSplat(url);
+});
+
+document.getElementById('camPrev').addEventListener('click', () => setCamera((camIdx - 1 + totalCams) % totalCams));
+document.getElementById('camNext').addEventListener('click', () => setCamera((camIdx + 1) % totalCams));
+
+function setCamera(index) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'set_camera', index }));
+  }
+}
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    document.getElementById('statusDot').classList.add('on');
+    document.getElementById('statusText').textContent = 'connected';
+    ws.send('ping');
+  };
+  ws.onclose = () => {
+    document.getElementById('statusDot').classList.remove('on');
+    document.getElementById('statusText').textContent = 'disconnected';
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = event => {
+    if (event.data instanceof Blob) {
+      if (!pendingImage) return;
+      const meta = pendingImage;
+      pendingImage = null;
+      const url = URL.createObjectURL(event.data);
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.getElementById('renderCanvas');
+        canvas.width = meta.width;
+        canvas.height = meta.height;
+        canvas.getContext('2d').drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
+      return;
+    }
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.type === 'pong') return;
+    if (msg.type === 'image') { pendingImage = msg; return; }
+    if (msg.type === 'camera_info') {
+      camIdx = msg.cam_idx;
+      totalCams = msg.total_cams;
+      document.getElementById('camDisplay').textContent = `cam ${camIdx}/${totalCams}`;
+      return;
+    }
+    if (msg.type === 'state') {
+      updateState(msg.state);
+      return;
+    }
+    const it = msg.iteration;
+    if (it != null) document.getElementById('statIter').textContent = it;
+    if (msg.num_gaussians != null) {
+      document.getElementById('statGaussians').textContent =
+        msg.num_gaussians >= 1000 ? `${(msg.num_gaussians / 1000).toFixed(1)}k` : msg.num_gaussians;
+      addPoint(charts.count, it, msg.num_gaussians);
+    }
+    if (msg.loss != null) {
+      document.getElementById('statLoss').textContent = msg.loss.toFixed(5);
+      addPoint(charts.loss, it, msg.loss);
+    }
+    if (msg.it_s != null) document.getElementById('statIters').textContent = msg.it_s.toFixed(2);
+  };
+}
+
+setInterval(() => { try { if (ws?.readyState === WebSocket.OPEN) ws.send('ping'); } catch {} }, 5000);
+
+fetch('/api/state').then(r => r.json()).then(updateState).catch(() => {});
+connect();
+
+let app = null;
+let splatEntity = null;
+let splatAsset = null;
+let yaw = 0.8;
+let pitch = -0.35;
+let distance = 4.0;
+let target = new pc.Vec3(0, 0, 0);
+let dragging = false;
+let lastX = 0;
+let lastY = 0;
+
+function initSplat() {
+  if (app) return;
+  const canvas = document.getElementById('splatCanvas');
+  app = new pc.Application(canvas, {
+    graphicsDeviceOptions: { antialias: false, alpha: false }
+  });
+  app.setCanvasFillMode(pc.FILLMODE_NONE);
+  app.setCanvasResolution(pc.RESOLUTION_AUTO);
+  app.scene.clearColor = new pc.Color(0.02, 0.03, 0.04);
+  const camera = new pc.Entity('camera');
+  camera.addComponent('camera', { clearColor: new pc.Color(0.02, 0.03, 0.04), fov: 55 });
+  app.root.addChild(camera);
+  app.cameraEntity = camera;
+  app.on('update', updateCamera);
+  app.start();
+  resizeSplat();
+  window.addEventListener('resize', resizeSplat);
+  canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointerup', () => { dragging = false; });
+  canvas.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    yaw -= dx * 0.006;
+    pitch = Math.max(-1.45, Math.min(1.45, pitch - dy * 0.006));
+  });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    distance = Math.max(0.1, distance * (1 + Math.sign(e.deltaY) * 0.12));
+  }, { passive: false });
+}
+
+function resizeSplat() {
+  if (!app) return;
+  const canvas = document.getElementById('splatCanvas');
+  const rect = canvas.getBoundingClientRect();
+  app.resizeCanvas(Math.max(1, rect.width), Math.max(1, rect.height));
+}
+
+function updateCamera() {
+  if (!app?.cameraEntity) return;
+  const x = target.x + Math.sin(yaw) * Math.cos(pitch) * distance;
+  const y = target.y + Math.sin(pitch) * distance;
+  const z = target.z + Math.cos(yaw) * Math.cos(pitch) * distance;
+  app.cameraEntity.setPosition(x, y, z);
+  app.cameraEntity.lookAt(target);
+}
+
+function loadSplat(url) {
+  initSplat();
+  if (splatEntity) {
+    splatEntity.destroy();
+    splatEntity = null;
+  }
+  if (splatAsset) {
+    app.assets.remove(splatAsset);
+    splatAsset = null;
+  }
+  const asset = new pc.Asset('cached-scene', 'gsplat', { url: `${url}?t=${Date.now()}` });
+  splatAsset = asset;
+  asset.on('load', () => {
+    const entity = new pc.Entity('splat');
+    entity.addComponent('gsplat', { asset });
+    entity.setEulerAngles(-90, 0, 180);
+    app.root.addChild(entity);
+    splatEntity = entity;
+    document.getElementById('mediaInfo').textContent = `loaded scene: ${url}`;
+  });
+  asset.on('error', err => {
+    document.getElementById('mediaInfo').textContent = `scene load failed: ${err}`;
+  });
+  app.assets.add(asset);
+  app.assets.load(asset);
+}
+</script>
+</body>
+</html>

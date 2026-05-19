@@ -1,0 +1,31 @@
+[project]
+name = "3dgs-mcmc"
+version = "0.1.0"
+description = "3D Gaussian Splatting with MCMC - ROCm port"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "plyfile",
+    "tqdm",
+    "opencv-python-headless",
+    "rosbags",
+]
+
+[project.optional-dependencies]
+dev = [
+    "rich",
+    "jaxtyping",
+    "tensorboard",
+]
+viewer = [
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+]
+preprocess = [
+    "open3d",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

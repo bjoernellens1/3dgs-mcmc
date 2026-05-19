@@ -1,0 +1,40 @@
+Optimizing /workspace/3dgs-mcmc/output/ablation_H4d_window88_gsplat_no_energy_adam_off
+[streaming] TUM: 100 frames loaded from /data/TUM/rgbd_dataset_freiburg1_desk [15/05 08:07:02]
+[streaming] Bootstrapping from 5 frame(s)... [15/05 08:07:02]
+Number of points at initialisation :  19877 [15/05 08:07:02]
+[streaming] Initialised 19877 Gaussians from 5 frames, scene radius=1.240 [15/05 08:07:02]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [15/05 08:07:02]
+[streaming] Starting: strategy=gsplat_mcmc optimizer=adam sparse=False steps_per_frame=150 wallclock=False [15/05 08:07:02]
+[streaming] Bootstrap (post-init) report at iter_0 over 5 bootstrap views... [15/05 08:07:02]
+Downloading: "https://download.pytorch.org/models/vgg16-397923af.pth" to /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth [15/05 08:07:03]
+  0%|          | 0.00/528M [00:00<?, ?B/s]  2%|2         | 12.4M/528M [00:00<00:04, 126MB/s]  7%|7         | 38.6M/528M [00:00<00:02, 212MB/s] 12%|#1        | 60.9M/528M [00:00<00:02, 221MB/s] 16%|#5        | 82.2M/528M [00:00<00:02, 222MB/s] 20%|#9        | 104M/528M [00:00<00:01, 225MB/s]  24%|##4       | 128M/528M [00:00<00:01, 231MB/s] 29%|##9       | 155M/528M [00:00<00:01, 240MB/s] 34%|###4      | 180M/528M [00:00<00:01, 244MB/s] 40%|###9      | 210M/528M [00:00<00:01, 263MB/s] 44%|####4     | 235M/528M [00:01<00:01, 260MB/s] 50%|#####     | 265M/528M [00:01<00:00, 276MB/s] 55%|#####5    | 291M/528M [00:01<00:00, 274MB/s] 60%|######    | 318M/528M [00:01<00:00, 272MB/s] 65%|######5   | 345M/528M [00:01<00:00, 274MB/s] 70%|#######   | 371M/528M [00:01<00:00, 270MB/s] 76%|#######6  | 402M/528M [00:01<00:00, 286MB/s] 81%|########1 | 430M/528M [00:01<00:00, 270MB/s] 87%|########6 | 457M/528M [00:01<00:00, 272MB/s] 91%|#########1| 483M/528M [00:01<00:00, 262MB/s] 97%|#########6| 511M/528M [00:02<00:00, 272MB/s]100%|##########| 528M/528M [00:02<00:00, 259MB/s]
+Downloading: "https://raw.githubusercontent.com/richzhang/PerceptualSimilarity/master/lpips/weights/v0.1/vgg.pth" to /root/.cache/torch/hub/checkpoints/vgg.pth [15/05 08:07:05]
+  0%|          | 0.00/7.12k [00:00<?, ?B/s]100%|##########| 7.12k/7.12k [00:00<00:00, 33.3MB/s]
+[report] iter=0 test PSNR mean=3.90dB min=3.86 max=3.94 (5 views) [15/05 08:07:21]
+[report] iter=0 test LPIPS mean=0.6600 min=0.6576 max=0.6639 [15/05 08:07:21]
+[report] iter=0 train PSNR mean=3.90dB min=3.86 max=3.94 (5 views) [15/05 08:07:23]
+[report] iter=0 train LPIPS mean=0.6600 min=0.6576 max=0.6639 [15/05 08:07:23]
+[report] trajectory.mp4 written (5 frames @ 30fps) [15/05 08:07:23]
+Streaming training:   0%|          | 0/17000 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1436, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1507, in streaming_training
+    gaussians.optimizer.step()
+  File "/workspace/3dgs-mcmc/scene/gsplat_model.py", line 38, in step
+    optimizer.step()
+  File "/opt/venv/lib/python3.12/site-packages/torch/optim/optimizer.py", line 526, in wrapper
+    out = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/optim/optimizer.py", line 81, in _use_grad
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/optim/adam.py", line 238, in step
+    has_complex = self._init_group(
+                  ^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/optim/adam.py", line 155, in _init_group
+    raise RuntimeError(
+RuntimeError: Adam does not support sparse gradients, please consider SparseAdam instead
+Streaming training:   0%|          | 0/17000 [00:02<?, ?it/s]

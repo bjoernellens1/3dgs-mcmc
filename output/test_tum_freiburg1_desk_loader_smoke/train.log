@@ -1,0 +1,15 @@
+Optimizing output/test_tum_freiburg1_desk_loader_smoke
+Output folder: output/test_tum_freiburg1_desk_loader_smoke [11/05 06:30:32]
+Found TUM RGB-D dataset layout. [11/05 06:30:32]
+Loaded TUM cameras: 40 skipped=0 [11/05 06:30:32]
+Generating TUM RGB-D init point cloud (stride=16, frames=10, max=5000)... [11/05 06:30:32]
+Loading Training Cameras [11/05 06:30:32]
+Loading Test Cameras [11/05 06:30:33]
+Number of points at initialisation :  5000 [11/05 06:30:33]
+[parallelism] profile=off model_layout=legacy optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [11/05 06:30:34]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [11/05 06:30:34]
+Training progress:   0%|          | 0/3 [00:00<?, ?it/s]Training progress:   0%|          | 0/3 [00:04<?, ?it/s]
+
+[ITER 3] Saving Gaussians [11/05 06:30:38]
+
+Training complete. [11/05 06:30:38]

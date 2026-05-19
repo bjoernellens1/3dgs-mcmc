@@ -1,0 +1,14 @@
+Optimizing output/tum_rgbd_loader_fix_smoke
+Output folder: output/tum_rgbd_loader_fix_smoke [10/05 13:13:44]
+Found TUM RGB-D dataset layout. [10/05 13:13:44]
+Loaded TUM cameras: 37 skipped=0 [10/05 13:13:44]
+Loading Training Cameras [10/05 13:13:44]
+Loading Test Cameras [10/05 13:13:45]
+Number of points at initialisation :  6000 [10/05 13:13:45]
+[parallelism] profile=off model_layout=legacy optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [10/05 13:13:46]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [10/05 13:13:46]
+Training progress:   0%|          | 0/2 [00:00<?, ?it/s]Training progress:   0%|          | 0/2 [00:03<?, ?it/s]
+
+[ITER 2] Saving Gaussians [10/05 13:13:49]
+
+Training complete. [10/05 13:13:49]

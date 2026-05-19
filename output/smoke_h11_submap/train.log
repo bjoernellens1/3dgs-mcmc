@@ -1,0 +1,61 @@
+Optimizing output/smoke_h11_submap
+[streaming] TUM: 15 frames loaded from /data/tum/rgbd_dataset_freiburg1_desk [13/05 08:55:44]
+[streaming] Bootstrapping from 3 frame(s)... [13/05 08:55:44]
+Number of points at initialisation :  11959 [13/05 08:55:44]
+[streaming] Initialised 11959 Gaussians from 3 frames, scene radius=1.248 [13/05 08:55:45]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [13/05 08:55:45]
+[submap] mode: 5 frames/submap, 100 iters/submap, 100 global refine iters [13/05 08:55:45]
+[submap] 14 total train cameras collected. [13/05 08:55:45]
+[submap] 3 submaps of up to 5 frames each. [13/05 08:55:45]
+[submap 0] 5 cameras, optimising 100 iters... [13/05 08:55:45]
+Number of points at initialisation :  19826 [13/05 08:55:45]
+[submap 0] done, 19826 Gaussians. [13/05 08:55:50]
+[submap 1] 5 cameras, optimising 100 iters... [13/05 08:55:50]
+Number of points at initialisation :  19634 [13/05 08:55:50]
+[submap 1] done, 19634 Gaussians. [13/05 08:55:50]
+[submap 2] 3 cameras, optimising 100 iters... [13/05 08:55:50]
+Number of points at initialisation :  11740 [13/05 08:55:50]
+[submap 2] done, 11740 Gaussians. [13/05 08:55:51]
+[submap] Merging 3 submaps into global model... [13/05 08:55:51]
+[submap] Global model: 63159 Gaussians total. [13/05 08:55:51]
+[submap] Running 100 global refinement iters over 14 cameras... [13/05 08:55:51]
+Global refine:   0%|          | 0/100 [00:00<?, ?it/s]Global refine:  11%|#1        | 11/100 [00:00<00:00, 102.33it/s]Global refine:  22%|##2       | 22/100 [00:00<00:00, 99.17it/s] Global refine:  32%|###2      | 32/100 [00:00<00:00, 98.34it/s]Global refine:  42%|####2     | 42/100 [00:00<00:00, 97.68it/s]Global refine:  52%|#####2    | 52/100 [00:00<00:00, 97.32it/s]Global refine:  62%|######2   | 62/100 [00:00<00:00, 97.22it/s]Global refine:  72%|#######2  | 72/100 [00:00<00:00, 97.00it/s]Global refine:  82%|########2 | 82/100 [00:00<00:00, 96.61it/s]Global refine:  92%|#########2| 92/100 [00:00<00:00, 96.57it/s]Global refine: 100%|##########| 100/100 [00:01<00:00, 97.25it/s]
+[submap] Evaluation failed: write_post_training_report() got an unexpected keyword argument 'test_cameras' [13/05 08:55:53]
+[submap] Stitch complete. [13/05 08:55:53]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1423, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 903, in streaming_training
+    save_worker.stop()
+    ^^^^^^^^^^^^^^^^
+AttributeError: '_AsyncSaveWorker' object has no attribute 'stop'
+Optimizing output/smoke_h11_submap
+[streaming] TUM: 15 frames loaded from /data/tum/rgbd_dataset_freiburg1_desk [13/05 08:56:45]
+[streaming] Bootstrapping from 3 frame(s)... [13/05 08:56:45]
+Number of points at initialisation :  11959 [13/05 08:56:45]
+[streaming] Initialised 11959 Gaussians from 3 frames, scene radius=1.248 [13/05 08:56:45]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [13/05 08:56:45]
+[submap] mode: 5 frames/submap, 100 iters/submap, 100 global refine iters [13/05 08:56:45]
+[submap] 14 total train cameras collected. [13/05 08:56:45]
+[submap] 3 submaps of up to 5 frames each. [13/05 08:56:45]
+[submap 0] 5 cameras, optimising 100 iters... [13/05 08:56:45]
+Number of points at initialisation :  19826 [13/05 08:56:45]
+[submap 0] done, 19826 Gaussians. [13/05 08:56:50]
+[submap 1] 5 cameras, optimising 100 iters... [13/05 08:56:50]
+Number of points at initialisation :  19634 [13/05 08:56:50]
+[submap 1] done, 19634 Gaussians. [13/05 08:56:51]
+[submap 2] 3 cameras, optimising 100 iters... [13/05 08:56:51]
+Number of points at initialisation :  11740 [13/05 08:56:51]
+[submap 2] done, 11740 Gaussians. [13/05 08:56:52]
+[submap] Merging 3 submaps into global model... [13/05 08:56:52]
+[submap] Global model: 63159 Gaussians total. [13/05 08:56:52]
+[submap] Running 100 global refinement iters over 14 cameras... [13/05 08:56:52]
+Global refine:   0%|          | 0/100 [00:00<?, ?it/s]Global refine:  11%|#1        | 11/100 [00:00<00:00, 103.22it/s]Global refine:  22%|##2       | 22/100 [00:00<00:00, 99.89it/s] Global refine:  32%|###2      | 32/100 [00:00<00:00, 98.95it/s]Global refine:  42%|####2     | 42/100 [00:00<00:00, 98.37it/s]Global refine:  52%|#####2    | 52/100 [00:00<00:00, 97.97it/s]Global refine:  62%|######2   | 62/100 [00:00<00:00, 97.69it/s]Global refine:  72%|#######2  | 72/100 [00:00<00:00, 97.35it/s]Global refine:  82%|########2 | 82/100 [00:00<00:00, 97.25it/s]Global refine:  92%|#########2| 92/100 [00:00<00:00, 97.01it/s]Global refine: 100%|##########| 100/100 [00:01<00:00, 97.79it/s]
+[report] iter=100 test PSNR mean=22.20dB min=22.20 max=22.20 (1 views) [13/05 08:56:53]
+[report] trajectory.mp4 written (14 frames @ 30fps) [13/05 08:56:53]
+[submap] Stitch complete. [13/05 08:56:53]
+
+Training complete. [13/05 08:56:53]

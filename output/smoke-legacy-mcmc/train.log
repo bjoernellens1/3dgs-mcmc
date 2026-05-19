@@ -1,0 +1,8 @@
+Optimizing /workspace/3dgs-mcmc/output/smoke-legacy-mcmc
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1262, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 986, in training
+    mcmc_strategy.step_post_backward(
+TypeError: ScheduledMCMCStrategy.step_post_backward() got an unexpected keyword argument 'render_pkg'
+Optimizing /workspace/3dgs-mcmc/output/smoke-legacy-mcmc

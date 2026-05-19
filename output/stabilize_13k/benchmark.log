@@ -1,0 +1,167 @@
+=== 13K DEFAULT (compile_mode=off) ===
+START: Fri May  8 10:34:24 AM CEST 2026
+time="2026-05-08T10:34:24+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/stabilize_13k/default
+Output folder: output/stabilize_13k/default [08/05 08:34:25]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [08/05 08:34:25]
+Loading Training Cameras [08/05 08:34:25]
+Loading Test Cameras [08/05 08:34:52]
+Number of points at initialisation :  54275 [08/05 08:34:52]
+[parallelism] profile=off optimizer=adam sparse_grad=False sh_update_interval=1 [08/05 08:34:53]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [08/05 08:34:53]
+[progress] iter=500 loss=0.4279492 it/s=24.08 sh=0 [08/05 08:35:14]
+
+[ITER 500] Saving Gaussians [08/05 08:35:14]
+[geo] iter=500 N=54275 LSOM=0.0018 OSF=0.0000 mean_sup=0.1173 [08/05 08:35:14]
+[progress] iter=1000 loss=0.2586331 it/s=27.19 sh=1 [08/05 08:35:32]
+
+[ITER 1000] Saving Gaussians [08/05 08:35:32]
+[geo] iter=1000 N=67702 LSOM=0.0074 OSF=0.0002 mean_sup=0.2610 [08/05 08:35:33]
+[progress] iter=1500 loss=0.2361693 it/s=26.56 sh=1 [08/05 08:35:51]
+[geo] iter=1500 N=67702 LSOM=0.0001 OSF=0.0000 mean_sup=0.3729 [08/05 08:35:51]
+[progress] iter=2000 loss=0.1962038 it/s=27.12 sh=2 [08/05 08:36:10]
+[geo] iter=2000 N=67702 LSOM=0.0061 OSF=0.0005 mean_sup=0.4221 [08/05 08:36:10]
+[progress] iter=2500 loss=0.2107918 it/s=26.08 sh=2 [08/05 08:36:29]
+[geo] iter=2500 N=67702 LSOM=0.0018 OSF=0.0001 mean_sup=0.4054 [08/05 08:36:29]
+[progress] iter=3000 loss=0.1606489 it/s=26.14 sh=3 [08/05 08:36:48]
+[geo] iter=3000 N=67702 LSOM=0.0003 OSF=0.0000 mean_sup=0.3808 [08/05 08:36:48]
+[progress] iter=3500 loss=0.1837553 it/s=23.98 sh=3 [08/05 08:37:09]
+[geo] iter=3500 N=74318 LSOM=0.0036 OSF=0.0002 mean_sup=0.4390 [08/05 08:37:09]
+[progress] iter=4000 loss=0.1831795 it/s=23.23 sh=3 [08/05 08:37:30]
+[geo] iter=4000 N=74318 LSOM=0.0004 OSF=0.0000 mean_sup=0.4112 [08/05 08:37:30]
+[progress] iter=4500 loss=0.1826779 it/s=23.02 sh=3 [08/05 08:37:52]
+[geo] iter=4500 N=74318 LSOM=0.0000 OSF=0.0000 mean_sup=0.4025 [08/05 08:37:52]
+[progress] iter=5000 loss=0.1680455 it/s=23.29 sh=3 [08/05 08:38:13]
+
+[ITER 5000] Saving Gaussians [08/05 08:38:13]
+[geo] iter=5000 N=74318 LSOM=0.0004 OSF=0.0000 mean_sup=0.3963 [08/05 08:38:14]
+
+[ITER 5000] Saving Checkpoint [08/05 08:38:14]
+[progress] iter=5500 loss=0.1507259 it/s=23.27 sh=3 [08/05 08:38:35]
+[geo] iter=5500 N=74318 LSOM=0.0085 OSF=0.0011 mean_sup=0.4258 [08/05 08:38:35]
+[progress] iter=6000 loss=0.1558884 it/s=23.26 sh=3 [08/05 08:38:56]
+[geo] iter=6000 N=74318 LSOM=0.0008 OSF=0.0000 mean_sup=0.4224 [08/05 08:38:56]
+[progress] iter=6500 loss=0.1797033 it/s=23.37 sh=3 [08/05 08:39:18]
+[geo] iter=6500 N=74318 LSOM=0.0003 OSF=0.0000 mean_sup=0.4172 [08/05 08:39:18]
+[progress] iter=7000 loss=0.1551246 it/s=23.30 sh=3 [08/05 08:39:39]
+[geo] iter=7000 N=75851 LSOM=0.0050 OSF=0.0009 mean_sup=0.4489 [08/05 08:39:39]
+[progress] iter=7500 loss=0.1786669 it/s=22.54 sh=3 [08/05 08:40:01]
+[geo] iter=7500 N=75851 LSOM=0.0002 OSF=0.0001 mean_sup=0.3991 [08/05 08:40:01]
+[progress] iter=8000 loss=0.1883359 it/s=23.21 sh=3 [08/05 08:40:23]
+[geo] iter=8000 N=75851 LSOM=0.0007 OSF=0.0001 mean_sup=0.4092 [08/05 08:40:23]
+[progress] iter=8500 loss=0.1538214 it/s=23.07 sh=3 [08/05 08:40:45]
+[geo] iter=8500 N=75851 LSOM=0.0027 OSF=0.0003 mean_sup=0.4544 [08/05 08:40:45]
+[progress] iter=9000 loss=0.1766139 it/s=23.21 sh=3 [08/05 08:41:06]
+[geo] iter=9000 N=75851 LSOM=0.0019 OSF=0.0002 mean_sup=0.4524 [08/05 08:41:06]
+[progress] iter=9500 loss=0.1786316 it/s=23.21 sh=3 [08/05 08:41:28]
+[geo] iter=9500 N=75851 LSOM=0.0005 OSF=0.0000 mean_sup=0.4353 [08/05 08:41:28]
+[progress] iter=10000 loss=0.1400586 it/s=23.16 sh=3 [08/05 08:41:49]
+
+[ITER 10000] Saving Gaussians [08/05 08:41:49]
+[geo] iter=10000 N=76245 LSOM=0.0009 OSF=0.0001 mean_sup=0.4417 [08/05 08:41:50]
+
+[ITER 10000] Saving Checkpoint [08/05 08:41:50]
+[progress] iter=10500 loss=0.1422732 it/s=22.93 sh=3 [08/05 08:42:11]
+[geo] iter=10500 N=76245 LSOM=0.0018 OSF=0.0003 mean_sup=0.4434 [08/05 08:42:11]
+[progress] iter=11000 loss=0.1518155 it/s=22.80 sh=3 [08/05 08:42:33]
+[geo] iter=11000 N=76245 LSOM=0.0005 OSF=0.0000 mean_sup=0.4214 [08/05 08:42:33]
+[progress] iter=11500 loss=0.1794207 it/s=23.06 sh=3 [08/05 08:42:55]
+[geo] iter=11500 N=76245 LSOM=0.0048 OSF=0.0006 mean_sup=0.4422 [08/05 08:42:55]
+[progress] iter=12000 loss=0.1595491 it/s=23.37 sh=3 [08/05 08:43:16]
+[geo] iter=12000 N=76245 LSOM=0.0022 OSF=0.0002 mean_sup=0.4427 [08/05 08:43:16]
+[progress] iter=12500 loss=0.1805465 it/s=22.98 sh=3 [08/05 08:43:38]
+[geo] iter=12500 N=76245 LSOM=0.0071 OSF=0.0010 mean_sup=0.4722 [08/05 08:43:38]
+
+[ITER 13000] Evaluating train: L1 0.052927011251449586 PSNR 21.47089729309082 [08/05 08:44:03]
+[progress] iter=13000 loss=0.1952994 it/s=20.29 sh=3 [08/05 08:44:03]
+
+[ITER 13000] Saving Gaussians [08/05 08:44:03]
+[geo] iter=13000 N=76245 LSOM=0.0018 OSF=0.0001 mean_sup=0.4407 [08/05 08:44:03]
+
+Training complete. [08/05 08:44:03]
+END DEFAULT: Fri May  8 10:44:04 AM CEST 2026
+
+=== 13K SH-COMPILE (--compile_mode reduce-overhead --compile_sh) ===
+START: Fri May  8 10:45:21 AM CEST 2026
+time="2026-05-08T10:45:21+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/stabilize_13k/sh
+Output folder: output/stabilize_13k/sh [08/05 08:45:23]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [08/05 08:45:23]
+Loading Training Cameras [08/05 08:45:23]
+Loading Test Cameras [08/05 08:45:50]
+Number of points at initialisation :  54275 [08/05 08:45:50]
+[parallelism] profile=off optimizer=adam sparse_grad=False sh_update_interval=1 [08/05 08:45:52]
+[compiled-kernels] growth-aware compile_after_iter=12500 (strategy=mcmc, growth_stop=12000, margin=500) [08/05 08:45:52]
+[compiled-kernels] WARNING: torch.compile on ROCm is experimental for this workload and may be slower. Use for ablation only. [08/05 08:45:52]
+[compiled-kernels] mode=reduce-overhead dynamic=False after_iter=12500 rocm=True [08/05 08:45:52]
+[progress] iter=500 loss=0.4288335 it/s=23.98 sh=0 [08/05 08:46:12]
+
+[ITER 500] Saving Gaussians [08/05 08:46:12]
+[geo] iter=500 N=54275 LSOM=0.0018 OSF=0.0000 mean_sup=0.1173 [08/05 08:46:13]
+[progress] iter=1000 loss=0.2573729 it/s=27.19 sh=1 [08/05 08:46:31]
+
+[ITER 1000] Saving Gaussians [08/05 08:46:31]
+[geo] iter=1000 N=67702 LSOM=0.0059 OSF=0.0001 mean_sup=0.2628 [08/05 08:46:31]
+
+=== 13K SH-COMPILE (resumed from default checkpoint at 10000) ===
+START: Fri May  8 10:48:08 AM CEST 2026
+time="2026-05-08T10:48:08+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/stabilize_13k/sh
+Output folder: output/stabilize_13k/sh [08/05 08:48:10]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [08/05 08:48:10]
+Loading Training Cameras [08/05 08:48:10]
+Loading Test Cameras [08/05 08:48:36]
+Number of points at initialisation :  54275 [08/05 08:48:37]
+[parallelism] profile=off optimizer=adam sparse_grad=False sh_update_interval=1 [08/05 08:48:38]
+[compiled-kernels] growth-aware compile_after_iter=12500 (strategy=mcmc, growth_stop=12000, margin=500) [08/05 08:48:38]
+[compiled-kernels] WARNING: torch.compile on ROCm is experimental for this workload and may be slower. Use for ablation only. [08/05 08:48:38]
+[compiled-kernels] mode=reduce-overhead dynamic=False after_iter=12500 rocm=True [08/05 08:48:38]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1329, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 317, in training
+    (model_params, first_iter) = torch.load(checkpoint)
+                                 ^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/serialization.py", line 1548, in load
+    raise pickle.UnpicklingError(_get_wo_message(str(e))) from None
+_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, [1mdo those steps only if you trust the source of the checkpoint[0m. 
+	(1) In PyTorch 2.6, we changed the default value of the `weights_only` argument in `torch.load` from `False` to `True`. Re-running `torch.load` with `weights_only` set to `False` will likely succeed, but it can result in arbitrary code execution. Do it only if you got the file from a trusted source.
+	(2) Alternatively, to load with `weights_only=True` please check the recommended steps in the following error message.
+	WeightsUnpickler error: Unsupported global: GLOBAL numpy._core.multiarray.scalar was not an allowed global by default. Please use `torch.serialization.add_safe_globals([numpy._core.multiarray.scalar])` or the `torch.serialization.safe_globals([numpy._core.multiarray.scalar])` context manager to allowlist this global if you trust this class/function.
+
+Check the documentation of torch.load to learn more about types accepted by default with weights_only https://pytorch.org/docs/stable/generated/torch.load.html.
+END SH: Fri May  8 10:48:39 AM CEST 2026
+
+=== 13K SH-COMPILE (resumed from default chkpnt10000) ===
+START: Fri May  8 10:49:10 AM CEST 2026
+time="2026-05-08T10:49:10+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/stabilize_13k/sh
+Output folder: output/stabilize_13k/sh [08/05 08:49:11]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [08/05 08:49:12]
+Loading Training Cameras [08/05 08:49:12]
+Loading Test Cameras [08/05 08:49:38]
+Number of points at initialisation :  54275 [08/05 08:49:38]
+[parallelism] profile=off optimizer=adam sparse_grad=False sh_update_interval=1 [08/05 08:49:40]
+[compiled-kernels] growth-aware compile_after_iter=12500 (strategy=mcmc, growth_stop=12000, margin=500) [08/05 08:49:40]
+[compiled-kernels] WARNING: torch.compile on ROCm is experimental for this workload and may be slower. Use for ablation only. [08/05 08:49:40]
+[compiled-kernels] mode=reduce-overhead dynamic=False after_iter=12500 rocm=True [08/05 08:49:40]
+[progress] iter=10500 loss=0.1658435 it/s=18.70 sh=3 [08/05 08:50:07]
+[geo] iter=10500 N=76245 LSOM=0.0005 OSF=0.0001 mean_sup=0.4338 [08/05 08:50:07]
+[progress] iter=11000 loss=0.1545802 it/s=23.16 sh=3 [08/05 08:50:28]
+[geo] iter=11000 N=76245 LSOM=0.0009 OSF=0.0000 mean_sup=0.4276 [08/05 08:50:28]
+[progress] iter=11500 loss=0.1653975 it/s=23.30 sh=3 [08/05 08:50:50]
+[geo] iter=11500 N=76245 LSOM=0.0000 OSF=0.0000 mean_sup=0.4266 [08/05 08:50:50]
+[progress] iter=12000 loss=0.1690866 it/s=23.54 sh=3 [08/05 08:51:11]
+[geo] iter=12000 N=76245 LSOM=0.0044 OSF=0.0007 mean_sup=0.4512 [08/05 08:51:11]
+[compiled-kernels] Compiled 'sh_to_rgb_deg3' (mode=reduce-overhead, dynamic=False) [08/05 08:51:33]
+[progress] iter=12500 loss=0.1819663 it/s=6.19 sh=3 [08/05 08:52:32]
+[geo] iter=12500 N=76245 LSOM=0.0014 OSF=0.0001 mean_sup=0.4327 [08/05 08:52:32]
+
+[ITER 13000] Evaluating train: L1 0.05324795320630074 PSNR 21.457760238647463 [08/05 08:53:00]
+[progress] iter=13000 loss=0.1440165 it/s=17.48 sh=3 [08/05 08:53:00]
+
+[ITER 13000] Saving Gaussians [08/05 08:53:00]
+[geo] iter=13000 N=76245 LSOM=0.0002 OSF=0.0000 mean_sup=0.4066 [08/05 08:53:01]
+
+Training complete. [08/05 08:53:01]
+END SH: Fri May  8 10:53:03 AM CEST 2026

@@ -1,0 +1,54 @@
+Optimizing output/step2_R3_freeze_shapes
+[streaming] Camera profile 'orbbec_femto_bolt':
+  streaming_min_depth: 0.1 -> 0.3
+  streaming_max_depth: 8.0 -> 5.0
+  streaming_depth_consistency_thresh: 0.05 -> 0.03
+  streaming_depth_edge_threshold: 0.02 -> 0.015
+  streaming_depth_stride: 8 -> 4
+  streaming_depth_loss_weight: 0.05 -> 0.1
+  streaming_free_space_loss_weight: 0.0 -> 0.01 [19/05 12:04:06]
+[streaming] OrbbecRosBag: loaded Open3D odometry cache output/test_streaming_bootstrap_motion_no_mcmc_smoke/odom_cache/c7fd7b5053c2e0c672622ab5.npz [19/05 12:04:07]
+[streaming] OrbbecRosBag: 10 synced frames from /mnt/cps_persistent1_shared/datasets/christian/embedding_map/bags/slam/kitchen1_slam (color=2056, depth=2055, pose=0, pose_source=open3d_odometry_live) [19/05 12:04:07]
+[streaming] Bootstrapping from 3 frame(s)... [19/05 12:04:07]
+Number of points at initialisation :  131250 [19/05 12:04:07]
+[streaming] Initial seed point cloud exported (131250 points) [19/05 12:04:07]
+[streaming] Initialised 131250 Gaussians from 3 frames, scene radius=3.349 [19/05 12:04:07]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [19/05 12:04:07]
+[streaming] freeze_params=['quats', 'scales'] [19/05 12:04:07]
+[streaming] Starting: strategy=gsplat_energy_mcmc optimizer=selective_adam sparse=True steps_per_frame=5 wallclock=False [19/05 12:04:07]
+[streaming] Dataset: 10 frames. Iterations to cover all frames: 65 (budget=30, covers 46%). Remaining frames will be flushed post-loop. [19/05 12:04:07]
+Streaming training:   0%|          | 0/30 [00:00<?, ?it/s]/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+Streaming training:   0%|          | 0/30 [00:04<?, ?it/s, Loss=0.4807110, N=131251, F=6]Streaming training:  33%|###3      | 10/30 [00:04<00:08,  2.45it/s, Loss=0.4807110, N=131251, F=6][bootstrap-motion] iter=12 stage=total n=131250 mean=0.01103m p95=0.02456m max=0.05204m >2cm=13594 >5cm=3 >10cm=0 [19/05 12:04:12]
+[bootstrap-motion] iter=13 stage=total n=131250 mean=0.01147m p95=0.02559m max=0.05620m >2cm=15431 >5cm=24 >10cm=0 [19/05 12:04:12]
+[bootstrap-motion] iter=14 stage=total n=131250 mean=0.01185m p95=0.02649m max=0.06010m >2cm=17088 >5cm=53 >10cm=0 [19/05 12:04:12]
+[bootstrap-motion] iter=15 stage=total n=131250 mean=0.01220m p95=0.02733m max=0.06347m >2cm=18608 >5cm=100 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=16 stage=total n=131250 mean=0.01252m p95=0.02802m max=0.06689m >2cm=20002 >5cm=138 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=17 stage=total n=131250 mean=0.01281m p95=0.02867m max=0.06981m >2cm=21211 >5cm=196 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=18 stage=total n=131250 mean=0.01308m p95=0.02927m max=0.07248m >2cm=22319 >5cm=266 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=19 stage=total n=131250 mean=0.01335m p95=0.02987m max=0.07510m >2cm=23529 >5cm=329 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=20 stage=total n=131250 mean=0.01360m p95=0.03041m max=0.07712m >2cm=24570 >5cm=409 >10cm=0 [19/05 12:04:13]
+Streaming training:  33%|###3      | 10/30 [00:05<00:08,  2.45it/s, Loss=0.4558651, N=131252, F=8]Streaming training:  67%|######6   | 20/30 [00:05<00:02,  4.28it/s, Loss=0.4558651, N=131252, F=8][bootstrap-motion] iter=21 stage=total n=131250 mean=0.01384m p95=0.03088m max=0.07897m >2cm=25532 >5cm=496 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=22 stage=total n=131250 mean=0.01407m p95=0.03141m max=0.08094m >2cm=26568 >5cm=562 >10cm=0 [19/05 12:04:13]
+[bootstrap-motion] iter=23 stage=total n=131250 mean=0.01429m p95=0.03187m max=0.08211m >2cm=27466 >5cm=643 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=24 stage=total n=131250 mean=0.01448m p95=0.03234m max=0.08339m >2cm=28373 >5cm=737 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=25 stage=total n=131250 mean=0.01468m p95=0.03275m max=0.08392m >2cm=29250 >5cm=809 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=26 stage=total n=131250 mean=0.01488m p95=0.03310m max=0.08469m >2cm=30160 >5cm=884 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=27 stage=total n=131250 mean=0.01508m p95=0.03354m max=0.08625m >2cm=31090 >5cm=956 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=28 stage=total n=131250 mean=0.01529m p95=0.03395m max=0.08869m >2cm=31984 >5cm=1029 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=29 stage=total n=131250 mean=0.01550m p95=0.03432m max=0.09138m >2cm=32877 >5cm=1104 >10cm=0 [19/05 12:04:14]
+[bootstrap-motion] iter=30 stage=total n=131250 mean=0.01550m p95=0.03432m max=0.09138m >2cm=32877 >5cm=1104 >10cm=0 [19/05 12:04:14]
+Streaming training:  67%|######6   | 20/30 [00:06<00:02,  4.28it/s, Loss=0.4435458, N=131254, F=10]Streaming training: 100%|##########| 30/30 [00:06<00:00,  5.78it/s, Loss=0.4435458, N=131254, F=10]Streaming training: 100%|##########| 30/30 [00:06<00:00,  4.83it/s, Loss=0.4435458, N=131254, F=10]
+
+[ITER 30] Saving Gaussians [19/05 12:04:14]
+[streaming] Keyframe admission: 6/6 admitted (100.0%) — forced=0 moved=0 novel=6 rej_overlap=0 rej_motion=0 [19/05 12:04:14]
+[report] iter=30 test PSNR mean=9.00dB min=8.98 max=9.02 (3/3 views) [19/05 12:04:17]
+[report] iter=30 test LPIPS mean=0.7339 min=0.7314 max=0.7361 [19/05 12:04:17]
+[report] iter=30 train PSNR mean=9.00dB min=8.98 max=9.02 (3/3 views) [19/05 12:04:18]
+[report] iter=30 train LPIPS mean=0.7339 min=0.7314 max=0.7361 [19/05 12:04:18]
+[report] iter=30 no trajectory views selected — skipping trajectory MP4 [19/05 12:04:19]
+[trajectory_eval] → output/step2_R3_freeze_shapes/trajectory_eval  n=9 ATE=None [19/05 12:04:19]
+
+[streaming] Training complete. [19/05 12:04:19]
+
+Training complete. [19/05 12:04:19]

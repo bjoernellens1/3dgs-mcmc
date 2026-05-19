@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/data/mipnerf360_v2_dataset/bicycle', model_path='/workspace/3dgs-mcmc/output/bench-bicycle-gsplat-6000', images='images', resolution=-1, white_background=False, data_device='cuda', eval=False, cap_max=200000, init_type='sfm', model_layout='gsplat')

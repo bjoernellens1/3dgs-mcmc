@@ -1,0 +1,62 @@
+# Python / build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.whl
+
+# Repository / editor
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Local virtual environments
+.venv/
+venv/
+
+# Training / evaluation outputs (mounted from host via compose)
+output/
+outputs/
+runs/
+wandb/
+tensorboard/
+*.tfevents*
+
+# Large generated artifacts
+*.ply
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.jsonl
+
+# Datasets — mounted at /data via compose, no need to bake into image
+data/
+datasets/
+rosbags/
+*.bag
+*.db3
+*.mcap
+*.sens
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.webm
+
+# Images (might be large datasets)
+*.png
+*.jpg
+*.jpeg
+
+# Docs (contains MP4/PDF)
+docs/

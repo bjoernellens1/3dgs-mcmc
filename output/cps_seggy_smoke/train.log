@@ -1,0 +1,125 @@
+Optimizing output/cps_seggy_smoke
+[streaming] Camera profile 'orbbec_femto_bolt':
+  streaming_min_depth: 0.1 -> 0.3
+  streaming_max_depth: 8.0 -> 5.0
+  streaming_depth_consistency_thresh: 0.05 -> 0.03
+  streaming_depth_edge_threshold: 0.02 -> 0.015
+  streaming_depth_stride: 8 -> 4
+  streaming_depth_loss_weight: 0.05 -> 0.1
+  streaming_free_space_loss_weight: 0.0 -> 0.01
+  streaming_max_new_gaussians_per_frame: 1000 -> 2000 [19/05 08:15:28]
+[streaming] Warning: '/camera/color/image_raw/compressed' has unset header.stamp (sec=0, nsec=0); falling back to bag receive timestamp for this topic. [19/05 08:15:28]
+[streaming] OrbbecRosBag: 8901 synced frames from /mnt/cps_persistent1_shared/datasets/bjoern/cps-seggy/bags/rosbag2_2025_06_20-07_38_47 (color=11326, depth=9025, pose=0, pose_source=open3d_odometry_live) [19/05 08:15:35]
+[streaming] Bootstrapping from 5 frame(s)... [19/05 08:15:35]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1415, in streaming_training
+    streaming_scene.initialize_from_frames(n_init)
+  File "/workspace/3dgs-mcmc/scene/streaming_scene.py", line 173, in initialize_from_frames
+    initial_frames = [self._get_source_frame(i) for i in range(n_frames)]
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/scene/streaming_scene.py", line 155, in _get_source_frame
+    return self._frame_source.get_frame(index)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1755, in get_frame
+    self._ensure_live_odom_until(index)
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1577, in _ensure_live_odom_until
+    self._live_odom_prev_key_rgbd = self._live_odom_to_rgbd(self._frames[0])
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1516, in _live_odom_to_rgbd
+    depth_img = Image.open(io.BytesIO(frame._depth_bytes))
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/PIL/Image.py", line 3711, in open
+    raise UnidentifiedImageError(msg)
+PIL.UnidentifiedImageError: cannot identify image file <_io.BytesIO object at 0x7fa7602ae520>
+Optimizing output/cps_seggy_smoke
+[streaming] Camera profile 'orbbec_femto_bolt':
+  streaming_min_depth: 0.1 -> 0.3
+  streaming_max_depth: 8.0 -> 5.0
+  streaming_depth_consistency_thresh: 0.05 -> 0.03
+  streaming_depth_edge_threshold: 0.02 -> 0.015
+  streaming_depth_stride: 8 -> 4
+  streaming_depth_loss_weight: 0.05 -> 0.1
+  streaming_free_space_loss_weight: 0.0 -> 0.01
+  streaming_max_new_gaussians_per_frame: 1000 -> 2000 [19/05 08:16:45]
+[streaming] Warning: '/camera/color/image_raw/compressed' has unset header.stamp (sec=0, nsec=0); falling back to bag receive timestamp for this topic. [19/05 08:16:45]
+[streaming] OrbbecRosBag: 8901 synced frames from /mnt/cps_persistent1_shared/datasets/bjoern/cps-seggy/bags/rosbag2_2025_06_20-07_38_47 (color=11326, depth=9025, pose=0, pose_source=open3d_odometry_live) [19/05 08:16:46]
+[streaming] Bootstrapping from 5 frame(s)... [19/05 08:16:46]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1415, in streaming_training
+    streaming_scene.initialize_from_frames(n_init)
+  File "/workspace/3dgs-mcmc/scene/streaming_scene.py", line 173, in initialize_from_frames
+    initial_frames = [self._get_source_frame(i) for i in range(n_frames)]
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/scene/streaming_scene.py", line 155, in _get_source_frame
+    return self._frame_source.get_frame(index)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1788, in get_frame
+    self._ensure_live_odom_until(index)
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1610, in _ensure_live_odom_until
+    self._live_odom_prev_key_rgbd = self._live_odom_to_rgbd(self._frames[0])
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1549, in _live_odom_to_rgbd
+    depth_img = Image.open(io.BytesIO(frame._depth_bytes))
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/PIL/Image.py", line 3711, in open
+    raise UnidentifiedImageError(msg)
+PIL.UnidentifiedImageError: cannot identify image file <_io.BytesIO object at 0x7ff6865b2890>
+Optimizing output/cps_seggy_smoke
+[streaming] Camera profile 'orbbec_femto_bolt':
+  streaming_min_depth: 0.1 -> 0.3
+  streaming_max_depth: 8.0 -> 5.0
+  streaming_depth_consistency_thresh: 0.05 -> 0.03
+  streaming_depth_edge_threshold: 0.02 -> 0.015
+  streaming_depth_stride: 8 -> 4
+  streaming_depth_loss_weight: 0.05 -> 0.1
+  streaming_free_space_loss_weight: 0.0 -> 0.01
+  streaming_max_new_gaussians_per_frame: 1000 -> 2000 [19/05 08:19:35]
+[streaming] OrbbecRosBag: 3454 synced frames from /mnt/cps_persistent1_shared/datasets/bjoern/cps-seggy/bags/rosbag2_2025_06_20-08_40_30 (color=4541, depth=6742, pose=0, pose_source=open3d_odometry_live) [19/05 08:19:42]
+[streaming] Bootstrapping from 5 frame(s)... [19/05 08:19:42]
+[streaming] live Open3D odometry source_frame=1 successes=1 failures=0 [19/05 08:19:45]
+Number of points at initialisation :  128264 [19/05 08:19:48]
+[streaming] Initialised 128264 Gaussians from 5 frames, scene radius=3.926 [19/05 08:19:48]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [19/05 08:19:48]
+[streaming] Starting: strategy=gsplat_energy_mcmc optimizer=selective_adam sparse=True steps_per_frame=25 wallclock=False [19/05 08:19:48]
+[streaming] Dataset: 3454 frames. Iterations to cover all frames: 86475 (budget=500, covers 0%). Remaining frames will be flushed post-loop. [19/05 08:19:48]
+Streaming training:   0%|          | 0/500 [00:00<?, ?it/s]/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+Streaming training:   0%|          | 0/500 [00:07<?, ?it/s, Loss=0.4690974, N=128264, F=6]Streaming training:   2%|2         | 10/500 [00:07<05:52,  1.39it/s, Loss=0.4690974, N=128264, F=6]Streaming training:   2%|2         | 10/500 [00:07<05:52,  1.39it/s, Loss=0.4423040, N=128264, F=6]Streaming training:   4%|4         | 20/500 [00:07<02:31,  3.16it/s, Loss=0.4423040, N=128264, F=6]Streaming training:   4%|4         | 20/500 [00:08<02:31,  3.16it/s, Loss=0.4136142, N=128278, F=7]Streaming training:   6%|6         | 30/500 [00:08<01:50,  4.25it/s, Loss=0.4136142, N=128278, F=7]Streaming training:   6%|6         | 30/500 [00:09<01:50,  4.25it/s, Loss=0.3839954, N=128278, F=7]Streaming training:   8%|8         | 40/500 [00:09<01:12,  6.38it/s, Loss=0.3839954, N=128278, F=7]Streaming training:   8%|8         | 40/500 [00:10<01:12,  6.38it/s, Loss=0.3577063, N=128281, F=8]Streaming training:  10%|#         | 50/500 [00:10<01:07,  6.71it/s, Loss=0.3577063, N=128281, F=8]Streaming training:  10%|#         | 50/500 [00:11<01:07,  6.71it/s, Loss=0.3322360, N=128281, F=8]Streaming training:  12%|#2        | 60/500 [00:11<00:48,  9.03it/s, Loss=0.3322360, N=128281, F=8]Streaming training:  12%|#2        | 60/500 [00:11<00:48,  9.03it/s, Loss=0.3084376, N=128281, F=8]Streaming training:  14%|#4        | 70/500 [00:11<00:37, 11.57it/s, Loss=0.3084376, N=128281, F=8]Streaming training:  14%|#4        | 70/500 [00:12<00:37, 11.57it/s, Loss=0.2788197, N=128281, F=9]Streaming training:  16%|#6        | 80/500 [00:12<00:37, 11.18it/s, Loss=0.2788197, N=128281, F=9]Streaming training:  16%|#6        | 80/500 [00:12<00:37, 11.18it/s, Loss=0.2477670, N=128281, F=9]Streaming training:  18%|#8        | 90/500 [00:12<00:29, 13.75it/s, Loss=0.2477670, N=128281, F=9][streaming] iter=100 promoted 9 points to permanent structure. [19/05 08:20:02]
+Streaming training:  18%|#8        | 90/500 [00:14<00:29, 13.75it/s, Loss=0.2130864, N=128281, F=10]Streaming training:  20%|##        | 100/500 [00:14<00:37, 10.71it/s, Loss=0.2130864, N=128281, F=10]Streaming training:  20%|##        | 100/500 [00:14<00:37, 10.71it/s, Loss=0.1742831, N=128281, F=10]Streaming training:  22%|##2       | 110/500 [00:14<00:29, 13.20it/s, Loss=0.1742831, N=128281, F=10]Streaming training:  22%|##2       | 110/500 [00:14<00:29, 13.20it/s, Loss=0.1404810, N=128281, F=10]Streaming training:  24%|##4       | 120/500 [00:14<00:24, 15.72it/s, Loss=0.1404810, N=128281, F=10]Streaming training:  24%|##4       | 120/500 [00:15<00:24, 15.72it/s, Loss=0.1136154, N=128281, F=11]Streaming training:  26%|##6       | 130/500 [00:15<00:27, 13.60it/s, Loss=0.1136154, N=128281, F=11]Streaming training:  26%|##6       | 130/500 [00:16<00:27, 13.60it/s, Loss=0.0948439, N=128281, F=11]Streaming training:  28%|##8       | 140/500 [00:16<00:22, 16.05it/s, Loss=0.0948439, N=128281, F=11]Streaming training:  28%|##8       | 140/500 [00:17<00:22, 16.05it/s, Loss=0.0871621, N=128281, F=12]Streaming training:  30%|###       | 150/500 [00:17<00:25, 13.79it/s, Loss=0.0871621, N=128281, F=12]Streaming training:  30%|###       | 150/500 [00:17<00:25, 13.79it/s, Loss=0.0838435, N=128281, F=12]Streaming training:  32%|###2      | 160/500 [00:17<00:20, 16.22it/s, Loss=0.0838435, N=128281, F=12]Streaming training:  32%|###2      | 160/500 [00:17<00:20, 16.22it/s, Loss=0.0791318, N=128281, F=12]Streaming training:  34%|###4      | 170/500 [00:17<00:17, 18.46it/s, Loss=0.0791318, N=128281, F=12]Streaming training:  34%|###4      | 170/500 [00:18<00:17, 18.46it/s, Loss=0.0777383, N=128281, F=13]Streaming training:  36%|###6      | 180/500 [00:18<00:21, 14.91it/s, Loss=0.0777383, N=128281, F=13]Streaming training:  36%|###6      | 180/500 [00:19<00:21, 14.91it/s, Loss=0.0750697, N=128281, F=13]Streaming training:  38%|###8      | 190/500 [00:19<00:17, 17.32it/s, Loss=0.0750697, N=128281, F=13][streaming] iter=200 frame=14 pose-only skip reason=redundant [19/05 08:20:08]
+Streaming training:  38%|###8      | 190/500 [00:20<00:17, 17.32it/s, Loss=0.0759964, N=128281, F=14]Streaming training:  40%|####      | 200/500 [00:20<00:20, 14.38it/s, Loss=0.0759964, N=128281, F=14]Streaming training:  40%|####      | 200/500 [00:20<00:20, 14.38it/s, Loss=0.0740364, N=128281, F=14]Streaming training:  42%|####2     | 210/500 [00:20<00:17, 16.78it/s, Loss=0.0740364, N=128281, F=14]Streaming training:  42%|####2     | 210/500 [00:20<00:17, 16.78it/s, Loss=0.0720968, N=128281, F=14]Streaming training:  44%|####4     | 220/500 [00:20<00:14, 19.01it/s, Loss=0.0720968, N=128281, F=14]Streaming training:  44%|####4     | 220/500 [00:21<00:14, 19.01it/s, Loss=0.0689384, N=128281, F=15]Streaming training:  46%|####6     | 230/500 [00:21<00:17, 15.11it/s, Loss=0.0689384, N=128281, F=15]Streaming training:  46%|####6     | 230/500 [00:22<00:17, 15.11it/s, Loss=0.0676581, N=128281, F=15]Streaming training:  48%|####8     | 240/500 [00:22<00:14, 17.48it/s, Loss=0.0676581, N=128281, F=15]Streaming training:  48%|####8     | 240/500 [00:23<00:14, 17.48it/s, Loss=0.0653158, N=128281, F=16]Streaming training:  50%|#####     | 250/500 [00:23<00:17, 14.34it/s, Loss=0.0653158, N=128281, F=16]Streaming training:  50%|#####     | 250/500 [00:23<00:17, 14.34it/s, Loss=0.0661343, N=128281, F=16]Streaming training:  52%|#####2    | 260/500 [00:23<00:14, 16.75it/s, Loss=0.0661343, N=128281, F=16]Streaming training:  52%|#####2    | 260/500 [00:23<00:14, 16.75it/s, Loss=0.0633658, N=128281, F=16]Streaming training:  54%|#####4    | 270/500 [00:23<00:12, 18.95it/s, Loss=0.0633658, N=128281, F=16]Streaming training:  54%|#####4    | 270/500 [00:24<00:12, 18.95it/s, Loss=0.0635756, N=128281, F=17]Streaming training:  56%|#####6    | 280/500 [00:24<00:14, 15.06it/s, Loss=0.0635756, N=128281, F=17]Streaming training:  56%|#####6    | 280/500 [00:25<00:14, 15.06it/s, Loss=0.0645192, N=128281, F=17]Streaming training:  58%|#####8    | 290/500 [00:25<00:12, 17.42it/s, Loss=0.0645192, N=128281, F=17][streaming] iter=300 frame=18 pose-only skip reason=redundant [19/05 08:20:14]
+Streaming training:  58%|#####8    | 290/500 [00:26<00:12, 17.42it/s, Loss=0.0657054, N=128281, F=18]Streaming training:  60%|######    | 300/500 [00:26<00:13, 14.41it/s, Loss=0.0657054, N=128281, F=18]Streaming training:  60%|######    | 300/500 [00:26<00:13, 14.41it/s, Loss=0.0644153, N=128281, F=18]Streaming training:  62%|######2   | 310/500 [00:26<00:11, 16.80it/s, Loss=0.0644153, N=128281, F=18]Streaming training:  62%|######2   | 310/500 [00:26<00:11, 16.80it/s, Loss=0.0653854, N=128281, F=18]Streaming training:  64%|######4   | 320/500 [00:26<00:09, 18.95it/s, Loss=0.0653854, N=128281, F=18]Streaming training:  64%|######4   | 320/500 [00:27<00:09, 18.95it/s, Loss=0.0618130, N=128281, F=19]Streaming training:  66%|######6   | 330/500 [00:27<00:11, 15.17it/s, Loss=0.0618130, N=128281, F=19]Streaming training:  66%|######6   | 330/500 [00:28<00:11, 15.17it/s, Loss=0.0628312, N=128281, F=19]Streaming training:  68%|######8   | 340/500 [00:28<00:09, 17.49it/s, Loss=0.0628312, N=128281, F=19]Streaming training:  68%|######8   | 340/500 [00:29<00:09, 17.49it/s, Loss=0.0615886, N=128281, F=20]Streaming training:  70%|#######   | 350/500 [00:29<00:12, 11.79it/s, Loss=0.0615886, N=128281, F=20]Streaming training:  70%|#######   | 350/500 [00:30<00:12, 11.79it/s, Loss=0.0614334, N=128281, F=20]Streaming training:  72%|#######2  | 360/500 [00:30<00:09, 14.24it/s, Loss=0.0614334, N=128281, F=20]Streaming training:  72%|#######2  | 360/500 [00:30<00:09, 14.24it/s, Loss=0.0621703, N=128281, F=20]Streaming training:  74%|#######4  | 370/500 [00:30<00:07, 16.65it/s, Loss=0.0621703, N=128281, F=20]Streaming training:  74%|#######4  | 370/500 [00:31<00:07, 16.65it/s, Loss=0.0613033, N=128281, F=21]Streaming training:  76%|#######6  | 380/500 [00:31<00:08, 14.01it/s, Loss=0.0613033, N=128281, F=21]Streaming training:  76%|#######6  | 380/500 [00:31<00:08, 14.01it/s, Loss=0.0634258, N=128281, F=21]Streaming training:  78%|#######8  | 390/500 [00:31<00:06, 16.40it/s, Loss=0.0634258, N=128281, F=21][streaming] iter=400 frame=22 pose-only skip reason=redundant [19/05 08:20:21]
+Streaming training:  78%|#######8  | 390/500 [00:32<00:06, 16.40it/s, Loss=0.0641522, N=128281, F=22]Streaming training:  80%|########  | 400/500 [00:32<00:07, 13.87it/s, Loss=0.0641522, N=128281, F=22]Streaming training:  80%|########  | 400/500 [00:33<00:07, 13.87it/s, Loss=0.0633237, N=128281, F=22]Streaming training:  82%|########2 | 410/500 [00:33<00:05, 16.32it/s, Loss=0.0633237, N=128281, F=22]Streaming training:  82%|########2 | 410/500 [00:33<00:05, 16.32it/s, Loss=0.0605134, N=128281, F=22]Streaming training:  84%|########4 | 420/500 [00:33<00:04, 18.55it/s, Loss=0.0605134, N=128281, F=22]Streaming training:  84%|########4 | 420/500 [00:34<00:04, 18.55it/s, Loss=0.0626342, N=128281, F=23]Streaming training:  86%|########6 | 430/500 [00:34<00:04, 14.95it/s, Loss=0.0626342, N=128281, F=23]Streaming training:  86%|########6 | 430/500 [00:34<00:04, 14.95it/s, Loss=0.0605988, N=128281, F=23]Streaming training:  88%|########8 | 440/500 [00:34<00:03, 17.29it/s, Loss=0.0605988, N=128281, F=23]Streaming training:  88%|########8 | 440/500 [00:35<00:03, 17.29it/s, Loss=0.0594650, N=128281, F=24]Streaming training:  90%|######### | 450/500 [00:35<00:03, 14.39it/s, Loss=0.0594650, N=128281, F=24]Streaming training:  90%|######### | 450/500 [00:36<00:03, 14.39it/s, Loss=0.0613826, N=128281, F=24]Streaming training:  92%|#########2| 460/500 [00:36<00:02, 16.81it/s, Loss=0.0613826, N=128281, F=24]Streaming training:  92%|#########2| 460/500 [00:36<00:02, 16.81it/s, Loss=0.0596739, N=128281, F=24]Streaming training:  94%|#########3| 470/500 [00:36<00:01, 18.99it/s, Loss=0.0596739, N=128281, F=24]Streaming training:  94%|#########3| 470/500 [00:37<00:01, 18.99it/s, Loss=0.0594793, N=128281, F=25]Streaming training:  96%|#########6| 480/500 [00:37<00:01, 15.18it/s, Loss=0.0594793, N=128281, F=25]Streaming training:  96%|#########6| 480/500 [00:37<00:01, 15.18it/s, Loss=0.0624773, N=128281, F=25]Streaming training:  98%|#########8| 490/500 [00:37<00:00, 17.51it/s, Loss=0.0624773, N=128281, F=25][streaming] iter=500 frame=26 pose-only skip reason=redundant [19/05 08:20:27]
+[gsplat-energy-mcmc] iter=500 mode=energy relocated=0 added=0 factor=1.0000 grow_int=500 N=128281->128281 lr=0.000581797 [19/05 08:20:27]
+Streaming training:  98%|#########8| 490/500 [00:38<00:00, 17.51it/s, Loss=0.0633392, N=128281, F=26]Streaming training: 100%|##########| 500/500 [00:38<00:00, 14.50it/s, Loss=0.0633392, N=128281, F=26]Streaming training: 100%|##########| 500/500 [00:38<00:00, 12.85it/s, Loss=0.0633392, N=128281, F=26]
+[report] iter=500 no test views — skipping test PSNR/LPIPS/contact sheet [19/05 08:20:27]
+[report] iter=500 train PSNR mean=25.53dB min=25.02 max=25.78 (9 views) [19/05 08:21:06]
+[report] iter=500 train LPIPS mean=0.1964 min=0.1935 max=0.2003 [19/05 08:21:06]
+[report] trajectory.mp4 written (9 frames @ 15fps) [19/05 08:21:07]
+
+[ITER 500] Saving Gaussians [19/05 08:21:07]
+[streaming] Keyframe admission: 4/18 admitted (22.2%) — forced=1 moved=0 novel=3 rej_overlap=1 rej_motion=13 [19/05 08:21:07]
+[streaming] Iteration budget exhausted with 3428 dataset frames unseen. Coverage: 4 frames optimized × 125.0 avg steps/frame = 26/3454 dataset frames. [19/05 08:21:07]
+[report] iter=500 no test views — skipping test PSNR/LPIPS/contact sheet [19/05 08:21:07]
+[report] iter=500 train PSNR mean=25.53dB min=25.02 max=25.78 (9 views) [19/05 08:21:12]
+[report] iter=500 train LPIPS mean=0.1964 min=0.1935 max=0.2003 [19/05 08:21:12]
+[report] trajectory.mp4 written (9 frames @ 15fps) [19/05 08:21:13]
+[report] iter=500 test PSNR mean=25.69dB min=25.58 max=25.78 (5 views) [19/05 08:21:17]
+[report] iter=500 test LPIPS mean=0.1949 min=0.1935 max=0.1969 [19/05 08:21:17]
+[report] iter=500 train PSNR mean=25.69dB min=25.58 max=25.78 (5 views) [19/05 08:21:19]
+[report] iter=500 train LPIPS mean=0.1949 min=0.1935 max=0.1969 [19/05 08:21:19]
+[report] trajectory.mp4 written (5 frames @ 20fps) [19/05 08:21:20]
+[trajectory_eval] → output/cps_seggy_smoke/trajectory_eval  n=9 ATE=None [19/05 08:21:21]
+
+[streaming] Training complete. [19/05 08:21:21]
+
+Training complete. [19/05 08:21:21]

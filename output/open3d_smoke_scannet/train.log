@@ -1,0 +1,18 @@
+Optimizing output/open3d_smoke_scannet
+Output folder: output/open3d_smoke_scannet [11/05 08:58:05]
+Found ScanNet RGB-D scene layout. [11/05 08:58:05]
+Loaded ScanNet .sens cameras: 20 of 5920 frames (skipped invalid/missing frames: 0) [11/05 08:58:19]
+Generating ScanNet RGB-D init point cloud (stride=16, frames=10, max=5000)... [11/05 08:58:19]
+[pointcloud] scannet_rgbd_init: preprocess=open3d points=5000->4699 voxel=0.02 outlier=statistical normals=0 time=0.003s [11/05 08:58:21]
+Loading Training Cameras [11/05 08:58:21]
+Loading Test Cameras [11/05 08:58:22]
+Number of points at initialisation :  4699 [11/05 08:58:22]
+[parallelism] profile=off model_layout=legacy optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [11/05 08:58:23]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [11/05 08:58:23]
+Training progress:   0%|          | 0/3 [00:00<?, ?it/s]Training progress:   0%|          | 0/3 [00:05<?, ?it/s]
+
+[ITER 3] Evaluating train: L1 0.498855608701706 PSNR 5.188733005523682 [11/05 08:58:31]
+
+[ITER 3] Saving Gaussians [11/05 08:58:31]
+
+Training complete. [11/05 08:58:31]

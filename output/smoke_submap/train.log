@@ -1,0 +1,32 @@
+Optimizing /workspace/3dgs-mcmc/output/smoke_submap
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1423, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 882, in streaming_training
+    _run_submap_stitch(
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 612, in _run_submap_stitch
+    sub_gaussians.create_from_pcd(pcd, cameras_extent=1.0,
+TypeError: GsplatGaussianModel.create_from_pcd() got an unexpected keyword argument 'cameras_extent'
+Optimizing /workspace/3dgs-mcmc/output/smoke_submap
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1423, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 882, in streaming_training
+    _run_submap_stitch(
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 627, in _run_submap_stitch
+    sub_gaussians.optimizer.step()
+  File "/workspace/3dgs-mcmc/scene/gsplat_model.py", line 38, in step
+    optimizer.step()
+  File "/opt/venv/lib/python3.12/site-packages/torch/optim/optimizer.py", line 526, in wrapper
+    out = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+TypeError: SelectiveAdam.step() missing 1 required positional argument: 'visibility'

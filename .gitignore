@@ -1,8 +1,33 @@
 *.pyc
 .vscode
-output
+data
 build
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
 tensorboard_3d
 screenshots
+
+# Output directory: exclude by default, allow specific text-based result files
+output/
+# Re-include directory structure and key result files
+!output/
+!output/**/
+!output/**/reproduce.sh
+!output/**/train.log
+!output/**/cfg_args
+!output/**/run_args
+# Exclude everything else that might match via wildcard re-inclusion
+output/**/*.pth
+output/**/*.ply
+output/**/*.npz
+output/**/*.npy
+output/**/*.png
+output/**/*.jpg
+output/**/*.jpeg
+output/**/*.mp4
+output/**/*.avi
+output/**/*.gif
+output/**/*.json
+output/**/*.jsonl
+output/**/*.pid
+output/**/events.out.tfevents.*

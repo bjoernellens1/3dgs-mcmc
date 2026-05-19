@@ -16,6 +16,20 @@ from utils.graphics_utils import fov2focal
 
 WARNED = False
 
+
+def _scale_intrinsics(cam_info, resolution, orig_w, orig_h):
+    fx = getattr(cam_info, "fx", None)
+    fy = getattr(cam_info, "fy", None)
+    cx = getattr(cam_info, "cx", None)
+    cy = getattr(cam_info, "cy", None)
+    if fx is None or fy is None or cx is None or cy is None:
+        return None, None, None, None
+
+    sx = float(resolution[0]) / float(orig_w)
+    sy = float(resolution[1]) / float(orig_h)
+    return float(fx) * sx, float(fy) * sy, float(cx) * sx, float(cy) * sy
+
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
@@ -46,10 +60,13 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
+    fx, fy, cx, cy = _scale_intrinsics(cam_info, resolution, orig_w, orig_h)
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  fx=fx, fy=fy, cx=cx, cy=cy)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -76,7 +93,9 @@ def camera_to_JSON(id, camera : Camera):
         'height' : camera.height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy' : camera.fy if camera.fy is not None else fov2focal(camera.FovY, camera.height),
+        'fx' : camera.fx if camera.fx is not None else fov2focal(camera.FovX, camera.width),
+        'cx' : camera.cx if camera.cx is not None else camera.width / 2.0,
+        'cy' : camera.cy if camera.cy is not None else camera.height / 2.0,
     }
     return camera_entry

@@ -1,0 +1,18 @@
+Optimizing output/open3d_smoke_tum
+Output folder: output/open3d_smoke_tum [11/05 08:57:43]
+Found TUM RGB-D dataset layout. [11/05 08:57:43]
+Loaded TUM cameras: 20 skipped=0 [11/05 08:57:43]
+Generating TUM RGB-D init point cloud (stride=16, frames=10, max=5000)... [11/05 08:57:43]
+[pointcloud] tum_rgbd_init: preprocess=open3d points=5000->4362 voxel=0.02 outlier=statistical normals=0 time=0.003s [11/05 08:57:46]
+Loading Training Cameras [11/05 08:57:46]
+Loading Test Cameras [11/05 08:57:46]
+Number of points at initialisation :  4362 [11/05 08:57:46]
+[parallelism] profile=off model_layout=legacy optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [11/05 08:57:47]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [11/05 08:57:47]
+Training progress:   0%|          | 0/3 [00:00<?, ?it/s]Training progress:   0%|          | 0/3 [00:04<?, ?it/s]
+
+[ITER 3] Evaluating train: L1 0.5248071908950805 PSNR 4.376281833648682 [11/05 08:57:52]
+
+[ITER 3] Saving Gaussians [11/05 08:57:52]
+
+Training complete. [11/05 08:57:52]

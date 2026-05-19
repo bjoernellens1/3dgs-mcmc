@@ -1,0 +1,15 @@
+Optimizing output/tum_smoke
+Output folder: output/tum_smoke [10/05 07:36:22]
+Found TUM RGB-D dataset layout. [10/05 07:36:22]
+Loaded TUM cameras: 6 skipped=0 [10/05 07:36:22]
+Loading Training Cameras [10/05 07:36:22]
+Loading Test Cameras [10/05 07:36:22]
+Number of points at initialisation :  192 [10/05 07:36:22]
+[parallelism] profile=off model_layout=gsplat optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [10/05 07:36:23]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [10/05 07:36:23]
+Training progress:   0%|          | 0/2 [00:00<?, ?it/s]Training progress:   0%|          | 0/2 [00:03<?, ?it/s]
+
+[ITER 2] Saving Gaussians [10/05 07:36:26]
+[gsplat-mcmc] iter=2 N=192->192 lr=4.39865e-06 [10/05 07:36:26]
+
+Training complete. [10/05 07:36:26]
