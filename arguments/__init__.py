@@ -120,7 +120,8 @@ class ModelParams(ParamGroup):
         self.orbbec_open3d_odom_cache_dir = ""
         self.orbbec_open3d_odom_stride = 1
         self.orbbec_open3d_odom_downscale = 1
-        self.orbbec_open3d_odom_async = False
+        self.orbbec_open3d_odom_async = True
+        self.orbbec_open3d_odom_async_queue_size = 32
         self.orbbec_open3d_odom_max_trans_per_edge = 0.15
         self.orbbec_open3d_odom_max_rot_deg_per_edge = 8.0
         self.orbbec_open3d_odom_method = "hybrid"

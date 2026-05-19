@@ -3000,6 +3000,12 @@ def streaming_training(
     _force_bootstrap_views = _debug_bootstrap_motion and bool(_bootstrap_cams)
     if _report_final or _force_bootstrap_views:
         try:
+            # Phase 5: drain any pending live-odom frames before reports enumerate
+            # all cameras, so the async producer can't leave frames mid-stream.
+            try:
+                streaming_scene.drain_pending_odometry()
+            except Exception:
+                pass
             from utils.comparison_report import write_post_training_report
             from gaussian_renderer.gsplat_backend import render_batch as _rb_final
             if _report_final:

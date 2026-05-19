@@ -819,6 +819,7 @@ class OrbbecRosBagFrameSource:
         open3d_odom_stride: int = 1,
         open3d_odom_downscale: int = 1,
         open3d_odom_async: bool = False,
+        open3d_odom_async_queue_size: int = 32,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
         open3d_odom_depth_min: float = 0.1,
@@ -1147,6 +1148,10 @@ class OrbbecRosBagFrameSource:
         self._live_odom_async_error = None
         self._live_odom_async_thread = None
         self._live_odom_cond = None
+        # Phase 5: producer-consumer backpressure
+        self._live_odom_consumer_idx = 0
+        self._live_odom_queue_size = max(1, int(open3d_odom_async_queue_size))
+        self._live_odom_async_stop = False
         if self._live_odom_enabled:
             live_cache_key = self._open3d_odom_cache_key(
                 path=path,
@@ -1644,15 +1649,34 @@ class OrbbecRosBagFrameSource:
                 cond.notify_all()
 
     def _start_live_odom_worker(self) -> None:
+        """Phase 5: queue-bounded producer for live Open3D odometry.
+
+        Producer advances `_live_odom_computed_idx` one frame at a time via
+        `_ensure_live_odom_until(idx)`.  When the producer would get more than
+        `_live_odom_queue_size` frames ahead of `_live_odom_consumer_idx`, it
+        blocks on the condition variable instead of racing through the whole
+        dataset.  Covers both RGBD-odom and ICP backends because the method
+        dispatch is inside `_ensure_live_odom_until`.
+        """
         if self._live_odom_async_thread is not None:
             return
         import threading
 
         self._live_odom_cond = threading.Condition()
+        n_total = len(self._frames)
 
         def _run():
             try:
-                self._ensure_live_odom_until(len(self._frames) - 1)
+                for idx in range(1, n_total):
+                    with self._live_odom_cond:
+                        while (
+                            (idx - self._live_odom_consumer_idx) > self._live_odom_queue_size
+                            and not self._live_odom_async_stop
+                        ):
+                            self._live_odom_cond.wait(timeout=0.5)
+                        if self._live_odom_async_stop:
+                            return
+                    self._ensure_live_odom_until(idx)
             except BaseException as exc:
                 self._live_odom_async_error = exc
             finally:
@@ -1665,7 +1689,41 @@ class OrbbecRosBagFrameSource:
             daemon=True,
         )
         self._live_odom_async_thread.start()
-        print("[streaming] live Open3D odometry async worker started", flush=True)
+        print(
+            f"[streaming] live Open3D odometry async worker started "
+            f"(queue_size={self._live_odom_queue_size}, queue-bounded)",
+            flush=True,
+        )
+
+    def _signal_consumer_progress(self, idx: int) -> None:
+        """Consumer-side: announce that frame `idx` has been consumed.
+
+        Wakes the producer so it can advance past the backpressure gate.
+        """
+        cond = getattr(self, "_live_odom_cond", None)
+        if cond is None:
+            return
+        with cond:
+            if idx > self._live_odom_consumer_idx:
+                self._live_odom_consumer_idx = idx
+                cond.notify_all()
+
+    def drain_pending(self) -> None:
+        """Release backpressure and block until the producer finishes.
+
+        Used by reports/trajectory eval that need every frame's pose realized.
+        No-op when live odom is disabled or the cache covered everything.
+        """
+        if not self._live_odom_enabled or self._live_odom_cached_full:
+            return
+        last = len(self._frames) - 1
+        if last < 0:
+            return
+        if self._live_odom_async_enabled:
+            self._signal_consumer_progress(last)
+            self._wait_live_odom_until(last)
+        else:
+            self._ensure_live_odom_until(last)
 
     def _wait_live_odom_until(self, index: int) -> None:
         if index <= self._live_odom_computed_idx:
@@ -1945,6 +2003,8 @@ class OrbbecRosBagFrameSource:
             raise IndexError(index)
         if self._live_odom_async_enabled and not self._live_odom_cached_full:
             self._wait_live_odom_until(index)
+            # Phase 5: release backpressure so producer can advance past this idx
+            self._signal_consumer_progress(index)
         elif self._live_odom_enabled:
             self._ensure_live_odom_until(index)
         return self._frames[index]
@@ -1980,6 +2040,7 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         open3d_odom_stride: int = 1,
         open3d_odom_downscale: int = 1,
         open3d_odom_async: bool = False,
+        open3d_odom_async_queue_size: int = 32,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
         open3d_odom_depth_min: float = 0.1,
@@ -2148,6 +2209,10 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._live_odom_async_error = None
         self._live_odom_async_thread = None
         self._live_odom_cond = None
+        # Phase 5: producer-consumer backpressure
+        self._live_odom_consumer_idx = 0
+        self._live_odom_queue_size = max(1, int(open3d_odom_async_queue_size))
+        self._live_odom_async_stop = False
 
         if self._frames:
             self._frames[0].c2w = np.eye(4, dtype=np.float32)
@@ -2301,6 +2366,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_stride=getattr(args, "orbbec_open3d_odom_stride", 1),
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
             open3d_odom_async=getattr(args, "orbbec_open3d_odom_async", False),
+            open3d_odom_async_queue_size=getattr(args, "orbbec_open3d_odom_async_queue_size", 32),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
             open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
@@ -2330,6 +2396,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_stride=getattr(args, "orbbec_open3d_odom_stride", 1),
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
             open3d_odom_async=getattr(args, "orbbec_open3d_odom_async", False),
+            open3d_odom_async_queue_size=getattr(args, "orbbec_open3d_odom_async_queue_size", 32),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
             open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
