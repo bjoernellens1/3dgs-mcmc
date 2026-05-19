@@ -122,6 +122,11 @@ class ModelParams(ParamGroup):
         self.orbbec_open3d_odom_downscale = 1
         self.orbbec_open3d_odom_max_trans_per_edge = 0.15
         self.orbbec_open3d_odom_max_rot_deg_per_edge = 8.0
+        self.orbbec_open3d_odom_method = "hybrid"
+        self.orbbec_open3d_odom_depth_diff_max = 0.07
+        self.orbbec_open3d_icp_max_distance = 0.07
+        self.orbbec_open3d_icp_robust_kernel = "huber"
+        self.orbbec_open3d_icp_sigma = 0.05
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

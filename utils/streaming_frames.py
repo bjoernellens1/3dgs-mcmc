@@ -820,6 +820,13 @@ class OrbbecRosBagFrameSource:
         open3d_odom_downscale: int = 1,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
+        open3d_odom_depth_min: float = 0.1,
+        open3d_odom_depth_max: float = 8.0,
+        open3d_odom_depth_diff_max: float = 0.07,
+        open3d_odom_method: str = "hybrid",
+        open3d_icp_max_distance: float = 0.07,
+        open3d_icp_robust_kernel: str = "huber",
+        open3d_icp_sigma: float = 0.05,
     ):
         try:
             from rosbags.rosbag2 import Reader
@@ -989,6 +996,10 @@ class OrbbecRosBagFrameSource:
                 synced=synced,
                 odom_stride=open3d_odom_stride,
                 odom_downscale=open3d_odom_downscale,
+                odom_method=open3d_odom_method,
+                icp_max_distance=open3d_icp_max_distance,
+                icp_robust_kernel=open3d_icp_robust_kernel,
+                icp_sigma=open3d_icp_sigma,
                 mode="precompute",
             )
             cache_path = self._open3d_odom_cache_path(
@@ -1017,6 +1028,13 @@ class OrbbecRosBagFrameSource:
                     max_failure_ratio=open3d_odom_max_failure_ratio,
                     odom_stride=open3d_odom_stride,
                     odom_downscale=open3d_odom_downscale,
+                    odom_depth_min=self._odom_depth_min,
+                    odom_depth_max=self._odom_depth_max,
+                    odom_depth_diff_max=self._odom_depth_diff_max,
+                    odom_method=open3d_odom_method,
+                    icp_max_distance=open3d_icp_max_distance,
+                    icp_robust_kernel=open3d_icp_robust_kernel,
+                    icp_sigma=open3d_icp_sigma,
                 )
                 if open3d_odom_cache:
                     self._save_open3d_odom_cache(cache_path, cache_key, odom_poses, odom_stats)
@@ -1056,6 +1074,13 @@ class OrbbecRosBagFrameSource:
         self._live_odom_max_failure_ratio = float(open3d_odom_max_failure_ratio)
         self._live_odom_max_trans = float(open3d_odom_max_trans_per_edge) if open3d_odom_max_trans_per_edge > 0 else float("inf")
         self._live_odom_max_rot = float(open3d_odom_max_rot_deg_per_edge) if open3d_odom_max_rot_deg_per_edge > 0 else float("inf")
+        self._odom_depth_min = float(open3d_odom_depth_min)
+        self._odom_depth_max = float(open3d_odom_depth_max)
+        self._odom_depth_diff_max = float(open3d_odom_depth_diff_max)
+        self._live_odom_method = open3d_odom_method
+        self._live_odom_icp_max_distance = open3d_icp_max_distance
+        self._live_odom_icp_robust_kernel = open3d_icp_robust_kernel
+        self._live_odom_icp_sigma = open3d_icp_sigma
         self._live_odom_successes = 0
         self._live_odom_failures = 0
         self._live_odom_pairs = 0
@@ -1089,6 +1114,10 @@ class OrbbecRosBagFrameSource:
                 synced=synced,
                 odom_stride=open3d_odom_stride,
                 odom_downscale=open3d_odom_downscale,
+                odom_method=open3d_odom_method,
+                icp_max_distance=open3d_icp_max_distance,
+                icp_robust_kernel=open3d_icp_robust_kernel,
+                icp_sigma=open3d_icp_sigma,
                 mode="live",
             )
             live_cache_path = self._open3d_odom_cache_path(
@@ -1140,6 +1169,10 @@ class OrbbecRosBagFrameSource:
         synced,
         odom_stride: int,
         odom_downscale: int,
+        odom_method: str = "hybrid",
+        icp_max_distance: float = 0.07,
+        icp_robust_kernel: str = "huber",
+        icp_sigma: float = 0.05,
         mode: str = "precompute",
     ) -> str:
         import hashlib
@@ -1156,7 +1189,7 @@ class OrbbecRosBagFrameSource:
             ",".join(str(ts) for ts in timestamps).encode("ascii")
         ).hexdigest()[:16]
         payload = {
-            "version": 1,
+            "version": 2,
             "mode": str(mode),
             "path": os.path.abspath(path),
             "metadata": metadata_sig,
@@ -1174,6 +1207,12 @@ class OrbbecRosBagFrameSource:
             ],
             "odom_stride": int(odom_stride),
             "odom_downscale": int(odom_downscale),
+            "odom_method": str(odom_method),
+            "icp_params": [
+                round(float(icp_max_distance), 6),
+                str(icp_robust_kernel),
+                round(float(icp_sigma), 6),
+            ],
             "n_frames": len(timestamps),
             "first_ts": timestamps[0] if timestamps else None,
             "last_ts": timestamps[-1] if timestamps else None,
@@ -1232,6 +1271,50 @@ class OrbbecRosBagFrameSource:
             print(f"[streaming] OrbbecRosBag: failed to save Open3D odometry cache: {exc}", flush=True)
 
     @staticmethod
+    def _estimate_icp_odometry(
+        prev_rgbd,
+        curr_rgbd,
+        intrinsic,
+        max_distance: float,
+        robust_kernel: str = "huber",
+        sigma: float = 0.05,
+        init_guess: np.ndarray | None = None,
+    ):
+        import open3d as o3d
+        import numpy as np
+
+        # Convert RGBDImage to PointCloud
+        pcd_prev = o3d.geometry.PointCloud.create_from_rgbd_image(prev_rgbd, intrinsic)
+        pcd_curr = o3d.geometry.PointCloud.create_from_rgbd_image(curr_rgbd, intrinsic)
+
+        # Estimate normals for point-to-plane (on target/prev)
+        pcd_prev.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+        )
+
+        # Setup robust kernel
+        loss = None
+        if robust_kernel == "huber":
+            loss = o3d.pipelines.registration.HuberLoss(k=sigma)
+        elif robust_kernel == "tukey":
+            loss = o3d.pipelines.registration.TukeyLoss(k=sigma)
+
+        trans_init = init_guess if init_guess is not None else np.eye(4)
+
+        # Point-to-plane ICP
+        reg = o3d.pipelines.registration.registration_icp(
+            pcd_curr,
+            pcd_prev,
+            max_distance,
+            trans_init,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
+        )
+
+        # Success check: fitness is ratio of overlapping points
+        success = reg.fitness > 0.01
+        return success, reg.transformation, None
+
+    @staticmethod
     def _estimate_open3d_odometry(
         synced_frames,
         fx: float,
@@ -1244,8 +1327,20 @@ class OrbbecRosBagFrameSource:
         max_failure_ratio: float,
         odom_stride: int = 1,
         odom_downscale: int = 1,
+        odom_depth_min: float = 0.1,
+        odom_depth_max: float = 8.0,
+        odom_depth_diff_max: float = 0.07,
+        odom_method: str = "hybrid",
+        icp_max_distance: float = 0.07,
+        icp_robust_kernel: str = "huber",
+        icp_sigma: float = 0.05,
     ):
         try:
+            import sys as _sys
+            if not hasattr(_sys.stdout, "isatty"):
+                _sys.stdout.isatty = lambda: False  # type: ignore[attr-defined]
+            if not hasattr(_sys.stderr, "isatty"):
+                _sys.stderr.isatty = lambda: False  # type: ignore[attr-defined]
             import open3d as o3d
         except ImportError as exc:
             raise ImportError(
@@ -1278,9 +1373,9 @@ class OrbbecRosBagFrameSource:
             odom_cy,
         )
         option = o3d.pipelines.odometry.OdometryOption(
-            depth_min=0.3,
-            depth_max=5.0,
-            depth_diff_max=0.07,
+            depth_min=odom_depth_min,
+            depth_max=odom_depth_max,
+            depth_diff_max=odom_depth_diff_max,
         )
         jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
 
@@ -1301,7 +1396,7 @@ class OrbbecRosBagFrameSource:
                 color,
                 depth,
                 depth_scale=float(depth_scale),
-                depth_trunc=5.0,
+                depth_trunc=odom_depth_max,
                 convert_rgb_to_intensity=True,
             )
 
@@ -1322,14 +1417,26 @@ class OrbbecRosBagFrameSource:
         for pair_idx, frame_idx in enumerate(key_indices[1:], start=1):
             _, rgb_bytes, depth_bytes, _ = synced_frames[frame_idx]
             curr_rgbd = to_rgbd(rgb_bytes, depth_bytes)
-            success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
-                prev_rgbd,
-                curr_rgbd,
-                intrinsic,
-                np.eye(4, dtype=np.float64),
-                jacobian,
-                option,
-            )
+
+            if odom_method == "icp":
+                success, trans_prev_to_curr, _ = OrbbecRosBagFrameSource._estimate_icp_odometry(
+                    prev_rgbd,
+                    curr_rgbd,
+                    intrinsic,
+                    max_distance=icp_max_distance,
+                    robust_kernel=icp_robust_kernel,
+                    sigma=icp_sigma,
+                )
+            else:
+                success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                    prev_rgbd,
+                    curr_rgbd,
+                    intrinsic,
+                    np.eye(4, dtype=np.float64),
+                    jacobian,
+                    option,
+                )
+
             if success:
                 key_poses.append((key_poses[-1] @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32))
                 prev_rgbd = curr_rgbd
@@ -1417,7 +1524,7 @@ class OrbbecRosBagFrameSource:
             color,
             depth,
             depth_scale=float(self._depth_scale),
-            depth_trunc=5.0,
+            depth_trunc=self._odom_depth_max,
             convert_rgb_to_intensity=True,
         )
 
@@ -1481,9 +1588,9 @@ class OrbbecRosBagFrameSource:
             float(self._cy) / self._live_odom_downscale,
         )
         option = o3d.pipelines.odometry.OdometryOption(
-            depth_min=0.3,
-            depth_max=5.0,
-            depth_diff_max=0.07,
+            depth_min=self._odom_depth_min,
+            depth_max=self._odom_depth_max,
+            depth_diff_max=self._odom_depth_diff_max,
         )
         jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
 
@@ -1520,14 +1627,26 @@ class OrbbecRosBagFrameSource:
                     init_guess = T
             else:
                 init_guess = np.eye(4, dtype=np.float64)
-            success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
-                self._live_odom_prev_key_rgbd,
-                curr_rgbd,
-                intrinsic,
-                init_guess,
-                jacobian,
-                option,
-            )
+
+            if self._live_odom_method == "icp":
+                success, trans_prev_to_curr, _ = self._estimate_icp_odometry(
+                    self._live_odom_prev_key_rgbd,
+                    curr_rgbd,
+                    intrinsic,
+                    max_distance=self._live_odom_icp_max_distance,
+                    robust_kernel=self._live_odom_icp_robust_kernel,
+                    sigma=self._live_odom_icp_sigma,
+                    init_guess=init_guess,
+                )
+            else:
+                success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                    self._live_odom_prev_key_rgbd,
+                    curr_rgbd,
+                    intrinsic,
+                    init_guess,
+                    jacobian,
+                    option,
+                )
             self._live_odom_pairs += 1
             key_pose = self._frames[self._live_odom_prev_key_idx].c2w
 
@@ -1734,6 +1853,13 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
+            open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
+            open3d_odom_depth_max=getattr(args, "streaming_max_depth", 8.0),
+            open3d_odom_depth_diff_max=getattr(args, "orbbec_open3d_odom_depth_diff_max", 0.07),
+            open3d_odom_method=getattr(args, "orbbec_open3d_odom_method", "hybrid"),
+            open3d_icp_max_distance=getattr(args, "orbbec_open3d_icp_max_distance", 0.07),
+            open3d_icp_robust_kernel=getattr(args, "orbbec_open3d_icp_robust_kernel", "huber"),
+            open3d_icp_sigma=getattr(args, "orbbec_open3d_icp_sigma", 0.05),
         )
     raise ValueError(
         f"[streaming] No supported RGB-D dataset layout found at: {path}\n"
