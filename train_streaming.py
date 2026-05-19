@@ -2131,6 +2131,22 @@ def streaming_training(
                 if is_train:
                     _n_frames_trained += 1
                 _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
+                # Log per-frame odometry diagnostics when available
+                _odom_stats = getattr(new_frame, "_odom_stats", None)
+                if _odom_stats is not None:
+                    from streaming.odometry.async_worker import log_odom_stats, OdometryStats
+                    if not isinstance(_odom_stats, OdometryStats):
+                        # Convert raw dict emitted by OrbbecRosBag into OdometryStats
+                        _odom_stats = OdometryStats(
+                            translation_m=float(_odom_stats.get("translation_m", 0.0)),
+                            rotation_deg=float(_odom_stats.get("rotation_deg", 0.0)),
+                            fitness=_odom_stats.get("fitness"),
+                            inlier_rmse=_odom_stats.get("inlier_rmse"),
+                            info_trace=_odom_stats.get("info_trace"),
+                            method=str(_odom_stats.get("method", "")),
+                            valid=bool(_odom_stats.get("valid", True)),
+                        )
+                    log_odom_stats(tb_writer, _odom_stats, iteration)
                 _admission_stats = getattr(new_frame, "_streaming_admission_stats", None)
                 if _admission_stats and _admission_stats.get("mode") == "hybrid_keyframe":
                     _admit_cnt["total"] += 1

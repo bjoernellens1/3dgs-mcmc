@@ -1821,6 +1821,16 @@ class OrbbecRosBagFrameSource:
                 # Update constant-velocity prior with the successful transform
                 self._live_odom_last_trans = trans_prev_to_curr.copy()
                 self._live_odom_last_n_edges = max(1, idx - self._live_odom_prev_key_idx)
+                # Attach diagnostics for TB logging in training loop
+                _info = odom_info if isinstance(odom_info, dict) else {}
+                self._frames[idx]._odom_stats = {
+                    "valid": True,
+                    "translation_m": edge_t or 0.0,
+                    "rotation_deg": edge_r or 0.0,
+                    "fitness": _info.get("fitness"),
+                    "inlier_rmse": _info.get("inlier_rmse"),
+                    "method": self._live_odom_method,
+                }
             else:
                 # Phase 2.2: on failure, keep the previous key pose but do NOT advance
                 # the odometry reference — the next estimate will still compare against
@@ -1829,6 +1839,15 @@ class OrbbecRosBagFrameSource:
                 curr_pose = key_pose.copy()
                 self._frames[idx].c2w = curr_pose
                 self._frames[idx]._odom_valid = False
+                # Attach failure diagnostics for TB logging in training loop
+                self._frames[idx]._odom_stats = {
+                    "valid": False,
+                    "translation_m": edge_t or 0.0,
+                    "rotation_deg": edge_r or 0.0,
+                    "fitness": None,
+                    "inlier_rmse": None,
+                    "method": self._live_odom_method,
+                }
                 for i in range(self._live_odom_prev_key_idx + 1, idx):
                     self._frames[i].c2w = curr_pose.copy()
                     self._frames[i]._odom_valid = False
