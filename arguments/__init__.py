@@ -434,6 +434,13 @@ class StreamingParams(ParamGroup):
         self.streaming_debug_bootstrap_ply_interval = 0
         self.streaming_debug_bootstrap_motion_threshold = 0.05
         self.streaming_debug_bootstrap_first_iters = 200
+        # Fine-grained parameter freeze for isolation ablations.
+        # Comma-separated list of param-group names to hard-zero-LR at training start.
+        # Valid names (gsplat layout): means, scales, quats, opacities, sh0, shN
+        # Valid names (legacy layout): xyz, scaling, rotation, opacity, f_dc, f_rest
+        # Example: "means" → isolate center drift; "scales,quats" → isolate shape drift.
+        # Empty string (default) → no freeze applied (normal / colors_only still apply).
+        self.streaming_freeze_params = ""
         # H10: Global keyframe reservoir.
         # Every Nth ingested train frame is kept in a permanent reservoir for
         # trajectory-wide replay. 0 = disabled.

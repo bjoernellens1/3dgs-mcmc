@@ -1939,6 +1939,23 @@ def streaming_training(
             if _pg.get("name") in _geom_names_gsplat | _geom_names_legacy:
                 _pg["lr"] = 0.0
         gaussians.xyz_scheduler_args = lambda _step: 0.0
+    # Fine-grained freeze: zero-LR on specific param groups for isolation ablations.
+    # Applied *after* colors_only so it can extend or override that freeze.
+    _freeze_params: set[str] = {
+        p.strip()
+        for p in getattr(args, "streaming_freeze_params", "").split(",")
+        if p.strip()
+    }
+    if _freeze_params:
+        _means_frozen = False
+        for _pg in gaussians.optimizer.param_groups:
+            if _pg.get("name") in _freeze_params:
+                _pg["lr"] = 0.0
+                if _pg.get("name") in ("means", "xyz"):
+                    _means_frozen = True
+        if _means_frozen:
+            gaussians.xyz_scheduler_args = lambda _step: 0.0
+        print(f"[streaming] freeze_params={sorted(_freeze_params)}", flush=True)
     if _training_mode == "submap_stitch":
         # H11: dispatch to submap-stitching path before entering the main loop
         _run_submap_stitch(
@@ -2936,26 +2953,32 @@ def streaming_training(
 
     # Post-training report: bounded test/train metrics + side-by-side PNGs +
     # contact sheet + trajectory MP4. Can be disabled for core-training profiling.
-    if getattr(args, "streaming_report_final", True):
+    _report_final = getattr(args, "streaming_report_final", True)
+    # Bootstrap-view comparison renders are always written when the bootstrap-motion
+    # diagnostic is active — even if --no-streaming_report_final was passed.
+    _force_bootstrap_views = _debug_bootstrap_motion and bool(_bootstrap_cams)
+    if _report_final or _force_bootstrap_views:
         try:
             from utils.comparison_report import write_post_training_report
             from gaussian_renderer.gsplat_backend import render_batch as _rb_final
-            write_post_training_report(
-                model_path=args.model_path,
-                iteration=opt.iterations,
-                gaussians=gaussians,
-                train_cams=list(streaming_scene.getTrainCameras()),
-                test_cams=list(streaming_scene.getTestCameras()),
-                render_fn=render,
-                pipe=pipe,
-                background=background,
-                tb_writer=tb_writer,
-                log_prefix="streaming_report",
-                batch_render_fn=_rb_final,
-                **_streaming_report_kwargs(),
-            )
+            if _report_final:
+                write_post_training_report(
+                    model_path=args.model_path,
+                    iteration=opt.iterations,
+                    gaussians=gaussians,
+                    train_cams=list(streaming_scene.getTrainCameras()),
+                    test_cams=list(streaming_scene.getTestCameras()),
+                    render_fn=render,
+                    pipe=pipe,
+                    background=background,
+                    tb_writer=tb_writer,
+                    log_prefix="streaming_report",
+                    batch_render_fn=_rb_final,
+                    **_streaming_report_kwargs(),
+                )
             # Re-render the bootstrap views with the trained Gaussians so the
             # iter_0 vs end-of-training comparison is over the same viewpoints.
+            # Written unconditionally when --streaming_debug_bootstrap_motion is set.
             if _bootstrap_cams:
                 write_post_training_report(
                     model_path=args.model_path,
