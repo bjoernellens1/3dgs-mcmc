@@ -2440,65 +2440,13 @@ def streaming_training(
             _chk = os.path.join(args.model_path, f"chkpnt{iteration}.pth")
             save_worker.enqueue(lambda s=_state, i=iteration, p=_chk: torch.save((s, i), p))
 
-    # ---- Post-loop frame flush -----------------------------------------------
-    # Ingest any frames that weren't reached within the iteration budget.
-    # Each frame is added as a camera (for eval coverage) and gets depth
-    # insertion, but NO RGB optimization runs — the training budget is spent.
     if streaming_scene.has_next_frame():
-        _flush_admission_fn = None
-        if getattr(args, "streaming_frame_admission", "all") == "hybrid_keyframe":
-            _flush_admission_fn = _hybrid_keyframe_admission
-        _flush_start = n_frames_ingested
-        _flush_insert_total = 0
-        print(
-            f"[streaming] Post-loop flush: ingesting remaining frames "
-            f"(depth insertion only, no optimization)...",
-            flush=True,
-        )
-        while streaming_scene.has_next_frame():
-            _f_result = streaming_scene.ingest_next_frame(admission_fn=_flush_admission_fn)
-            if _f_result is None:
-                continue
-            _f_cam, _f_frame, _f_is_train = _f_result
-            n_frames_ingested += 1
-            if _f_is_train and getattr(args, "streaming_insert_from_depth", True):
-                cap = getattr(args, "cap_max", -1)
-                _n_now = gaussians.get_xyz.shape[0]
-                if not getattr(args, "streaming_depth_respects_cap", False) or cap <= 0 or _n_now < cap:
-                    with torch.no_grad():
-                        _f_pkg = render(_f_cam, gaussians, pipe, background, render_depth=True)
-                    _f_alpha = _f_pkg["alpha"]
-                    _f_depth = _f_pkg.get("rendered_depth", None)
-                    if getattr(args, "streaming_export_depth_comparison", False) and _f_depth is not None:
-                        _f_sensor_d = _get_sensor_depth(_f_cam, _f_cam.image_height, _f_cam.image_width)
-                        if _f_sensor_d is not None:
-                            _save_depth_comparison(
-                                os.path.join(args.model_path, "depth_comparison"),
-                                n_frames_ingested,
-                                _f_pkg["render"],
-                                _f_depth,
-                                _f_sensor_d,
-                            )
-                    _f_added, _ = insert_gaussians_from_frame(
-                        gaussians, _f_frame, args,
-                        streaming_scene=streaming_scene,
-                        prev_frame=_prev_insert_frame,
-                        prev_depth_meters=_prev_insert_depth_m,
-                        render_alpha=_f_alpha,
-                        render_depth=_f_depth,
-                        current_frame_idx=n_frames_ingested,
-                    )
-                    _flush_insert_total += _f_added
-                    _prev_insert_frame = _f_frame
-                    _prev_insert_depth_m = _load_depth_meters(_f_frame)
-        total_inserted += _flush_insert_total
+        _remaining = _n_total_frames - n_frames_ingested
         _eff_spf = opt.iterations / max(1, _n_frames_trained)
         print(
-            f"[streaming] Post-loop flush complete: flushed {n_frames_ingested - _flush_start} frames, "
-            f"inserted {_flush_insert_total} Gaussians, N={gaussians.get_xyz.shape[0]}\n"
-            f"[streaming] Coverage: {_n_frames_trained} frames optimized × "
-            f"{_eff_spf:.1f} avg steps/frame + {n_frames_ingested - _flush_start} flush-only frames = "
-            f"{n_frames_ingested} total / {_n_total_frames} dataset frames",
+            f"[streaming] Iteration budget exhausted with {_remaining} dataset frames unseen. "
+            f"Coverage: {_n_frames_trained} frames optimized × {_eff_spf:.1f} avg steps/frame "
+            f"= {n_frames_ingested}/{_n_total_frames} dataset frames.",
             flush=True,
         )
 
