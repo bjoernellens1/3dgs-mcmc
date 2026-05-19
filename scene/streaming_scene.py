@@ -205,12 +205,29 @@ class StreamingScene:
             init_scale=getattr(self.args, "init_scale", 0.01),
             voxel_size=getattr(self.args, "pcd_voxel_size", 0.02),
         )
+        self._export_initial_seed_pointcloud(pcd)
         self.maintain_occupancy_hash(voxel_size=getattr(self.args, "streaming_insert_voxel_size", 0.02))
         print(
             f"[streaming] Initialised {self.gaussians.get_xyz.shape[0]} Gaussians "
             f"from {n_frames} frames, scene radius={self.cameras_extent:.3f}",
             flush=True,
         )
+
+    def _export_initial_seed_pointcloud(self, pcd) -> None:
+        """Write the bootstrap RGB-D point cloud into the run output for inspection."""
+        try:
+            from scene.readers.common import storePly
+
+            seed_dir = os.path.join(self.model_path, "point_cloud", "initial_seed")
+            os.makedirs(seed_dir, exist_ok=True)
+            points = np.asarray(pcd.points, dtype=np.float32)
+            colors = np.clip(np.asarray(pcd.colors, dtype=np.float32) * 255.0, 0, 255).astype(np.uint8)
+            normals = np.asarray(getattr(pcd, "normals", np.zeros_like(points)), dtype=np.float32)
+            storePly(os.path.join(seed_dir, "point_cloud.ply"), points, colors, normals=normals)
+            storePly(os.path.join(self.model_path, "input_seed.ply"), points, colors, normals=normals)
+            print(f"[streaming] Initial seed point cloud exported ({points.shape[0]} points)", flush=True)
+        except Exception as exc:
+            print(f"[streaming] Warning: initial seed point cloud export failed: {exc}", flush=True)
 
     def _estimate_cameras_extent(self, frames: List["StreamingRGBDFrame"]) -> float:
         """NeRF++ normalisation radius from a list of frames."""
@@ -234,6 +251,128 @@ class StreamingScene:
         except Exception:
             return 1.0
 
+    @staticmethod
+    def _resize_nearest_np(arr: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        if arr.shape[:2] == (target_h, target_w):
+            return arr
+        src_h, src_w = arr.shape[:2]
+        ys = np.clip(np.round(np.linspace(0, src_h - 1, target_h)).astype(np.int32), 0, src_h - 1)
+        xs = np.clip(np.round(np.linspace(0, src_w - 1, target_w)).astype(np.int32), 0, src_w - 1)
+        return arr[ys[:, None], xs[None, :]]
+
+    @staticmethod
+    def _stable_depth_samples(
+        z: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        min_depth: float,
+        max_depth: float,
+        args,
+    ) -> np.ndarray:
+        if not getattr(args, "streaming_depth_filter_enabled", True):
+            return np.ones(xs.shape, dtype=bool)
+        h, w = z.shape
+        erode_px = max(0, int(getattr(args, "streaming_depth_filter_erode_px", 2)))
+        window = max(1, int(getattr(args, "streaming_depth_filter_window", 5)))
+        min_valid_ratio = float(getattr(args, "streaming_depth_filter_min_valid_ratio", 0.75))
+        max_range = float(getattr(args, "streaming_depth_filter_max_range", 0.08))
+        median_thresh = float(getattr(args, "streaming_depth_filter_median_thresh", 0.04))
+        bottom_margin = float(getattr(args, "streaming_depth_filter_bottom_margin", 0.0))
+
+        radius = window // 2
+        local_depths = []
+        for dy in range(-radius, radius + 1):
+            yy = np.clip(ys + dy, 0, h - 1)
+            for dx in range(-radius, radius + 1):
+                xx = np.clip(xs + dx, 0, w - 1)
+                local_depths.append(z[yy, xx])
+        local = np.stack(local_depths, axis=0).astype(np.float32, copy=False)
+        local_valid = np.isfinite(local) & (local > min_depth) & (local < max_depth)
+        stable = local_valid.mean(axis=0) >= min_valid_ratio
+
+        if max_range > 0:
+            local_min = np.where(local_valid, local, np.inf).min(axis=0)
+            local_max = np.where(local_valid, local, -np.inf).max(axis=0)
+            stable &= np.isfinite(local_min) & np.isfinite(local_max) & ((local_max - local_min) <= max_range)
+
+        if median_thresh > 0:
+            import warnings
+            local_nan = np.where(local_valid, local, np.nan)
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                local_median = np.nanmedian(local_nan, axis=0)
+            stable &= np.isfinite(local_median) & (np.abs(z[ys, xs] - local_median) <= median_thresh)
+
+        if erode_px > 0:
+            valid_hw = np.isfinite(z) & (z > min_depth) & (z < max_depth)
+            eroded = np.ones(xs.shape, dtype=bool)
+            for dy in range(-erode_px, erode_px + 1):
+                yy = np.clip(ys + dy, 0, h - 1)
+                for dx in range(-erode_px, erode_px + 1):
+                    xx = np.clip(xs + dx, 0, w - 1)
+                    eroded &= valid_hw[yy, xx]
+            stable &= eroded
+
+        if bottom_margin > 0:
+            stable &= ys < int(round(h * (1.0 - bottom_margin)))
+        return stable
+
+    @staticmethod
+    def _temporal_depth_samples(
+        z_v: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        frame,
+        other_frame,
+        other_depth_m: np.ndarray,
+        d_fx: float,
+        d_fy: float,
+        d_cx: float,
+        d_cy: float,
+        thresh: float,
+    ) -> Optional[np.ndarray]:
+        if other_frame is None or other_depth_m is None or thresh <= 0:
+            return None
+        try:
+            c2w = np.asarray(frame.c2w, dtype=np.float32)
+            other_c2w = np.asarray(other_frame.c2w, dtype=np.float32)
+            if c2w.shape != (4, 4) or other_c2w.shape != (4, 4):
+                return None
+            if not np.isfinite(c2w).all() or not np.isfinite(other_c2w).all():
+                return None
+
+            other_h, other_w = int(other_frame.height), int(other_frame.width)
+            other_depth = StreamingScene._resize_nearest_np(
+                np.asarray(other_depth_m, dtype=np.float32),
+                (other_h, other_w),
+            )
+
+            x_c = (xs.astype(np.float32) - float(d_cx)) / float(d_fx) * z_v.astype(np.float32)
+            y_c = (ys.astype(np.float32) - float(d_cy)) / float(d_fy) * z_v.astype(np.float32)
+            pts_cam = np.stack([x_c, y_c, z_v.astype(np.float32)], axis=1)
+            pts_world = (c2w[:3, :3] @ pts_cam.T).T + c2w[:3, 3]
+
+            other_w2c = np.linalg.inv(other_c2w)
+            pts_other = (other_w2c[:3, :3] @ pts_world.T).T + other_w2c[:3, 3]
+            z_other = pts_other[:, 2]
+
+            o_fx = other_frame.depth_fx if other_frame.depth_fx is not None else other_frame.fx
+            o_fy = other_frame.depth_fy if other_frame.depth_fy is not None else other_frame.fy
+            o_cx = other_frame.depth_cx if other_frame.depth_cx is not None else other_frame.cx
+            o_cy = other_frame.depth_cy if other_frame.depth_cy is not None else other_frame.cy
+            u = np.round((pts_other[:, 0] / np.maximum(z_other, 1e-6)) * float(o_fx) + float(o_cx)).astype(np.int32)
+            v = np.round((pts_other[:, 1] / np.maximum(z_other, 1e-6)) * float(o_fy) + float(o_cy)).astype(np.int32)
+
+            ok = (z_other > 0) & (u >= 0) & (u < other_w) & (v >= 0) & (v < other_h)
+            out = np.zeros(z_v.shape[0], dtype=bool)
+            if ok.any():
+                lookup = other_depth[v[ok], u[ok]]
+                out[ok] = np.isfinite(lookup) & (lookup > 0) & (np.abs(z_other[ok] - lookup) <= float(thresh))
+            return out
+        except Exception:
+            return None
+
     def _build_pcd_from_frames(self, frames: List["StreamingRGBDFrame"]):
         """Backproject depth into a BasicPointCloud for create_from_pcd()."""
         from utils.graphics_utils import BasicPointCloud
@@ -245,16 +384,19 @@ class StreamingScene:
         max_depth = getattr(self.args, "streaming_max_depth", 8.0)
         max_pts = getattr(self.args, "rgbd_max_init_points", 250000)
 
-        points_all, colors_all = [], []
+        loaded = []
         for frame in frames:
             if frame.depth_path is None and frame._depth_bytes is None:
+                loaded.append(None)
                 continue
             if frame.depth_path is not None and not os.path.exists(frame.depth_path) and frame._depth_bytes is None:
+                loaded.append(None)
                 continue
             try:
                 from utils.streaming_frames import load_frame_rgb, load_frame_depth_np
                 depth_raw = load_frame_depth_np(frame)
                 if depth_raw is None:
+                    loaded.append(None)
                     continue
                 depth = np.asarray(depth_raw)
                 _target = (int(frame.height), int(frame.width))
@@ -265,22 +407,64 @@ class StreamingScene:
                 if rgb_pil.size != (_target[1], _target[0]):
                     rgb_pil = rgb_pil.resize((_target[1], _target[0]), _Image.BILINEAR)
                 rgb = np.array(rgb_pil).astype(np.float32) / 255.0
+                loaded.append((frame, depth, rgb, depth_to_meters(depth, frame.depth_scale)))
             except Exception:
+                loaded.append(None)
                 continue
-            z = depth_to_meters(depth, frame.depth_scale)
+
+        points_all, colors_all = [], []
+        seed_temporal = bool(getattr(self.args, "streaming_depth_temporal_require_for_seed", True))
+        temporal_thresh = float(getattr(self.args, "streaming_depth_temporal_thresh", 0.07))
+        for idx, item in enumerate(loaded):
+            if item is None:
+                continue
+            frame, depth, rgb, z = item
             h, w = z.shape
             ys, xs = np.mgrid[0:h:depth_stride, 0:w:depth_stride]
             z_v = z[ys, xs]
             valid = np.isfinite(z_v) & (z_v > min_depth) & (z_v < max_depth)
+            valid &= self._stable_depth_samples(z, xs, ys, min_depth, max_depth, self.args)
             if not valid.any():
                 continue
-            xs_v = xs[valid].astype(np.float32)
-            ys_v = ys[valid].astype(np.float32)
-            z_v = z_v[valid].astype(np.float32)
             d_fx = frame.depth_fx if frame.depth_fx is not None else frame.fx
             d_fy = frame.depth_fy if frame.depth_fy is not None else frame.fy
             d_cx = frame.depth_cx if frame.depth_cx is not None else frame.cx
             d_cy = frame.depth_cy if frame.depth_cy is not None else frame.cy
+            if seed_temporal and len(loaded) > 1:
+                other_item = None
+                for j in (idx - 1, idx + 1):
+                    if 0 <= j < len(loaded) and loaded[j] is not None:
+                        other_item = loaded[j]
+                        break
+                if other_item is not None:
+                    other_frame, _, _, other_z = other_item
+                    temporal = self._temporal_depth_samples(
+                        z_v[valid].astype(np.float32),
+                        xs[valid].astype(np.int32),
+                        ys[valid].astype(np.int32),
+                        frame,
+                        other_frame,
+                        other_z,
+                        d_fx,
+                        d_fy,
+                        d_cx,
+                        d_cy,
+                        temporal_thresh,
+                    )
+                    if temporal is not None:
+                        full_temporal = np.zeros_like(valid, dtype=bool)
+                        full_temporal[valid] = temporal
+                        valid &= full_temporal
+                    else:
+                        valid &= False
+                else:
+                    valid &= False
+            if not valid.any():
+                continue
+
+            xs_v = xs[valid].astype(np.float32)
+            ys_v = ys[valid].astype(np.float32)
+            z_v = z_v[valid].astype(np.float32)
             pts_world, cols = backproject_depth_pixels(
                 z_v, xs_v, ys_v, d_fx, d_fy, d_cx, d_cy, frame.c2w, rgb, (h, w))
             points_all.append(pts_world)

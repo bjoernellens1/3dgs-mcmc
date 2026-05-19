@@ -105,6 +105,7 @@ def plot_trajectory(
     *,
     title: Optional[str] = None,
     gt: Optional[np.ndarray] = None,
+    metrics: Optional[dict] = None,
 ) -> None:
     """Top-down + side view of one trajectory, optional GT overlay."""
     import matplotlib
@@ -117,6 +118,8 @@ def plot_trajectory(
     _plot_2d(axes[1], xyz[:, 0], xyz[:, 1], "X", "Y (up)", "Side view (XY)", gt=gt, invert_y=True)
     if title:
         fig.suptitle(title, fontsize=12)
+    if metrics:
+        _add_metrics_box(fig, metrics)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=120)
@@ -130,6 +133,7 @@ def plot_trajectory_pair(
     *,
     labels: tuple[str, str] = ("A", "B"),
     title: Optional[str] = None,
+    metrics: Optional[dict] = None,
 ) -> None:
     """Overlay two trajectories for comparison."""
     import matplotlib
@@ -156,6 +160,8 @@ def plot_trajectory_pair(
             ax.invert_yaxis()
     if title:
         fig.suptitle(title, fontsize=12)
+    if metrics:
+        _add_metrics_box(fig, metrics)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=120)
@@ -176,6 +182,46 @@ def _plot_2d(ax, xs, ys, xlabel, ylabel, title, *, gt=None, invert_y=False):
     ax.set_aspect("equal")
     if invert_y:
         ax.invert_yaxis()
+
+
+def _trajectory_distance(c2w_arr: np.ndarray) -> float:
+    xyz = c2w_arr[:, :3, 3]
+    if len(xyz) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum())
+
+
+def _fmt_metric(value, suffix: str = "") -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if not np.isfinite(float(value)):
+            return "n/a"
+        return f"{float(value):.4g}{suffix}"
+    except Exception:
+        return "n/a"
+
+
+def _add_metrics_box(fig, metrics: dict) -> None:
+    lines = [
+        f"distance: {_fmt_metric(metrics.get('distance_m'), ' m')}",
+        f"ATE RMSE: {_fmt_metric(metrics.get('ate_rmse'), ' m')}",
+        f"ATE mean: {_fmt_metric(metrics.get('ate_mean'), ' m')}",
+        f"RPE trans: {_fmt_metric(metrics.get('rpe_trans_rmse'), ' m')}",
+        f"RPE rot: {_fmt_metric(metrics.get('rpe_rot_deg_rmse'), ' deg')}",
+    ]
+    if metrics.get("gt_distance_m") is not None:
+        lines.insert(1, f"GT distance: {_fmt_metric(metrics.get('gt_distance_m'), ' m')}")
+    fig.text(
+        0.01,
+        0.01,
+        "\n".join(lines),
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        family="monospace",
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +264,9 @@ def trajectory_metrics(c2w_est: np.ndarray, c2w_ref: np.ndarray) -> dict:
     n = min(len(c2w_est), len(c2w_ref))
     if n < 2:
         return {"ate_rmse": None, "ate_mean": None,
-                "rpe_trans_rmse": None, "rpe_rot_deg_rmse": None, "n_frames": n}
+                "rpe_trans_rmse": None, "rpe_rot_deg_rmse": None, "n_frames": n,
+                "distance_m": _trajectory_distance(c2w_est[:n]),
+                "gt_distance_m": _trajectory_distance(c2w_ref[:n])}
 
     pos_est = c2w_est[:n, :3, 3]
     pos_ref = c2w_ref[:n, :3, 3]
@@ -260,6 +308,8 @@ def trajectory_metrics(c2w_est: np.ndarray, c2w_ref: np.ndarray) -> dict:
         "rpe_trans_rmse": rpe_trans,
         "rpe_rot_deg_rmse": rpe_rot,
         "n_frames": n,
+        "distance_m": _trajectory_distance(c2w_est[:n]),
+        "gt_distance_m": _trajectory_distance(c2w_ref[:n]),
     }
 
 
@@ -314,17 +364,19 @@ def run_trajectory_eval(
     if gt_cams:
         _, gt_c2w = _cams_to_c2w(gt_cams)
 
-    png_path = os.path.join(output_dir, "trajectory.png")
-    plot_trajectory(png_path, c2w, title=f"Trajectory — {method_label}", gt=gt_c2w)
-
     if gt_c2w is not None:
         metrics = trajectory_metrics(c2w, gt_c2w)
     else:
         metrics = {"ate_rmse": None, "ate_mean": None,
                    "rpe_trans_rmse": None, "rpe_rot_deg_rmse": None,
-                   "n_frames": len(train_cams)}
+                   "n_frames": len(train_cams),
+                   "distance_m": _trajectory_distance(c2w),
+                   "gt_distance_m": None}
     metrics["method"] = method_label
     metrics["n_train_cams"] = len(train_cams)
+
+    png_path = os.path.join(output_dir, "trajectory.png")
+    plot_trajectory(png_path, c2w, title=f"Trajectory — {method_label}", gt=gt_c2w, metrics=metrics)
 
     metrics_path = os.path.join(output_dir, "metrics.json")
     with open(metrics_path, "w") as f:

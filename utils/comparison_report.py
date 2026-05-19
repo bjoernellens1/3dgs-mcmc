@@ -399,6 +399,9 @@ def write_post_training_report(
     log_prefix: str = "report",
     subdir: Optional[str] = None,
     batch_render_fn=None,
+    train_metrics_max: Optional[int] = None,
+    test_metrics_max: Optional[int] = None,
+    trajectory_max_frames: Optional[int] = None,
 ) -> dict:
     """Produce side-by-side PNGs, contact sheet, trajectory MP4, and report.json.
 
@@ -427,6 +430,8 @@ def write_post_training_report(
         "min_train_lpips": None,
         "max_train_lpips": None,
         "trajectory_fps": None,
+        "n_train_metrics": 0,
+        "n_test_metrics": 0,
         "output_dir": out_dir,
         "artifacts": artifacts,
     }
@@ -439,23 +444,9 @@ def write_post_training_report(
     def _compute_metrics(cams: List, split: str):
         psnr_list = []
         lpips_list = []
-        # Batch-render all cameras at once when batch_render_fn is available
-        batch_imgs_m: list = []
-        if batch_render_fn is not None:
-            try:
-                batch_imgs_m = _batch_render_images(
-                    cams, gaussians, pipe, background,
-                    batch_render_fn=batch_render_fn,
-                )
-            except Exception:
-                batch_imgs_m = []
-        use_batch_m = len(batch_imgs_m) == len(cams)
         for i, cam in enumerate(cams):
             try:
-                if use_batch_m:
-                    img = batch_imgs_m[i].clamp(0.0, 1.0)
-                else:
-                    img = _render_image(cam, gaussians, render_fn, pipe, background)
+                img = _render_image(cam, gaussians, render_fn, pipe, background)
                 gt = _gt_image(cam)
             except Exception as e:
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
@@ -465,6 +456,11 @@ def write_post_training_report(
                 # LPIPS expects batched tensors
                 l_val = float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
                 lpips_list.append(l_val)
+            del img, gt
+            if torch.cuda.is_available() and (i + 1) % 32 == 0:
+                torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return psnr_list, lpips_list
 
     def _representative_cams(cams: List, max_items: int) -> List:
@@ -519,6 +515,7 @@ def write_post_training_report(
             side = _hconcat_with_gap([r_u8, g_u8, d_u8], gap_px=4)
             _save_png(os.path.join(split_dir, f"{name}.png"), side)
             pairs_for_visual_sheet.append((name, r_u8, g_u8))
+            del img, gt
         if not pairs_for_visual_sheet:
             return None
         sheet = _build_contact_sheet(
@@ -531,17 +528,27 @@ def write_post_training_report(
         artifacts.append(sheet_path)
         return sheet_path
 
+    _train_metric_limit = len(train_cams) if train_metrics_max is None else int(train_metrics_max)
+    _test_metric_limit = len(test_cams) if test_metrics_max is None else int(test_metrics_max)
+
     # --- Test split: side-by-side + contact sheet + metrics -----------------------------
     psnrs: List[float] = []
     lpipss: List[float] = []
     pairs_for_sheet: List[Tuple[str, np.ndarray, np.ndarray]] = []
     if test_cams:
+        metric_test_cams = _representative_cams(test_cams, max_items=_test_metric_limit)
+        psnrs, lpipss = _compute_metrics(metric_test_cams, "test")
+        summary["n_test_metrics"] = len(psnrs)
         test_dir = os.path.join(out_dir, "test")
-        # Batch-render all test cameras at once when batch_render_fn is available
+        os.makedirs(test_dir, exist_ok=True)
+        visual_test_cams = _representative_cams(
+            test_cams,
+            max_items=max(1, contact_sheet_cols * 2),
+        )
         if batch_render_fn is not None:
             try:
                 batch_imgs = _batch_render_images(
-                    test_cams, gaussians, pipe, background,
+                    visual_test_cams, gaussians, pipe, background,
                     batch_render_fn=batch_render_fn,
                 )
             except Exception as e:
@@ -549,9 +556,9 @@ def write_post_training_report(
                 batch_imgs = []
         else:
             batch_imgs = []
-        use_batch = len(batch_imgs) == len(test_cams)
+        use_batch = len(batch_imgs) == len(visual_test_cams)
 
-        for i, cam in enumerate(test_cams):
+        for i, cam in enumerate(visual_test_cams):
             try:
                 if use_batch:
                     img = batch_imgs[i].clamp(0.0, 1.0)
@@ -561,9 +568,6 @@ def write_post_training_report(
             except Exception as e:
                 print(f"[report] render failed for {cam.image_name}: {e}", flush=True)
                 continue
-            psnrs.append(float(_psnr(img, gt).mean().item()))
-            if _lpips is not None:
-                lpipss.append(float(_lpips(img.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item()))
             r_u8 = _to_uint8_hwc(img)
             g_u8 = _to_uint8_hwc(gt)
             d_u8 = _abs_diff(img, gt)
@@ -571,6 +575,7 @@ def write_post_training_report(
             name = str(getattr(cam, "image_name", f"view_{len(pairs_for_sheet):04d}"))
             _save_png(os.path.join(test_dir, f"{name}.png"), side)
             pairs_for_sheet.append((name, r_u8, g_u8))
+            del img, gt
         if pairs_for_sheet:
             sheet = _build_contact_sheet(
                 pairs_for_sheet,
@@ -587,7 +592,7 @@ def write_post_training_report(
             msg = (
                 f"[report] iter={iteration} test PSNR mean={summary['mean_test_psnr']:.2f}dB "
                 f"min={summary['min_test_psnr']:.2f} max={summary['max_test_psnr']:.2f} "
-                f"({len(psnrs)} views)"
+                f"({len(psnrs)}/{len(test_cams)} views)"
             )
             print(msg, flush=True)
             if tb_writer is not None:
@@ -610,7 +615,9 @@ def write_post_training_report(
 
     # --- Train split: metrics ------------------------------------
     if train_cams:
-        train_psnrs, train_lpipss = _compute_metrics(train_cams, "train")
+        metric_train_cams = _representative_cams(train_cams, max_items=_train_metric_limit)
+        train_psnrs, train_lpipss = _compute_metrics(metric_train_cams, "train")
+        summary["n_train_metrics"] = len(train_psnrs)
         if train_psnrs:
             summary["mean_train_psnr"] = float(np.mean(train_psnrs))
             summary["min_train_psnr"] = float(np.min(train_psnrs))
@@ -618,7 +625,7 @@ def write_post_training_report(
             msg = (
                 f"[report] iter={iteration} train PSNR mean={summary['mean_train_psnr']:.2f}dB "
                 f"min={summary['min_train_psnr']:.2f} max={summary['max_train_psnr']:.2f} "
-                f"({len(train_psnrs)} views)"
+                f"({len(train_psnrs)}/{len(train_cams)} views)"
             )
             print(msg, flush=True)
             if tb_writer is not None:
@@ -649,11 +656,13 @@ def write_post_training_report(
     # --- Trajectory MP4 over train cameras ------------------------------------
     if train_cams:
         cams_for_video = train_cams
-        if len(cams_for_video) > mp4_max_frames:
-            step = max(1, len(cams_for_video) // mp4_max_frames)
-            cams_for_video = cams_for_video[::step][:mp4_max_frames]
+        _traj_limit = mp4_max_frames if trajectory_max_frames is None else int(trajectory_max_frames)
+        cams_for_video = _representative_cams(cams_for_video, max_items=_traj_limit)
+        if not cams_for_video:
+            print(f"[report] iter={iteration} no trajectory views selected — skipping trajectory MP4", flush=True)
+            cams_for_video = []
 
-        if batch_render_fn is not None:
+        if cams_for_video and batch_render_fn is not None:
             try:
                 traj_imgs = _batch_render_images(
                     cams_for_video, gaussians, pipe, background,
@@ -678,15 +687,16 @@ def write_post_training_report(
                     continue
                 yield _to_uint8_hwc(img)
 
-        video_fps = _infer_realtime_fps(cams_for_video, mp4_fps)
-        summary["trajectory_fps"] = video_fps
-        mp4_path = os.path.join(out_dir, "trajectory.mp4")
-        err = _write_mp4(mp4_path, _frames(), fps=video_fps)
-        if err is None:
-            artifacts.append(mp4_path)
-            print(f"[report] trajectory.mp4 written ({len(cams_for_video)} frames @ {video_fps}fps)", flush=True)
-        else:
-            print(f"[report] trajectory.mp4 SKIPPED: {err}", flush=True)
+        if cams_for_video:
+            video_fps = _infer_realtime_fps(cams_for_video, mp4_fps)
+            summary["trajectory_fps"] = video_fps
+            mp4_path = os.path.join(out_dir, "trajectory.mp4")
+            err = _write_mp4(mp4_path, _frames(), fps=video_fps)
+            if err is None:
+                artifacts.append(mp4_path)
+                print(f"[report] trajectory.mp4 written ({len(cams_for_video)} frames @ {video_fps}fps)", flush=True)
+            else:
+                print(f"[report] trajectory.mp4 SKIPPED: {err}", flush=True)
     else:
         print(f"[report] iter={iteration} no train views — skipping trajectory MP4", flush=True)
 

@@ -818,6 +818,7 @@ class OrbbecRosBagFrameSource:
         open3d_odom_cache_dir: str = "",
         open3d_odom_stride: int = 1,
         open3d_odom_downscale: int = 1,
+        open3d_odom_async: bool = False,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
         open3d_odom_depth_min: float = 0.1,
@@ -827,6 +828,7 @@ class OrbbecRosBagFrameSource:
         open3d_icp_max_distance: float = 0.07,
         open3d_icp_robust_kernel: str = "huber",
         open3d_icp_sigma: float = 0.05,
+        streaming_resolution: int = 1,
     ):
         try:
             from rosbags.rosbag2 import Reader
@@ -972,6 +974,17 @@ class OrbbecRosBagFrameSource:
         if intrinsics is None:
             raise RuntimeError(f"No '{camera_info_topic}' messages found in {path}")
         fx, fy, cx, cy, width, height = intrinsics
+
+        # Apply streaming_resolution divisor: scale intrinsics so odometry, camera
+        # creation, and depth backprojection all work at the same reduced resolution.
+        _R = int(streaming_resolution)
+        if _R > 1:
+            width = max(1, width // _R)
+            height = max(1, height // _R)
+            fx /= _R
+            fy /= _R
+            cx /= _R
+            cy /= _R
         self._fx = fx
         self._fy = fy
         self._cx = cx
@@ -979,20 +992,6 @@ class OrbbecRosBagFrameSource:
         self._width = width
         self._height = height
         self._depth_scale = 1000.0
-
-        # Apply streaming_resolution divisor: scale intrinsics so odometry, camera
-        # creation, and depth backprojection all work at the same reduced resolution.
-        _R = int(getattr(args, "streaming_resolution", 1))
-        if _R > 1:
-            self._width  = self._width  // _R
-            self._height = self._height // _R
-            self._fx /= _R;  self._fy /= _R
-            self._cx /= _R;  self._cy /= _R
-            for _fr in self._frames:
-                _fr.width  = _fr.width  // _R
-                _fr.height = _fr.height // _R
-                _fr.fx = _fr.fx / _R;  _fr.fy = _fr.fy / _R
-                _fr.cx = _fr.cx / _R;  _fr.cy = _fr.cy / _R
 
         # Build sorted timestamp arrays for O(log n) nearest-neighbour sync
         pose_ts = np.array([m[0] for m in pose_msgs], dtype=np.int64)
@@ -1143,6 +1142,11 @@ class OrbbecRosBagFrameSource:
         self._live_odom_cache_key = None
         self._live_odom_cache_enabled = bool(open3d_odom_cache)
         self._live_odom_cached_full = False
+        self._live_odom_async_enabled = bool(open3d_odom_async) and self._live_odom_enabled
+        self._live_odom_async_done = False
+        self._live_odom_async_error = None
+        self._live_odom_async_thread = None
+        self._live_odom_cond = None
         if self._live_odom_enabled:
             live_cache_key = self._open3d_odom_cache_key(
                 path=path,
@@ -1190,6 +1194,8 @@ class OrbbecRosBagFrameSource:
                     self._live_odom_pairs = self._live_odom_successes + self._live_odom_failures
             if not self._live_odom_cached_full and self._frames:
                 self._frames[0].c2w = np.eye(4, dtype=np.float32)
+                if self._live_odom_async_enabled:
+                    self._start_live_odom_worker()
 
         print(
             f"[streaming] OrbbecRosBag: {len(self._frames)} synced frames from {path} "
@@ -1359,7 +1365,11 @@ class OrbbecRosBagFrameSource:
 
         # Success check: fitness is ratio of overlapping points
         success = reg.fitness > 0.01
-        return success, reg.transformation, None
+        info = {
+            "fitness": float(reg.fitness),
+            "inlier_rmse": float(reg.inlier_rmse),
+        }
+        return success, reg.transformation, info
 
     @staticmethod
     def _estimate_open3d_odometry(
@@ -1466,7 +1476,7 @@ class OrbbecRosBagFrameSource:
             curr_rgbd = to_rgbd(rgb_bytes, depth_bytes)
 
             if odom_method == "icp":
-                success, trans_prev_to_curr, _ = OrbbecRosBagFrameSource._estimate_icp_odometry(
+                success, trans_prev_to_curr, odom_info = OrbbecRosBagFrameSource._estimate_icp_odometry(
                     prev_rgbd,
                     curr_rgbd,
                     intrinsic,
@@ -1475,7 +1485,7 @@ class OrbbecRosBagFrameSource:
                     sigma=icp_sigma,
                 )
             else:
-                success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                success, trans_prev_to_curr, odom_info = o3d.pipelines.odometry.compute_rgbd_odometry(
                     prev_rgbd,
                     curr_rgbd,
                     intrinsic,
@@ -1483,6 +1493,26 @@ class OrbbecRosBagFrameSource:
                     jacobian,
                     option,
                 )
+            delta = np.linalg.inv(trans_prev_to_curr)
+            edge_t = float(np.linalg.norm(delta[:3, 3]))
+            cos_r = float(np.clip((np.trace(delta[:3, :3]) - 1.0) * 0.5, -1.0, 1.0))
+            edge_r = float(np.degrees(np.arccos(cos_r)))
+
+            def _odom_info_summary(info) -> str:
+                if isinstance(info, dict):
+                    parts = []
+                    if info.get("fitness") is not None:
+                        parts.append(f"fitness={float(info['fitness']):.4f}")
+                    if info.get("inlier_rmse") is not None:
+                        parts.append(f"rmse={float(info['inlier_rmse']):.4f}")
+                    return " ".join(parts)
+                try:
+                    arr = np.asarray(info)
+                    if arr.size:
+                        return f"info_trace={float(np.trace(arr)):.3e}"
+                except Exception:
+                    pass
+                return ""
 
             if success:
                 key_poses.append((key_poses[-1] @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32))
@@ -1495,7 +1525,11 @@ class OrbbecRosBagFrameSource:
                 print(
                     "[streaming] Open3D odometry "
                     f"{pair_idx}/{total_pairs} keyframe pairs "
-                    f"(source_frame={frame_idx}, successes={successes}, failures={failures})",
+                    f"(source_frame={frame_idx}, successes={successes}, failures={failures}, "
+                    f"method={odom_method}, stride={odom_stride}, dt={edge_t:.4f}m, "
+                    f"dr={edge_r:.2f}deg"
+                    + (f", {_odom_info_summary(odom_info)}" if _odom_info_summary(odom_info) else "")
+                    + ")",
                     flush=True,
                 )
 
@@ -1603,6 +1637,53 @@ class OrbbecRosBagFrameSource:
             stats,
         )
 
+    def _notify_live_odom_progress(self) -> None:
+        cond = getattr(self, "_live_odom_cond", None)
+        if cond is not None:
+            with cond:
+                cond.notify_all()
+
+    def _start_live_odom_worker(self) -> None:
+        if self._live_odom_async_thread is not None:
+            return
+        import threading
+
+        self._live_odom_cond = threading.Condition()
+
+        def _run():
+            try:
+                self._ensure_live_odom_until(len(self._frames) - 1)
+            except BaseException as exc:
+                self._live_odom_async_error = exc
+            finally:
+                self._live_odom_async_done = True
+                self._notify_live_odom_progress()
+
+        self._live_odom_async_thread = threading.Thread(
+            target=_run,
+            name="open3d-live-odom",
+            daemon=True,
+        )
+        self._live_odom_async_thread.start()
+        print("[streaming] live Open3D odometry async worker started", flush=True)
+
+    def _wait_live_odom_until(self, index: int) -> None:
+        if index <= self._live_odom_computed_idx:
+            return
+        cond = getattr(self, "_live_odom_cond", None)
+        if cond is None:
+            self._ensure_live_odom_until(index)
+            return
+        with cond:
+            while index > self._live_odom_computed_idx and self._live_odom_async_error is None:
+                cond.wait(timeout=0.25)
+                if self._live_odom_async_done and index > self._live_odom_computed_idx:
+                    break
+        if self._live_odom_async_error is not None:
+            raise RuntimeError("Open3D live odometry async worker failed") from self._live_odom_async_error
+        if index > self._live_odom_computed_idx:
+            self._ensure_live_odom_until(index)
+
     def _ensure_live_odom_until(self, index: int) -> None:
         if not self._live_odom_enabled or self._live_odom_cached_full:
             return
@@ -1676,7 +1757,7 @@ class OrbbecRosBagFrameSource:
                 init_guess = np.eye(4, dtype=np.float64)
 
             if self._live_odom_method == "icp":
-                success, trans_prev_to_curr, _ = self._estimate_icp_odometry(
+                success, trans_prev_to_curr, odom_info = self._estimate_icp_odometry(
                     self._live_odom_prev_key_rgbd,
                     curr_rgbd,
                     intrinsic,
@@ -1686,7 +1767,7 @@ class OrbbecRosBagFrameSource:
                     init_guess=init_guess,
                 )
             else:
-                success, trans_prev_to_curr, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                success, trans_prev_to_curr, odom_info = o3d.pipelines.odometry.compute_rgbd_odometry(
                     self._live_odom_prev_key_rgbd,
                     curr_rgbd,
                     intrinsic,
@@ -1698,12 +1779,14 @@ class OrbbecRosBagFrameSource:
             key_pose = self._frames[self._live_odom_prev_key_idx].c2w
 
             # Phase 2.3: sanity-gate on estimated per-edge motion
+            edge_t = None
+            edge_r = None
+            n_edges = max(1, idx - self._live_odom_prev_key_idx)
             if success:
                 delta = np.linalg.inv(trans_prev_to_curr)
                 edge_t = float(np.linalg.norm(delta[:3, 3]))
                 cos_r = float(np.clip((np.trace(delta[:3, :3]) - 1.0) * 0.5, -1.0, 1.0))
                 edge_r = float(np.degrees(np.arccos(cos_r)))
-                n_edges = max(1, idx - self._live_odom_prev_key_idx)
                 if (edge_t > self._live_odom_max_trans * n_edges or
                         edge_r > self._live_odom_max_rot * n_edges):
                     print(
@@ -1714,6 +1797,22 @@ class OrbbecRosBagFrameSource:
                         flush=True,
                     )
                     success = False
+
+            def _odom_info_summary(info) -> str:
+                if isinstance(info, dict):
+                    parts = []
+                    if info.get("fitness") is not None:
+                        parts.append(f"fitness={float(info['fitness']):.4f}")
+                    if info.get("inlier_rmse") is not None:
+                        parts.append(f"rmse={float(info['inlier_rmse']):.4f}")
+                    return " ".join(parts)
+                try:
+                    arr = np.asarray(info)
+                    if arr.size:
+                        return f"info_trace={float(np.trace(arr)):.3e}"
+                except Exception:
+                    pass
+                return ""
 
             if success:
                 curr_pose = (key_pose @ np.linalg.inv(trans_prev_to_curr)).astype(np.float32)
@@ -1730,9 +1829,25 @@ class OrbbecRosBagFrameSource:
                 curr_pose = key_pose.copy()
                 self._frames[idx].c2w = curr_pose
                 self._frames[idx]._odom_valid = False
+                for i in range(self._live_odom_prev_key_idx + 1, idx):
+                    self._frames[i].c2w = curr_pose.copy()
+                    self._frames[i]._odom_valid = False
                 self._live_odom_failures += 1
                 # Reset the velocity prior so a bad estimate doesn't compound
                 self._live_odom_last_trans = None
+                _motion = ""
+                if edge_t is not None and edge_r is not None:
+                    _motion = f" dt={edge_t:.4f}m dr={edge_r:.2f}deg"
+                _quality = _odom_info_summary(odom_info)
+                if _quality:
+                    _quality = " " + _quality
+                print(
+                    "[streaming] live Open3D odometry failed "
+                    f"source_frame={idx} successes={self._live_odom_successes} "
+                    f"failures={self._live_odom_failures} method={self._live_odom_method} "
+                    f"stride={self._live_odom_stride}{_motion}{_quality}",
+                    flush=True,
+                )
                 failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
                 if failure_ratio > self._live_odom_max_failure_ratio:
                     raise RuntimeError(
@@ -1742,6 +1857,7 @@ class OrbbecRosBagFrameSource:
                         f"{self._live_odom_max_failure_ratio}"
                     )
                 self._live_odom_computed_idx = idx
+                self._notify_live_odom_progress()
                 continue  # skip reference advance
 
             self._frames[idx].c2w = curr_pose
@@ -1769,13 +1885,21 @@ class OrbbecRosBagFrameSource:
                     f"{self._live_odom_max_failure_ratio}"
                 )
             if self._live_odom_pairs == 1 or self._live_odom_pairs % 50 == 0:
+                _motion = ""
+                if edge_t is not None and edge_r is not None:
+                    _motion = f" dt={edge_t:.4f}m dr={edge_r:.2f}deg"
+                _quality = _odom_info_summary(odom_info)
+                if _quality:
+                    _quality = " " + _quality
                 print(
                     "[streaming] live Open3D odometry "
                     f"source_frame={idx} successes={self._live_odom_successes} "
-                    f"failures={self._live_odom_failures}",
+                    f"failures={self._live_odom_failures} method={self._live_odom_method} "
+                    f"stride={self._live_odom_stride}{_motion}{_quality}",
                     flush=True,
                 )
             self._live_odom_computed_idx = idx
+            self._notify_live_odom_progress()
 
         self._save_live_odom_cache()
 
@@ -1787,7 +1911,9 @@ class OrbbecRosBagFrameSource:
             yield self.get_frame(idx)
 
     def get_all(self) -> List[StreamingRGBDFrame]:
-        if self._live_odom_enabled:
+        if self._live_odom_async_enabled and not self._live_odom_cached_full:
+            self._wait_live_odom_until(len(self._frames) - 1)
+        elif self._live_odom_enabled:
             self._ensure_live_odom_until(len(self._frames) - 1)
         return self._frames
 
@@ -1798,7 +1924,9 @@ class OrbbecRosBagFrameSource:
     def get_frame(self, index: int) -> StreamingRGBDFrame:
         if index < 0 or index >= len(self._frames):
             raise IndexError(index)
-        if self._live_odom_enabled:
+        if self._live_odom_async_enabled and not self._live_odom_cached_full:
+            self._wait_live_odom_until(index)
+        elif self._live_odom_enabled:
             self._ensure_live_odom_until(index)
         return self._frames[index]
 
@@ -1832,6 +1960,7 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         open3d_odom_cache_dir: str = "",
         open3d_odom_stride: int = 1,
         open3d_odom_downscale: int = 1,
+        open3d_odom_async: bool = False,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
         open3d_odom_depth_min: float = 0.1,
@@ -1841,6 +1970,7 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         open3d_icp_max_distance: float = 0.07,
         open3d_icp_robust_kernel: str = "huber",
         open3d_icp_sigma: float = 0.05,
+        streaming_resolution: int = 1,
     ):
         # Intentionally bypass OrbbecRosBagFrameSource.__init__ — we read a
         # different bag format and set up the same instance state directly.
@@ -1955,7 +2085,7 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._height = height
         self._depth_scale = 1000.0
 
-        _R = int(getattr(args, "streaming_resolution", 1))
+        _R = int(streaming_resolution)
         if _R > 1:
             self._width  = self._width  // _R
             self._height = self._height // _R
@@ -1994,6 +2124,11 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._live_odom_cache_key = None
         self._live_odom_cache_enabled = bool(open3d_odom_cache)
         self._live_odom_cached_full = False
+        self._live_odom_async_enabled = bool(open3d_odom_async)
+        self._live_odom_async_done = False
+        self._live_odom_async_error = None
+        self._live_odom_async_thread = None
+        self._live_odom_cond = None
 
         if self._frames:
             self._frames[0].c2w = np.eye(4, dtype=np.float32)
@@ -2036,6 +2171,8 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
                 self._live_odom_successes = int(cached_stats.get("successes", 0))
                 self._live_odom_failures = int(cached_stats.get("failures", 0))
                 self._live_odom_pairs = self._live_odom_successes + self._live_odom_failures
+        if self._live_odom_enabled and not self._live_odom_cached_full and self._frames and self._live_odom_async_enabled:
+            self._start_live_odom_worker()
 
         print(
             f"[streaming] RealsenseBag: {len(self._frames)} synced frames from {path} "
@@ -2144,6 +2281,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_cache_dir=getattr(args, "orbbec_open3d_odom_cache_dir", ""),
             open3d_odom_stride=getattr(args, "orbbec_open3d_odom_stride", 1),
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
+            open3d_odom_async=getattr(args, "orbbec_open3d_odom_async", False),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
             open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
@@ -2153,6 +2291,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_icp_max_distance=getattr(args, "orbbec_open3d_icp_max_distance", 0.07),
             open3d_icp_robust_kernel=getattr(args, "orbbec_open3d_icp_robust_kernel", "huber"),
             open3d_icp_sigma=getattr(args, "orbbec_open3d_icp_sigma", 0.05),
+            streaming_resolution=getattr(args, "streaming_resolution", 1),
         )
     # Orbbec ROS2 slam bag: metadata.yaml (rosbag2 format)
     if os.path.exists(os.path.join(path, "metadata.yaml")):
@@ -2171,6 +2310,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_cache_dir=getattr(args, "orbbec_open3d_odom_cache_dir", ""),
             open3d_odom_stride=getattr(args, "orbbec_open3d_odom_stride", 1),
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
+            open3d_odom_async=getattr(args, "orbbec_open3d_odom_async", False),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
             open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
@@ -2180,6 +2320,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_icp_max_distance=getattr(args, "orbbec_open3d_icp_max_distance", 0.07),
             open3d_icp_robust_kernel=getattr(args, "orbbec_open3d_icp_robust_kernel", "huber"),
             open3d_icp_sigma=getattr(args, "orbbec_open3d_icp_sigma", 0.05),
+            streaming_resolution=getattr(args, "streaming_resolution", 1),
         )
     raise ValueError(
         f"[streaming] No supported RGB-D dataset layout found at: {path}\n"

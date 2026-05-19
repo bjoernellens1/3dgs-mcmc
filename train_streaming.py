@@ -364,6 +364,137 @@ def _load_depth_meters(frame) -> Optional[np.ndarray]:
         return None
 
 
+def _resize_nearest_np(arr: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+    """Resize a 2D array with nearest-neighbour indexing without dtype changes."""
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    if arr.shape[:2] == (target_h, target_w):
+        return arr
+    src_h, src_w = arr.shape[:2]
+    ys = np.clip(np.round(np.linspace(0, src_h - 1, target_h)).astype(np.int32), 0, src_h - 1)
+    xs = np.clip(np.round(np.linspace(0, src_w - 1, target_w)).astype(np.int32), 0, src_w - 1)
+    return arr[ys[:, None], xs[None, :]]
+
+
+def _sample_stable_depth_mask(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    *,
+    erode_px: int,
+    window: int,
+    min_valid_ratio: float,
+    max_range: float,
+    median_thresh: float,
+) -> np.ndarray:
+    """Return per-sampled-pixel mask for locally stable depth measurements."""
+    sample_shape = xs.shape
+    if erode_px <= 0 and window <= 1 and min_valid_ratio <= 0 and max_range <= 0 and median_thresh <= 0:
+        return np.ones(sample_shape, dtype=bool)
+
+    h, w = z.shape
+    local_depths = []
+    radius = max(0, int(window) // 2)
+    if radius > 0:
+        for dy in range(-radius, radius + 1):
+            yy = np.clip(ys + dy, 0, h - 1)
+            for dx in range(-radius, radius + 1):
+                xx = np.clip(xs + dx, 0, w - 1)
+                local_depths.append(z[yy, xx])
+    else:
+        local_depths.append(z[ys, xs])
+
+    local = np.stack(local_depths, axis=0).astype(np.float32, copy=False)
+    local_valid = np.isfinite(local) & (local > min_depth) & (local < max_depth)
+    stable = np.ones(sample_shape, dtype=bool)
+
+    if min_valid_ratio > 0:
+        stable &= local_valid.mean(axis=0) >= float(min_valid_ratio)
+
+    if max_range > 0:
+        local_min = np.where(local_valid, local, np.inf).min(axis=0)
+        local_max = np.where(local_valid, local, -np.inf).max(axis=0)
+        stable &= np.isfinite(local_min) & np.isfinite(local_max) & ((local_max - local_min) <= float(max_range))
+
+    if median_thresh > 0:
+        local_nan = np.where(local_valid, local, np.nan)
+        import warnings
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            local_median = np.nanmedian(local_nan, axis=0)
+        stable &= np.isfinite(local_median) & (np.abs(z[ys, xs] - local_median) <= float(median_thresh))
+
+    erode_px = max(0, int(erode_px))
+    if erode_px > 0:
+        valid_hw = np.isfinite(z) & (z > min_depth) & (z < max_depth)
+        eroded = np.ones(sample_shape, dtype=bool)
+        for dy in range(-erode_px, erode_px + 1):
+            yy = np.clip(ys + dy, 0, h - 1)
+            for dx in range(-erode_px, erode_px + 1):
+                xx = np.clip(xs + dx, 0, w - 1)
+                eroded &= valid_hw[yy, xx]
+        stable &= eroded
+
+    return stable
+
+
+def _sample_temporal_depth_mask(
+    z_v: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    frame,
+    prev_frame,
+    prev_depth_meters: Optional[np.ndarray],
+    d_fx: float,
+    d_fy: float,
+    d_cx: float,
+    d_cy: float,
+    *,
+    thresh: float,
+) -> Optional[np.ndarray]:
+    """Check current depth candidates against the previous inserted frame."""
+    if prev_frame is None or prev_depth_meters is None or thresh <= 0:
+        return None
+    if getattr(frame, "c2w", None) is None or getattr(prev_frame, "c2w", None) is None:
+        return None
+    try:
+        c2w = np.asarray(frame.c2w, dtype=np.float32)
+        prev_c2w = np.asarray(prev_frame.c2w, dtype=np.float32)
+        if c2w.shape != (4, 4) or prev_c2w.shape != (4, 4):
+            return None
+        if not np.isfinite(c2w).all() or not np.isfinite(prev_c2w).all():
+            return None
+
+        prev_h, prev_w = int(prev_frame.height), int(prev_frame.width)
+        prev_depth = _resize_nearest_np(np.asarray(prev_depth_meters, dtype=np.float32), (prev_h, prev_w))
+
+        x_c = (xs.astype(np.float32) - float(d_cx)) / float(d_fx) * z_v.astype(np.float32)
+        y_c = (ys.astype(np.float32) - float(d_cy)) / float(d_fy) * z_v.astype(np.float32)
+        pts_cam = np.stack([x_c, y_c, z_v.astype(np.float32)], axis=1)
+        pts_world = (c2w[:3, :3] @ pts_cam.T).T + c2w[:3, 3]
+
+        prev_w2c = np.linalg.inv(prev_c2w)
+        pts_prev = (prev_w2c[:3, :3] @ pts_world.T).T + prev_w2c[:3, 3]
+        z_prev = pts_prev[:, 2]
+
+        p_fx = prev_frame.depth_fx if prev_frame.depth_fx is not None else prev_frame.fx
+        p_fy = prev_frame.depth_fy if prev_frame.depth_fy is not None else prev_frame.fy
+        p_cx = prev_frame.depth_cx if prev_frame.depth_cx is not None else prev_frame.cx
+        p_cy = prev_frame.depth_cy if prev_frame.depth_cy is not None else prev_frame.cy
+        u = np.round((pts_prev[:, 0] / np.maximum(z_prev, 1e-6)) * float(p_fx) + float(p_cx)).astype(np.int32)
+        v = np.round((pts_prev[:, 1] / np.maximum(z_prev, 1e-6)) * float(p_fy) + float(p_cy)).astype(np.int32)
+
+        ok = (z_prev > 0) & (u >= 0) & (u < prev_w) & (v >= 0) & (v < prev_h)
+        out = np.zeros(z_v.shape[0], dtype=bool)
+        if ok.any():
+            lookup = prev_depth[v[ok], u[ok]]
+            out[ok] = np.isfinite(lookup) & (lookup > 0) & (np.abs(z_prev[ok] - lookup) <= float(thresh))
+        return out
+    except Exception:
+        return None
+
+
 def _quaternion_from_normal(normal: np.ndarray) -> np.ndarray:
     """Compute wxyz quaternions rotating [0,0,1] to the given normals."""
     z_axis = np.array([0, 0, 1.0])
@@ -449,6 +580,54 @@ def insert_gaussians_from_frame(
     if _debug:
         _stats["raw_candidates"] = int(valid.sum())
 
+    if getattr(args, "streaming_depth_filter_enabled", True):
+        stable_depth = _sample_stable_depth_mask(
+            z,
+            xs,
+            ys,
+            min_depth,
+            max_depth,
+            erode_px=int(getattr(args, "streaming_depth_filter_erode_px", 2)),
+            window=int(getattr(args, "streaming_depth_filter_window", 5)),
+            min_valid_ratio=float(getattr(args, "streaming_depth_filter_min_valid_ratio", 0.75)),
+            max_range=float(getattr(args, "streaming_depth_filter_max_range", 0.08)),
+            median_thresh=float(getattr(args, "streaming_depth_filter_median_thresh", 0.04)),
+        )
+        before_stable = int(valid.sum())
+        valid = valid & stable_depth
+        bottom_margin = float(getattr(args, "streaming_depth_filter_bottom_margin", 0.0))
+        if bottom_margin > 0:
+            valid = valid & (ys < int(round(h * (1.0 - bottom_margin))))
+        if _debug:
+            _stats["after_stable_depth_filter"] = int(valid.sum())
+            _stats["rejected_unstable_depth"] = before_stable - int(valid.sum())
+    else:
+        stable_depth = np.ones_like(valid, dtype=bool)
+
+    temporal_ok = None
+    temporal_check_enabled = bool(getattr(args, "streaming_depth_temporal_check", True))
+    temporal_thresh = float(getattr(args, "streaming_depth_temporal_thresh", 0.07))
+    if temporal_check_enabled and valid.any():
+        temporal_flat = _sample_temporal_depth_mask(
+            z_v[valid].astype(np.float32),
+            xs[valid].astype(np.int32),
+            ys[valid].astype(np.int32),
+            frame,
+            prev_frame,
+            prev_depth_meters,
+            d_fx,
+            d_fy,
+            d_cx,
+            d_cy,
+            thresh=temporal_thresh,
+        )
+        if temporal_flat is not None:
+            temporal_ok = np.zeros_like(valid, dtype=bool)
+            temporal_ok[valid] = temporal_flat
+        elif (prev_frame is not None and prev_depth_meters is not None and
+              getattr(args, "streaming_depth_temporal_require_for_insert", True)):
+            temporal_ok = np.zeros_like(valid, dtype=bool)
+
     # ---- Alpha + Depth occupancy masking (Step 4) ----------------------------
     # Render may be at a different resolution than the raw sensor (--resolution
     # rescaling). Map sensor pixel coords into render pixel coords before indexing.
@@ -484,6 +663,9 @@ def insert_gaussians_from_frame(
             consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
             no_rend_depth = rend_d_v <= 0
             sensor_closer = rend_d_v - z_v > consistency_thresh
+            if (temporal_ok is not None and
+                    getattr(args, "streaming_depth_temporal_require_for_sensor_closer", True)):
+                sensor_closer = sensor_closer & temporal_ok
 
         valid = valid & (low_alpha | no_rend_depth | sensor_closer)
         if _debug:
@@ -491,6 +673,16 @@ def insert_gaussians_from_frame(
             _stats["insert_path_low_alpha"] = int((valid & low_alpha).sum())
             _stats["insert_path_no_depth"] = int((valid & no_rend_depth & ~low_alpha).sum())
             _stats["insert_path_sensor_closer"] = int((valid & sensor_closer & ~low_alpha & ~no_rend_depth).sum())
+
+    if temporal_ok is not None and getattr(args, "streaming_depth_temporal_require_for_insert", True):
+        before_temporal = int(valid.sum())
+        valid = valid & temporal_ok
+        if _debug:
+            _stats["after_temporal_depth_filter"] = int(valid.sum())
+            _stats["rejected_temporal_depth"] = before_temporal - int(valid.sum())
+    elif _debug and temporal_check_enabled:
+        _stats["after_temporal_depth_filter"] = int(valid.sum())
+        _stats["rejected_temporal_depth"] = 0
 
     # ---- Relative depth discontinuity masking (Step 5) ----------------------
     if edge_threshold > 0:
@@ -676,6 +868,15 @@ def _flush_insertion_batch(
     birth_frame_val = pending[len(pending) // 2]["birth_frame"]
     init_opacity = pending[0]["init_opacity"]
 
+    if all_pts.shape[0] > 1:
+        voxel_size = getattr(args, "streaming_insert_voxel_size", 0.02)
+        keys = streaming_scene._xyz_to_keys(all_pts, voxel_size)
+        _, keep_idx = np.unique(keys, return_index=True)
+        if keep_idx.shape[0] != all_pts.shape[0]:
+            keep_idx = np.sort(keep_idx)
+            all_pts, all_cols = all_pts[keep_idx], all_cols[keep_idx]
+            all_scales, all_quats = all_scales[keep_idx], all_quats[keep_idx]
+
     max_new = getattr(args, "streaming_max_new_gaussians_per_frame", 2000) * len(pending)
     if max_new > 0 and all_pts.shape[0] > max_new:
         rng = np.random.default_rng(iteration)
@@ -743,6 +944,130 @@ def _write_ply(snap, out_path):
         (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
     )))
     PlyData([PlyElement.describe(elements, "vertex")]).write(out_path)
+
+
+def _subset_snapshot(snap, mask: torch.Tensor):
+    mask_cpu = mask.detach().to(device="cpu", dtype=torch.bool)
+    return {
+        "attrs": snap["attrs"],
+        "means": snap["means"][mask_cpu],
+        "sh0": snap["sh0"][mask_cpu],
+        "shN": snap["shN"][mask_cpu],
+        "opacities": snap["opacities"][mask_cpu],
+        "scales": snap["scales"][mask_cpu],
+        "quats": snap["quats"][mask_cpu],
+    }
+
+
+def _bootstrap_mask(gaussians) -> Optional[torch.Tensor]:
+    birth_frame = getattr(gaussians, "birth_frame", None)
+    if birth_frame is None:
+        return None
+    if birth_frame.shape[0] != gaussians.get_xyz.shape[0]:
+        return None
+    mask = birth_frame == 0
+    return mask if mask.any() else None
+
+
+def _capture_bootstrap_positions(gaussians) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    mask = _bootstrap_mask(gaussians)
+    if mask is None:
+        return None
+    return mask.detach().clone(), gaussians.get_xyz[mask].detach().clone()
+
+
+def _bootstrap_motion_stats(
+    gaussians,
+    *,
+    before: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    threshold: float = 0.05,
+) -> Optional[dict]:
+    with torch.no_grad():
+        if before is not None:
+            mask, ref_xyz = before
+            if mask.shape[0] != gaussians.get_xyz.shape[0] or not mask.any():
+                return {
+                    "n": 0,
+                    "mean": 0.0,
+                    "p95": 0.0,
+                    "max": 0.0,
+                    "count_gt_2cm": 0,
+                    "count_gt_5cm": 0,
+                    "count_gt_10cm": 0,
+                    "count_gt_threshold": 0,
+                    "shape_mismatch": 1,
+                }
+            cur_xyz = gaussians.get_xyz[mask]
+            if cur_xyz.shape != ref_xyz.shape:
+                return None
+            delta = torch.linalg.norm(cur_xyz - ref_xyz, dim=1)
+        else:
+            mask = _bootstrap_mask(gaussians)
+            anchor_xyz = getattr(gaussians, "anchor_xyz", None)
+            if mask is None or anchor_xyz is None or anchor_xyz.shape[0] != gaussians.get_xyz.shape[0]:
+                return None
+            delta = torch.linalg.norm(gaussians.get_xyz[mask] - anchor_xyz[mask], dim=1)
+        if delta.numel() == 0:
+            return None
+        return {
+            "n": int(delta.numel()),
+            "mean": float(delta.mean().item()),
+            "p95": float(torch.quantile(delta.float(), 0.95).item()),
+            "max": float(delta.max().item()),
+            "count_gt_2cm": int((delta > 0.02).sum().item()),
+            "count_gt_5cm": int((delta > 0.05).sum().item()),
+            "count_gt_10cm": int((delta > 0.10).sum().item()),
+            "count_gt_threshold": int((delta > float(threshold)).sum().item()),
+            "shape_mismatch": 0,
+        }
+
+
+def _log_bootstrap_motion(
+    tb_writer,
+    args,
+    iteration: int,
+    stage: str,
+    stats: Optional[dict],
+) -> None:
+    if not stats:
+        return
+    prefix = f"streaming/bootstrap_motion/{stage}"
+    if tb_writer is not None:
+        for key, value in stats.items():
+            tb_writer.add_scalar(f"{prefix}/{key}", float(value), iteration)
+    threshold = float(getattr(args, "streaming_debug_bootstrap_motion_threshold", 0.05))
+    should_print = (
+        bool(getattr(args, "streaming_debug_bootstrap_motion", False))
+        and (stats.get("count_gt_threshold", 0) > 0 or stats.get("max", 0.0) > threshold)
+    )
+    if should_print:
+        print(
+            f"[bootstrap-motion] iter={iteration} stage={stage} "
+            f"n={stats.get('n', 0)} mean={stats.get('mean', 0.0):.5f}m "
+            f"p95={stats.get('p95', 0.0):.5f}m max={stats.get('max', 0.0):.5f}m "
+            f">2cm={stats.get('count_gt_2cm', 0)} >5cm={stats.get('count_gt_5cm', 0)} "
+            f">10cm={stats.get('count_gt_10cm', 0)}",
+            flush=True,
+        )
+
+
+def _write_bootstrap_motion_ply(gaussians, args, iteration: int, label: str) -> None:
+    if not getattr(args, "streaming_debug_bootstrap_motion", False):
+        return
+    mask = _bootstrap_mask(gaussians)
+    if mask is None:
+        return
+    try:
+        snap = _snapshot_for_ply(gaussians)
+        boot_snap = _subset_snapshot(snap, mask)
+        out_path = os.path.join(
+            args.model_path,
+            "bootstrap_motion",
+            f"iter_{int(iteration):06d}_{label}_bootstrap.ply",
+        )
+        _write_ply(boot_snap, out_path)
+    except Exception as exc:
+        print(f"[bootstrap-motion] failed to write PLY iter={iteration} label={label}: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1113,7 +1438,10 @@ def _run_rolling_seed(
             _eval_bg = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
             write_post_training_report(
                 args.model_path, refine_iters, gaussians, all_train_cameras, streaming_scene.getTestCameras(),
-                render, pipe, _eval_bg, tb_writer=tb_writer, subdir="rolling_seed_final"
+                render, pipe, _eval_bg, tb_writer=tb_writer, subdir="rolling_seed_final",
+                train_metrics_max=int(getattr(args, "streaming_report_train_metrics_max", 128)),
+                test_metrics_max=int(getattr(args, "streaming_report_test_metrics_max", 128)),
+                trajectory_max_frames=int(getattr(args, "streaming_report_trajectory_max_frames", 120)),
             )
         except Exception as _e:
             print(f"[rolling_seed] Evaluation failed: {_e}", flush=True)
@@ -1345,6 +1673,9 @@ def _run_submap_stitch(
                 _eval_bg,
                 tb_writer=tb_writer,
                 subdir="submap_final",
+                train_metrics_max=int(getattr(args, "streaming_report_train_metrics_max", 128)),
+                test_metrics_max=int(getattr(args, "streaming_report_test_metrics_max", 128)),
+                trajectory_max_frames=int(getattr(args, "streaming_report_trajectory_max_frames", 120)),
             )
         except Exception as _e:
             print(f"[submap] Evaluation failed: {_e}", flush=True)
@@ -1586,6 +1917,9 @@ def streaming_training(
     _insertion_batch_frames: int = 0  # frames accumulated since last flush
     _batch_frames = max(1, int(getattr(args, "streaming_insertion_batch_frames", 1)))
     _batch_max_pts = int(getattr(args, "streaming_insertion_batch_max_points", 8000))
+    _report_train_metrics_max = int(getattr(args, "streaming_report_train_metrics_max", 128))
+    _report_test_metrics_max = int(getattr(args, "streaming_report_test_metrics_max", 128))
+    _report_trajectory_max_frames = int(getattr(args, "streaming_report_trajectory_max_frames", 120))
     depth_loss_weight = getattr(args, "streaming_depth_loss_weight", 0.0)
     use_depth_loss = depth_loss_weight > 0
     depth_loss_type = getattr(args, "streaming_depth_loss_type", "l1")
@@ -1653,6 +1987,13 @@ def streaming_training(
     _progress_frames: list = []   # accumulated side-by-side uint8 HWC numpy frames
 
     from gaussian_renderer.gsplat_backend import render_batch as _render_batch
+
+    def _streaming_report_kwargs() -> dict:
+        return {
+            "train_metrics_max": _report_train_metrics_max,
+            "test_metrics_max": _report_test_metrics_max,
+            "trajectory_max_frames": _report_trajectory_max_frames,
+        }
 
     # Async render: renders go on a side CUDA stream; CPU work (numpy/cv2) goes to a daemon thread.
     # This overlaps GPU renders and CPU image assembly with the next training iteration.
@@ -1744,9 +2085,24 @@ def streaming_training(
                 tb_writer=tb_writer,
                 log_prefix="streaming_report",
                 subdir="iter_0_bootstrap_views",
+                **_streaming_report_kwargs(),
             )
         except Exception as e:
             print(f"[streaming-report] pre-training report failed: {e}", flush=True)
+
+    _debug_bootstrap_motion = bool(getattr(args, "streaming_debug_bootstrap_motion", False))
+    _debug_bootstrap_ply_interval = max(0, int(getattr(args, "streaming_debug_bootstrap_ply_interval", 0)))
+    _debug_bootstrap_first_iters = max(0, int(getattr(args, "streaming_debug_bootstrap_first_iters", 200)))
+    _debug_bootstrap_threshold = float(getattr(args, "streaming_debug_bootstrap_motion_threshold", 0.05))
+    if _debug_bootstrap_motion:
+        _log_bootstrap_motion(
+            tb_writer,
+            args,
+            0,
+            "total",
+            _bootstrap_motion_stats(gaussians, threshold=_debug_bootstrap_threshold),
+        )
+        _write_bootstrap_motion_ply(gaussians, args, 0, "post_init")
 
     progress_bar = tqdm(
         range(first_iter, opt.iterations),
@@ -1757,6 +2113,10 @@ def streaming_training(
 
     for iteration in range(first_iter, opt.iterations + 1):
         set_compile_iteration(iteration)
+        _debug_bootstrap_this_iter = (
+            _debug_bootstrap_motion
+            and (_debug_bootstrap_first_iters <= 0 or iteration <= _debug_bootstrap_first_iters)
+        )
 
         # Measure per-iteration wall time for dataset_fps simulated clock
         _now = time.perf_counter()
@@ -1861,7 +2221,8 @@ def streaming_training(
                                 _insertion_batch.append(cands_or_n)
                             _insertion_batch_frames += 1
                             _pending_pts = sum(c["pts"].shape[0] for c in _insertion_batch)
-                            if _insertion_batch_frames >= _batch_frames or _pending_pts >= _batch_max_pts:
+                            _early_by_points = _batch_max_pts > 0 and _pending_pts >= _batch_max_pts
+                            if _insertion_batch_frames >= _batch_frames or _early_by_points:
                                 added = _flush_insertion_batch(
                                     _insertion_batch, gaussians, streaming_scene, iteration, args)
                                 _insertion_batch = []
@@ -2106,6 +2467,9 @@ def streaming_training(
         visible = render_pkg["visibility_filter"].detach().to(dtype=torch.bool).contiguous()
         _step_mask = visible  # default; overridden below when sparse_active_set
         if not _placement_only:
+            _before_optimizer_bootstrap = (
+                _capture_bootstrap_positions(gaussians) if _debug_bootstrap_this_iter else None
+            )
             mcmc_strategy.step_pre_backward(
                 gaussians=gaussians, args=args, iteration=iteration,
                 render_pkg=render_pkg, loss=loss,
@@ -2181,11 +2545,26 @@ def streaming_training(
                     gaussians.normalize_rotation_params(
                         mask=_step_mask if sparse_active_set else None
                     )
+                if _debug_bootstrap_this_iter:
+                    _log_bootstrap_motion(
+                        tb_writer,
+                        args,
+                        iteration,
+                        "optimizer",
+                        _bootstrap_motion_stats(
+                            gaussians,
+                            before=_before_optimizer_bootstrap,
+                            threshold=_debug_bootstrap_threshold,
+                        ),
+                    )
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
                 # MCMC noise injection — skipped in placement_only / colors_only modes
                 if not _skip_mcmc:
                     if densification_strategy in {"mcmc", "hybrid", "gsplat_mcmc", "gsplat_energy_mcmc"}:
+                        _before_noise_bootstrap = (
+                            _capture_bootstrap_positions(gaussians) if _debug_bootstrap_this_iter else None
+                        )
                         if streaming_mcmc_local and sparse_active_set:
                             mcmc_strategy.inject_noise(
                                 gaussians=gaussians, args=args, xyz_lr=xyz_lr,
@@ -2195,6 +2574,18 @@ def streaming_training(
                             mcmc_strategy.inject_noise(
                                 gaussians=gaussians, args=args, xyz_lr=xyz_lr,
                                 visible=None, sparse_active_set=False, iteration=iteration,
+                            )
+                        if _debug_bootstrap_this_iter:
+                            _log_bootstrap_motion(
+                                tb_writer,
+                                args,
+                                iteration,
+                                "mcmc_noise",
+                                _bootstrap_motion_stats(
+                                    gaussians,
+                                    before=_before_noise_bootstrap,
+                                    threshold=_debug_bootstrap_threshold,
+                                ),
                             )
 
         # ---- Utility for energy MCMC --------------------------------------
@@ -2296,6 +2687,11 @@ def streaming_training(
             if _anchor_mask.any():
                 _anchor_pos = gaussians.get_xyz[_anchor_mask].detach().clone()
 
+        _before_mcmc_post_bootstrap = (
+            _capture_bootstrap_positions(gaussians)
+            if (_debug_bootstrap_this_iter and not _skip_mcmc)
+            else None
+        )
         if not _skip_mcmc:
             mcmc_strategy.step_post_backward(
                 gaussians=gaussians, args=args, sched=sched, iteration=iteration,
@@ -2312,6 +2708,31 @@ def streaming_training(
                         gaussians.params["means"].data[_anchor_mask] = _anchor_pos
                     else:
                         gaussians._xyz.data[_anchor_mask] = _anchor_pos
+            if _debug_bootstrap_this_iter:
+                _log_bootstrap_motion(
+                    tb_writer,
+                    args,
+                    iteration,
+                    "mcmc_post_backward",
+                    _bootstrap_motion_stats(
+                        gaussians,
+                        before=_before_mcmc_post_bootstrap,
+                        threshold=_debug_bootstrap_threshold,
+                    ),
+                )
+
+        if _debug_bootstrap_this_iter:
+            _log_bootstrap_motion(
+                tb_writer,
+                args,
+                iteration,
+                "total",
+                _bootstrap_motion_stats(gaussians, threshold=_debug_bootstrap_threshold),
+            )
+            if _debug_bootstrap_ply_interval > 0 and (
+                iteration <= 5 or iteration % _debug_bootstrap_ply_interval == 0
+            ):
+                _write_bootstrap_motion_ply(gaussians, args, iteration, "post_mcmc")
 
         # ---- Deferred lifecycle pruning (safe: optimizer/MCMC already done) --
         if _deferred_stale_mask is not None and _deferred_stale_count > 0:
@@ -2421,7 +2842,7 @@ def streaming_training(
                 progress_bar.close()
 
             # Test evaluation: full comparison report (renders + contact sheet + MP4)
-            if iteration in testing_iterations:
+            if iteration in testing_iterations and iteration != opt.iterations:
                 try:
                     from utils.comparison_report import write_post_training_report
                     from gaussian_renderer.gsplat_backend import render_batch as _rb_mid
@@ -2437,6 +2858,7 @@ def streaming_training(
                         tb_writer=tb_writer,
                         log_prefix="streaming_report",
                         batch_render_fn=_rb_mid,
+                        **_streaming_report_kwargs(),
                     )
                 except Exception as _e:
                     print(f"[streaming-report] mid-training report failed iter={iteration}: {_e}", flush=True)
@@ -2501,44 +2923,59 @@ def streaming_training(
             flush=True,
         )
 
-    # Mandatory post-training report: test PSNR + side-by-side PNGs +
-    # contact sheet + trajectory MP4. Always runs (independent of the
-    # opt-in --streaming_render_at_saves milestone snapshots).
-    try:
-        from utils.comparison_report import write_post_training_report
-        from gaussian_renderer.gsplat_backend import render_batch as _rb_final
-        write_post_training_report(
-            model_path=args.model_path,
-            iteration=opt.iterations,
-            gaussians=gaussians,
-            train_cams=list(streaming_scene.getTrainCameras()),
-            test_cams=list(streaming_scene.getTestCameras()),
-            render_fn=render,
-            pipe=pipe,
-            background=background,
-            tb_writer=tb_writer,
-            log_prefix="streaming_report",
-            batch_render_fn=_rb_final,
-        )
-        # Re-render the bootstrap views with the trained Gaussians so the
-        # iter_0 vs end-of-training comparison is over the same viewpoints.
-        if _bootstrap_cams:
+    # Flush any remaining pending batch insertions before final reporting/eval so
+    # the exported metrics include all admitted geometry.
+    if _insertion_batch:
+        _remaining = _flush_insertion_batch(
+            _insertion_batch, gaussians, streaming_scene, args.iterations, args)
+        _insertion_batch = []
+        _insertion_batch_frames = 0
+        if _remaining > 0:
+            total_inserted += _remaining
+            print(f"[streaming] End-of-training batch flush: inserted {_remaining} Gaussians", flush=True)
+
+    # Post-training report: bounded test/train metrics + side-by-side PNGs +
+    # contact sheet + trajectory MP4. Can be disabled for core-training profiling.
+    if getattr(args, "streaming_report_final", True):
+        try:
+            from utils.comparison_report import write_post_training_report
+            from gaussian_renderer.gsplat_backend import render_batch as _rb_final
             write_post_training_report(
                 model_path=args.model_path,
                 iteration=opt.iterations,
                 gaussians=gaussians,
-                train_cams=_bootstrap_cams,
-                test_cams=_bootstrap_cams,
+                train_cams=list(streaming_scene.getTrainCameras()),
+                test_cams=list(streaming_scene.getTestCameras()),
                 render_fn=render,
                 pipe=pipe,
                 background=background,
                 tb_writer=tb_writer,
                 log_prefix="streaming_report",
-                subdir=f"iter_{opt.iterations}_bootstrap_views",
                 batch_render_fn=_rb_final,
+                **_streaming_report_kwargs(),
             )
-    except Exception as e:
-        print(f"[streaming-report] post-training report failed: {e}", flush=True)
+            # Re-render the bootstrap views with the trained Gaussians so the
+            # iter_0 vs end-of-training comparison is over the same viewpoints.
+            if _bootstrap_cams:
+                write_post_training_report(
+                    model_path=args.model_path,
+                    iteration=opt.iterations,
+                    gaussians=gaussians,
+                    train_cams=_bootstrap_cams,
+                    test_cams=_bootstrap_cams,
+                    render_fn=render,
+                    pipe=pipe,
+                    background=background,
+                    tb_writer=tb_writer,
+                    log_prefix="streaming_report",
+                    subdir=f"iter_{opt.iterations}_bootstrap_views",
+                    batch_render_fn=_rb_final,
+                    **_streaming_report_kwargs(),
+                )
+        except Exception as e:
+            print(f"[streaming-report] post-training report failed: {e}", flush=True)
+    else:
+        print("[streaming-report] final report disabled by --no-streaming_report_final", flush=True)
 
     # ---- Trajectory evaluation -----------------------------------------------
     if getattr(args, "streaming_trajectory_eval", True):
@@ -2566,13 +3003,6 @@ def streaming_training(
             print(f"[streaming] training_progress.mp4 → {_prog_path}", flush=True)
         else:
             print(f"[streaming] training_progress.mp4 FAILED: {_err}", flush=True)
-
-    # Flush any remaining pending batch insertions
-    if _insertion_batch:
-        _remaining = _flush_insertion_batch(
-            _insertion_batch, gaussians, streaming_scene, args.iterations, args)
-        if _remaining > 0:
-            print(f"[streaming] End-of-training batch flush: inserted {_remaining} Gaussians", flush=True)
 
     _signal.signal(_signal.SIGINT, _orig_sigint)
     save_worker.shutdown()

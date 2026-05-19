@@ -120,6 +120,7 @@ class ModelParams(ParamGroup):
         self.orbbec_open3d_odom_cache_dir = ""
         self.orbbec_open3d_odom_stride = 1
         self.orbbec_open3d_odom_downscale = 1
+        self.orbbec_open3d_odom_async = False
         self.orbbec_open3d_odom_max_trans_per_edge = 0.15
         self.orbbec_open3d_odom_max_rot_deg_per_edge = 8.0
         self.orbbec_open3d_odom_method = "hybrid"
@@ -331,6 +332,19 @@ class StreamingParams(ParamGroup):
         self.streaming_occupancy_rebuild_interval = 200
         # Depth discontinuity threshold: reject pixels where |dz/dx|+|dz/dy| > this (metres)
         self.streaming_depth_edge_threshold = 0.02
+        # Early depth-candidate stability filters before insertion.
+        self.streaming_depth_filter_enabled = False
+        self.streaming_depth_filter_erode_px = 2
+        self.streaming_depth_filter_window = 5
+        self.streaming_depth_filter_min_valid_ratio = 0.75
+        self.streaming_depth_filter_max_range = 0.08
+        self.streaming_depth_filter_median_thresh = 0.04
+        self.streaming_depth_filter_bottom_margin = 0.0
+        self.streaming_depth_temporal_check = False
+        self.streaming_depth_temporal_thresh = 0.07
+        self.streaming_depth_temporal_require_for_sensor_closer = False
+        self.streaming_depth_temporal_require_for_insert = False
+        self.streaming_depth_temporal_require_for_seed = False
         # Grazing-angle rejection: reject surface normals > this angle from view direction (degrees)
         self.streaming_max_view_angle = 70.0
         # Use KNN-based initial scale for inserted Gaussians (matches bootstrap quality)
@@ -352,6 +366,13 @@ class StreamingParams(ParamGroup):
         # Pre-training bootstrap snapshot: render bootstrap views before training starts
         # and write to iter_0_bootstrap_views/ (opt-in; adds overhead on startup)
         self.streaming_report_pre_training = False
+        # Final report is useful, but can dominate profiling if left unbounded.
+        self.streaming_report_final = True
+        # Representative metric caps for streaming reports (0 = skip that split).
+        self.streaming_report_train_metrics_max = 128
+        self.streaming_report_test_metrics_max = 128
+        # Representative trajectory-video cap for streaming reports.
+        self.streaming_report_trajectory_max_frames = 120
         # Freeze bootstrap Gaussians (birth_frame==0) from MCMC noise displacement.
         # After each step_post_backward, their positions are restored to the pre-noise
         # values. Tests whether position displacement of early Gaussians causes forgetting.
@@ -408,6 +429,11 @@ class StreamingParams(ParamGroup):
         self.streaming_anchor_loss_weight = 0.0
         # Anchor penalty decays linearly to zero over this many training iterations.
         self.streaming_anchor_decay_steps = 500
+        # Bootstrap motion diagnostics (off by default; useful for early geometry drift).
+        self.streaming_debug_bootstrap_motion = False
+        self.streaming_debug_bootstrap_ply_interval = 0
+        self.streaming_debug_bootstrap_motion_threshold = 0.05
+        self.streaming_debug_bootstrap_first_iters = 200
         # H10: Global keyframe reservoir.
         # Every Nth ingested train frame is kept in a permanent reservoir for
         # trajectory-wide replay. 0 = disabled.
