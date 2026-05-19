@@ -147,15 +147,16 @@ class StreamingScene:
             yield self._get_source_frame(i)
 
     def drain_pending_odometry(self) -> None:
-        """Phase 5: force the live-odom producer to compute every remaining frame.
-
-        Called before any path that enumerates all frames (final reports,
-        trajectory eval) so the async producer cannot be left mid-stream.
-        No-op for sources without the method (non-live or non-Orbbec/Realsense).
-        """
+        """Force the live-odom producer to compute every source frame."""
         drain = getattr(self._frame_source, "drain_pending", None)
         if callable(drain):
             drain()
+
+    def stop_pending_odometry(self) -> None:
+        """Stop background live odometry without computing unseen frames."""
+        stop = getattr(self._frame_source, "stop_pending", None)
+        if callable(stop):
+            stop()
 
     # ------------------------------------------------------------------
     # Initialisation

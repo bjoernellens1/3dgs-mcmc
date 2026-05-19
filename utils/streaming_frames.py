@@ -16,6 +16,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
 
+from utils.rosbag_sync import (
+    StampedMsg,
+    SyncedRGBD,
+    attach_pose,
+    check_p95_within_threshold,
+    estimate_stream_offset_ns,
+    format_stats_oneline,
+    merge_stats,
+    sync_color_depth_unique,
+    write_sync_report,
+)
+
 
 @dataclass
 class StreamingRGBDFrame:
@@ -52,6 +64,14 @@ class StreamingRGBDFrame:
     _rgb_bytes: Optional[bytes] = field(default=None, repr=False, compare=False)
     _depth_bytes: Optional[bytes] = field(default=None, repr=False, compare=False)
     _sens_header: Optional[dict] = field(default=None, repr=False, compare=False)
+    # Optional rosbag sync audit timestamps/deltas (nanoseconds).
+    color_ts_ns: Optional[int] = None
+    depth_ts_ns: Optional[int] = None
+    pose_ts_ns: Optional[int] = None
+    rgb_depth_dt_ns: Optional[int] = None
+    rgb_pose_dt_ns: Optional[int] = None
+    color_bag_ns: Optional[int] = None
+    depth_bag_ns: Optional[int] = None
 
 
 def load_frame_rgb(frame: "StreamingRGBDFrame"):
@@ -76,6 +96,41 @@ def load_frame_depth_np(frame: "StreamingRGBDFrame"):
         return None
     from PIL import Image
     return np.array(Image.open(frame.depth_path))
+
+
+def streaming_frame_from_synced_rgbd(
+    rec: SyncedRGBD,
+    index: int,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    c2w_override=None,
+    depth_scale: float = 1000.0,
+) -> StreamingRGBDFrame:
+    """Build a StreamingRGBDFrame while preserving rosbag sync audit fields."""
+    c2w = c2w_override if c2w_override is not None else (rec.pose.payload if rec.pose is not None else None)
+    return StreamingRGBDFrame(
+        index=index,
+        timestamp=float(rec.color.header_ns) * 1e-9,
+        rgb_path="",
+        depth_path=None,
+        c2w=c2w,
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        width=width, height=height,
+        depth_scale=depth_scale,
+        _rgb_bytes=rec.color.payload,
+        _depth_bytes=rec.depth.payload,
+        color_ts_ns=rec.color.header_ns,
+        depth_ts_ns=rec.depth.header_ns,
+        pose_ts_ns=rec.pose.header_ns if rec.pose is not None else None,
+        rgb_depth_dt_ns=rec.rgb_depth_dt_ns,
+        rgb_pose_dt_ns=rec.rgb_pose_dt_ns,
+        color_bag_ns=rec.color.bag_ns,
+        depth_bag_ns=rec.depth.bag_ns,
+    )
 
 
 def _rot_to_quat(R):
@@ -810,7 +865,13 @@ class OrbbecRosBagFrameSource:
         pose_topic: str = "/camera_pose",
         pose_source: str = "camera_pose",
         camera_info_topic: str = "/camera/color/camera_info",
-        sync_threshold_ms: float = 33.0,
+        sync_threshold_ms: float = 5.0,
+        pose_sync_threshold_ms: float = 10.0,
+        sync_estimate_offset: bool = False,
+        sync_offset_ms: str | float = "auto",
+        sync_strict: bool = True,
+        sync_report_json: str = "",
+        model_path: str = "",
         max_frames: int = 0,
         frame_stride: int = 1,
         open3d_odom_max_failure_ratio: float = 0.25,
@@ -843,9 +904,13 @@ class OrbbecRosBagFrameSource:
 
         typestore = get_typestore(Stores.ROS2_HUMBLE)
         sync_ns = int(sync_threshold_ms * 1e6)
+        pose_sync_ns = int(pose_sync_threshold_ms * 1e6)
         pose_source = str(pose_source or "camera_pose")
         open3d_odom_stride = max(1, int(open3d_odom_stride))
         open3d_odom_downscale = max(1, int(open3d_odom_downscale))
+        self._odom_depth_min = float(open3d_odom_depth_min)
+        self._odom_depth_max = float(open3d_odom_depth_max)
+        self._odom_depth_diff_max = float(open3d_odom_depth_diff_max)
         if pose_source not in {"camera_pose", "auto", "open3d_odometry", "open3d_odometry_live"}:
             raise ValueError(
                 "orbbec_pose_source must be one of: camera_pose, auto, open3d_odometry, "
@@ -867,10 +932,11 @@ class OrbbecRosBagFrameSource:
                 "or --orbbec_pose_source auto to use /camera_pose when present and Open3D otherwise."
             )
 
-        # Read all messages in one pass
-        pose_msgs: list = []     # (ts_ns, c2w_4x4)
-        color_msgs: list = []    # (ts_ns, bytes)
-        depth_msgs: list = []    # (ts_ns, bytes)
+        # Read all messages in one pass.
+        pose_msgs: list[StampedMsg] = []
+        color_msgs: list[StampedMsg] = []
+        depth_msgs: list[StampedMsg] = []
+        camera_infos: list[dict] = []
         intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy, W, H)
 
         _msg_ns_zero_warned: set = set()
@@ -920,6 +986,10 @@ class OrbbecRosBagFrameSource:
                 return fallback_ns
             return sec * 1_000_000_000 + nsec
 
+        def _frame_id(msg) -> str:
+            header = getattr(msg, "header", None)
+            return str(getattr(header, "frame_id", "") or "")
+
         with Reader(path) as reader:
             want = [color_topic, depth_topic, camera_info_topic]
             if pose_source == "camera_pose":
@@ -941,40 +1011,96 @@ class OrbbecRosBagFrameSource:
                     c2w = np.eye(4, dtype=np.float32)
                     c2w[:3, :3] = R
                     c2w[:3, 3] = [p.x, p.y, p.z]
-                    pose_msgs.append((msg_ts, c2w))
+                    pose_msgs.append(StampedMsg(
+                        topic=topic,
+                        header_ns=msg_ts,
+                        bag_ns=int(ts),
+                        payload=c2w,
+                        frame_id=_frame_id(msg),
+                    ))
                 elif topic == color_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     msg_ts = _msg_ns(msg, ts, topic)
+                    encoding = str(getattr(msg, "encoding", "") or "")
+                    fmt = str(getattr(msg, "format", "") or "")
                     if _msg_is_raw_image(msg):
-                        color_msgs.append((msg_ts, _raw_image_to_png(msg)))
+                        payload = _raw_image_to_png(msg)
                     else:
-                        color_msgs.append((msg_ts, bytes(msg.data)))
+                        payload = bytes(msg.data)
+                    color_msgs.append(StampedMsg(
+                        topic=topic,
+                        header_ns=msg_ts,
+                        bag_ns=int(ts),
+                        payload=payload,
+                        frame_id=_frame_id(msg),
+                        encoding=encoding,
+                        format=fmt,
+                    ))
                 elif topic == depth_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     msg_ts = _msg_ns(msg, ts, topic)
+                    encoding = str(getattr(msg, "encoding", "") or "")
+                    fmt = str(getattr(msg, "format", "") or "")
                     if _msg_is_raw_image(msg):
-                        depth_msgs.append((msg_ts, _raw_image_to_png(msg)))
+                        payload = _raw_image_to_png(msg)
                     else:
-                        fmt = getattr(msg, "format", "")
                         if fmt and "png" not in fmt.lower() and "16uc1" not in fmt.lower():
                             raise RuntimeError(
                                 f"Depth topic '{depth_topic}' has format '{fmt}' — "
                                 "expected lossless PNG/16UC1, not JPEG. "
                                 "JPEG-compressed depth corrupts metric values."
                             )
-                        depth_msgs.append((msg_ts, bytes(msg.data)))
-                elif topic == camera_info_topic and intrinsics is None:
+                        payload = bytes(msg.data)
+                    depth_msgs.append(StampedMsg(
+                        topic=topic,
+                        header_ns=msg_ts,
+                        bag_ns=int(ts),
+                        payload=payload,
+                        frame_id=_frame_id(msg),
+                        encoding=encoding,
+                        format=fmt,
+                    ))
+                elif topic == camera_info_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     K = msg.k  # row-major 3×3
-                    intrinsics = (
-                        float(K[0]), float(K[4]),   # fx, fy
-                        float(K[2]), float(K[5]),   # cx, cy
-                        int(msg.width), int(msg.height),
-                    )
+                    info = {
+                        "topic": topic,
+                        "frame_id": _frame_id(msg),
+                        "header_ns": _msg_ns(msg, ts, topic),
+                        "bag_ns": int(ts),
+                        "K": [float(v) for v in K],
+                        "width": int(msg.width),
+                        "height": int(msg.height),
+                    }
+                    camera_infos.append(info)
+                    if intrinsics is None:
+                        intrinsics = (
+                            float(K[0]), float(K[4]),   # fx, fy
+                            float(K[2]), float(K[5]),   # cx, cy
+                            int(msg.width), int(msg.height),
+                        )
 
         if intrinsics is None:
             raise RuntimeError(f"No '{camera_info_topic}' messages found in {path}")
         fx, fy, cx, cy, width, height = intrinsics
+        camera_info_width, camera_info_height = int(width), int(height)
+        if color_msgs:
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(io.BytesIO(color_msgs[0].payload)) as _img:
+                    image_width, image_height = _img.size
+                if (image_width, image_height) != (camera_info_width, camera_info_height):
+                    raise RuntimeError(
+                        f"[streaming] Selected color intrinsics from '{camera_info_topic}' "
+                        f"are {camera_info_width}x{camera_info_height}, but the first color frame is "
+                        f"{image_width}x{image_height}. Use matching color CameraInfo for '{color_topic}'."
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[streaming] Could not verify color frame size against '{camera_info_topic}': {exc}"
+                ) from exc
 
         # Apply streaming_resolution divisor: scale intrinsics so odometry, camera
         # creation, and depth backprojection all work at the same reduced resolution.
@@ -994,36 +1120,136 @@ class OrbbecRosBagFrameSource:
         self._height = height
         self._depth_scale = 1000.0
 
-        # Build sorted timestamp arrays for O(log n) nearest-neighbour sync
-        pose_ts = np.array([m[0] for m in pose_msgs], dtype=np.int64)
-        depth_ts = np.array([m[0] for m in depth_msgs], dtype=np.int64)
+        color_msgs.sort(key=lambda m: m.header_ns)
+        depth_msgs.sort(key=lambda m: m.header_ns)
+        pose_msgs.sort(key=lambda m: m.header_ns)
 
-        synced: list = []
-        for i, (color_ts, rgb_bytes) in enumerate(color_msgs[::frame_stride]):
-            c2w = None
-            if pose_source == "camera_pose":
-                # Find closest pose
-                pi = int(np.searchsorted(pose_ts, color_ts))
-                pi = min(pi, len(pose_ts) - 1)
-                if pi > 0 and abs(pose_ts[pi - 1] - color_ts) < abs(pose_ts[pi] - color_ts):
-                    pi -= 1
-                if abs(pose_ts[pi] - color_ts) > sync_ns:
-                    continue
-                c2w = pose_msgs[pi][1]
+        color_frame_ids = sorted({m.frame_id for m in color_msgs if m.frame_id})
+        depth_frame_ids = sorted({m.frame_id for m in depth_msgs if m.frame_id})
+        frame_ids_match = bool(color_frame_ids and depth_frame_ids and set(color_frame_ids) == set(depth_frame_ids))
+        depth_topic_aligned = "aligned" in str(depth_topic).lower()
+        depth_aligned = frame_ids_match or depth_topic_aligned
+        if not depth_aligned:
+            raise RuntimeError(
+                "[streaming] OrbbecRosBagFrameSource requires depth already aligned to the color camera. "
+                f"Color frame_id(s)={color_frame_ids or ['<unset>']} depth frame_id(s)={depth_frame_ids or ['<unset>']} "
+                f"and depth topic '{depth_topic}' is not an aligned-depth topic. "
+                "Use aligned depth or implement raw-depth+TF reprojection before loading this bag."
+            )
 
-            # Find closest depth
-            di = int(np.searchsorted(depth_ts, color_ts))
-            di = min(di, len(depth_ts) - 1)
-            if di > 0 and abs(depth_ts[di - 1] - color_ts) < abs(depth_ts[di] - color_ts):
-                di -= 1
-            depth_bytes: Optional[bytes] = None
-            if abs(depth_ts[di] - color_ts) <= sync_ns:
-                depth_bytes = depth_msgs[di][1]
-            if depth_bytes is None:
-                continue
-            synced.append((color_ts, rgb_bytes, depth_bytes, c2w))
-            if max_frames > 0 and len(synced) >= max_frames:
-                break
+        if width <= 0 or height <= 0:
+            raise RuntimeError(
+                f"[streaming] Invalid selected color intrinsics from '{camera_info_topic}': width={width}, height={height}"
+            )
+
+        estimated_offset_ns = 0
+        if sync_estimate_offset:
+            estimated_offset_ns = estimate_stream_offset_ns(
+                [m.header_ns for m in color_msgs],
+                [m.header_ns for m in depth_msgs],
+            )
+        offset_config = str(sync_offset_ms)
+        if offset_config.strip().lower() == "auto":
+            offset_ns = estimated_offset_ns if sync_estimate_offset else 0
+        else:
+            try:
+                offset_ns = int(round(float(offset_config) * 1e6))
+            except ValueError as exc:
+                raise ValueError(
+                    "--orbbec_sync_offset_ms must be 'auto' or a numeric millisecond value "
+                    f"(got {sync_offset_ms!r})"
+                ) from exc
+
+        pairs, pair_stats = sync_color_depth_unique(color_msgs, depth_msgs, sync_ns, offset_ns=offset_ns)
+        synced_all, pose_stats = attach_pose(
+            pairs,
+            color_msgs,
+            depth_msgs,
+            pose_msgs if pose_source == "camera_pose" else [],
+            max_pose_dt_ns=pose_sync_ns,
+            pose_required=(pose_source == "camera_pose"),
+        )
+        sync_stats = merge_stats(
+            pair_stats,
+            pose_stats,
+            color_msgs,
+            depth_msgs,
+            pose_msgs,
+            estimated_offset_ns=estimated_offset_ns,
+            offset_applied_ns=offset_ns,
+        )
+        sync_stats.p95_violation = not check_p95_within_threshold(sync_stats, sync_ns)
+
+        report_path = sync_report_json or (
+            os.path.join(model_path, "sync_report.json") if model_path else os.path.join(path, "sync_report.json")
+        )
+        selected_camera_info = camera_infos[0] if camera_infos else None
+        write_sync_report(report_path, sync_stats, extras={
+            "source_path": path,
+            "topics": {
+                "color": color_topic,
+                "depth": depth_topic,
+                "pose": pose_topic if pose_source == "camera_pose" else "",
+                "camera_info": camera_info_topic,
+            },
+            "thresholds": {
+                "rgb_depth_ms": float(sync_threshold_ms),
+                "rgb_pose_ms": float(pose_sync_threshold_ms),
+            },
+            "offset": {
+                "estimate_enabled": bool(sync_estimate_offset),
+                "config_ms": sync_offset_ms,
+                "estimated_offset_ns": int(estimated_offset_ns),
+                "applied_offset_ns": int(offset_ns),
+            },
+            "frame_counts": {
+                "color": len(color_msgs),
+                "depth": len(depth_msgs),
+                "pose": len(pose_msgs),
+                "accepted_rgbd": len(synced_all),
+            },
+            "selected_camera_info": selected_camera_info,
+            "selected_frame_size": {"width": int(width), "height": int(height)},
+            "camera_infos": camera_infos,
+            "alignment": {
+                "depth_aligned": bool(depth_aligned),
+                "reason": "frame_id_match" if frame_ids_match else "depth_topic_contains_aligned",
+                "color_frame_ids": color_frame_ids,
+                "depth_frame_ids": depth_frame_ids,
+            },
+            "strict": bool(sync_strict),
+            "frame_stride": int(frame_stride),
+            "max_frames": int(max_frames),
+            "pose_source": pose_source,
+        })
+        print(f"[streaming] OrbbecRosBag sync: {format_stats_oneline(sync_stats)} report={report_path}", flush=True)
+
+        if not synced_all:
+            raise RuntimeError(
+                "[streaming] OrbbecRosBagFrameSource accepted no RGB-D frames after strict timestamp sync. "
+                f"threshold={sync_threshold_ms}ms color={len(color_msgs)} depth={len(depth_msgs)} pose_source={pose_source}"
+            )
+        if sync_strict and sync_stats.p95_violation:
+            p95_ms = float(sync_stats.rgb_depth_dt_ns.get("abs_p95_ns", 0.0)) / 1e6
+            raise RuntimeError(
+                "[streaming] OrbbecRosBagFrameSource strict sync rejected this bag: "
+                f"RGB-depth abs p95={p95_ms:.3f}ms exceeds threshold={float(sync_threshold_ms):.3f}ms. "
+                "Pass --no-orbbec_sync_strict or increase --orbbec_sync_threshold_ms only if this drift is acceptable."
+            )
+
+        stride = max(1, int(frame_stride))
+        synced_records = synced_all[::stride]
+        if max_frames > 0:
+            synced_records = synced_records[:int(max_frames)]
+        synced: list = [
+            (
+                rec.color.header_ns,
+                rec.color.payload,
+                rec.depth.payload,
+                rec.pose.payload if rec.pose is not None else None,
+            )
+            for rec in synced_records
+        ]
 
         if pose_source == "open3d_odometry":
             cache_key = self._open3d_odom_cache_key(
@@ -1100,18 +1326,15 @@ class OrbbecRosBagFrameSource:
             )
 
         self._frames: List[StreamingRGBDFrame] = []
-        for color_ts, rgb_bytes, depth_bytes, c2w in synced:
-            self._frames.append(StreamingRGBDFrame(
+        for sync_idx, (color_ts, rgb_bytes, depth_bytes, c2w) in enumerate(synced):
+            rec = synced_records[sync_idx]
+            self._frames.append(streaming_frame_from_synced_rgbd(
+                rec,
                 index=len(self._frames),
-                timestamp=float(color_ts) * 1e-9,
-                rgb_path="",
-                depth_path=None,
-                c2w=c2w,
                 fx=fx, fy=fy, cx=cx, cy=cy,
                 width=width, height=height,
+                c2w_override=c2w,
                 depth_scale=1000.0,
-                _rgb_bytes=rgb_bytes,
-                _depth_bytes=depth_bytes,
             ))
 
         self._pose_source = pose_source
@@ -1121,9 +1344,6 @@ class OrbbecRosBagFrameSource:
         self._live_odom_max_failure_ratio = float(open3d_odom_max_failure_ratio)
         self._live_odom_max_trans = float(open3d_odom_max_trans_per_edge) if open3d_odom_max_trans_per_edge > 0 else float("inf")
         self._live_odom_max_rot = float(open3d_odom_max_rot_deg_per_edge) if open3d_odom_max_rot_deg_per_edge > 0 else float("inf")
-        self._odom_depth_min = float(open3d_odom_depth_min)
-        self._odom_depth_max = float(open3d_odom_depth_max)
-        self._odom_depth_diff_max = float(open3d_odom_depth_diff_max)
         self._live_odom_method = open3d_odom_method
         self._live_odom_icp_max_distance = open3d_icp_max_distance
         self._live_odom_icp_robust_kernel = open3d_icp_robust_kernel
@@ -1724,6 +1944,26 @@ class OrbbecRosBagFrameSource:
             self._wait_live_odom_until(last)
         else:
             self._ensure_live_odom_until(last)
+
+    def stop_pending(self) -> None:
+        """Stop the async live-odometry producer without advancing unseen frames."""
+        if not self._live_odom_enabled or self._live_odom_cached_full:
+            return
+        thread = getattr(self, "_live_odom_async_thread", None)
+        if thread is None:
+            return
+        cond = getattr(self, "_live_odom_cond", None)
+        self._live_odom_async_stop = True
+        if cond is not None:
+            with cond:
+                cond.notify_all()
+        thread.join(timeout=10.0)
+        if thread.is_alive():
+            print(
+                "[streaming] Warning: live Open3D odometry worker did not stop within 10s; "
+                "leaving daemon thread for process shutdown.",
+                flush=True,
+            )
 
     def _wait_live_odom_until(self, index: int) -> None:
         if index <= self._live_odom_computed_idx:
@@ -2357,7 +2597,7 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             depth_topic=getattr(args, "realsense_depth_topic", "/device_0/sensor_0/Depth_0/image/data"),
             color_info_topic=getattr(args, "realsense_color_info_topic", "/device_0/sensor_1/Color_0/info/camera_info"),
             depth_info_topic=getattr(args, "realsense_depth_info_topic", "/device_0/sensor_0/Depth_0/info/camera_info"),
-            sync_threshold_ms=getattr(args, "orbbec_sync_threshold_ms", 33.0),
+            sync_threshold_ms=getattr(args, "realsense_sync_threshold_ms", 33.0),
             max_frames=getattr(args, "streaming_max_frames", 0),
             frame_stride=getattr(args, "streaming_frame_stride", 1),
             open3d_odom_max_failure_ratio=getattr(args, "orbbec_open3d_odom_max_failure_ratio", 0.25),
@@ -2387,7 +2627,13 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             pose_topic=getattr(args, "orbbec_pose_topic", "/camera_pose"),
             pose_source=getattr(args, "orbbec_pose_source", "camera_pose"),
             camera_info_topic=getattr(args, "orbbec_camera_info_topic", "/camera/color/camera_info"),
-            sync_threshold_ms=getattr(args, "orbbec_sync_threshold_ms", 33.0),
+            sync_threshold_ms=getattr(args, "orbbec_sync_threshold_ms", 5.0),
+            pose_sync_threshold_ms=getattr(args, "orbbec_pose_sync_threshold_ms", 10.0),
+            sync_estimate_offset=getattr(args, "orbbec_sync_estimate_offset", False),
+            sync_offset_ms=getattr(args, "orbbec_sync_offset_ms", "auto"),
+            sync_strict=getattr(args, "orbbec_sync_strict", True),
+            sync_report_json=getattr(args, "orbbec_sync_report_json", ""),
+            model_path=getattr(args, "model_path", ""),
             max_frames=getattr(args, "streaming_max_frames", 0),
             frame_stride=getattr(args, "streaming_frame_stride", 1),
             open3d_odom_max_failure_ratio=getattr(args, "orbbec_open3d_odom_max_failure_ratio", 0.25),

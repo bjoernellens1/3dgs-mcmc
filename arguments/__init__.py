@@ -114,7 +114,12 @@ class ModelParams(ParamGroup):
         self.orbbec_pose_topic = "/camera_pose"
         self.orbbec_pose_source = "camera_pose"
         self.orbbec_camera_info_topic = "/camera/color/camera_info"
-        self.orbbec_sync_threshold_ms = 33.0
+        self.orbbec_sync_threshold_ms = 5.0
+        self.orbbec_pose_sync_threshold_ms = 10.0
+        self.orbbec_sync_estimate_offset = False
+        self.orbbec_sync_offset_ms = "auto"
+        self.orbbec_sync_strict = True
+        self.orbbec_sync_report_json = ""
         self.orbbec_open3d_odom_max_failure_ratio = 0.25
         self.orbbec_open3d_odom_cache = True
         self.orbbec_open3d_odom_cache_dir = ""
