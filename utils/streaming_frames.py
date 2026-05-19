@@ -980,6 +980,20 @@ class OrbbecRosBagFrameSource:
         self._height = height
         self._depth_scale = 1000.0
 
+        # Apply streaming_resolution divisor: scale intrinsics so odometry, camera
+        # creation, and depth backprojection all work at the same reduced resolution.
+        _R = int(getattr(args, "streaming_resolution", 1))
+        if _R > 1:
+            self._width  = self._width  // _R
+            self._height = self._height // _R
+            self._fx /= _R;  self._fy /= _R
+            self._cx /= _R;  self._cy /= _R
+            for _fr in self._frames:
+                _fr.width  = _fr.width  // _R
+                _fr.height = _fr.height // _R
+                _fr.fx = _fr.fx / _R;  _fr.fy = _fr.fy / _R
+                _fr.cx = _fr.cx / _R;  _fr.cy = _fr.cy / _R
+
         # Build sorted timestamp arrays for O(log n) nearest-neighbour sync
         pose_ts = np.array([m[0] for m in pose_msgs], dtype=np.int64)
         depth_ts = np.array([m[0] for m in depth_msgs], dtype=np.int64)
@@ -1940,6 +1954,18 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._width = width
         self._height = height
         self._depth_scale = 1000.0
+
+        _R = int(getattr(args, "streaming_resolution", 1))
+        if _R > 1:
+            self._width  = self._width  // _R
+            self._height = self._height // _R
+            self._fx /= _R;  self._fy /= _R
+            self._cx /= _R;  self._cy /= _R
+            for _fr in self._frames:
+                _fr.width  = _fr.width  // _R
+                _fr.height = _fr.height // _R
+                _fr.fx = _fr.fx / _R;  _fr.fy = _fr.fy / _R
+                _fr.cx = _fr.cx / _R;  _fr.cy = _fr.cy / _R
 
         # Live odometry state (mirrors OrbbecRosBagFrameSource)
         self._pose_source = "open3d_odometry_live"

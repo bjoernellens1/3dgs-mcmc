@@ -1,0 +1,17 @@
+Optimizing /workspace/3dgs-mcmc/output/smoke_geometry_first
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1423, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1209, in streaming_training
+    _p.grad[_old] = 0.0
+    ~~~~~~~^^^^^^
+TypeError: Cannot assign to a sparse tensor
+Optimizing /workspace/3dgs-mcmc/output/smoke_geometry_first
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+Optimizing /workspace/3dgs-mcmc/output/smoke_geometry_first
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)

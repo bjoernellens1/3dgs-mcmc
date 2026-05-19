@@ -1,0 +1,14 @@
+Optimizing output/test_replica_room_0_loader_smoke
+Output folder: output/test_replica_room_0_loader_smoke [11/05 06:54:44]
+Found Replica mesh scene layout. [11/05 06:54:44]
+Loaded Replica mesh scene: cameras=8 init_points=5000 mesh_vertices=954492 [11/05 06:54:45]
+Loading Training Cameras [11/05 06:54:45]
+Loading Test Cameras [11/05 06:54:46]
+Number of points at initialisation :  5000 [11/05 06:54:46]
+[parallelism] profile=off model_layout=legacy optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [11/05 06:54:47]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [11/05 06:54:47]
+Training progress:   0%|          | 0/3 [00:00<?, ?it/s]Training progress:   0%|          | 0/3 [00:03<?, ?it/s]
+
+[ITER 3] Saving Gaussians [11/05 06:54:50]
+
+Training complete. [11/05 06:54:50]

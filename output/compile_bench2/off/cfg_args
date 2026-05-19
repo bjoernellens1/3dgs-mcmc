@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/data/mipnerf360_v2_dataset/bicycle', model_path='output/compile_bench2/off', images='images', resolution=4, white_background=False, data_device='cuda', eval=False, cap_max=5900000, init_type='sfm')

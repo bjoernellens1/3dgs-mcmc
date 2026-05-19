@@ -1,0 +1,66 @@
+Optimizing output/bicycle_reviewfix_defaults_6k
+Output folder: output/bicycle_reviewfix_defaults_6k [07/05 14:49:08]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [07/05 14:49:09]
+Loading Training Cameras [07/05 14:49:09]
+Loading Test Cameras [07/05 14:49:37]
+Number of points at initialisation :  54275 [07/05 14:49:37]
+[parallelism] profile=safe optimizer=selective_adam sparse_grad=True sh_update_interval=16 [07/05 14:49:39]
+[progress] iter=500 loss=0.2853095 it/s=21.80 sh=0 [07/05 14:50:02]
+
+[ITER 500] Saving Gaussians [07/05 14:50:02]
+[geo] iter=500 N=54275 LSOM=0.0113 OSF=0.0000 mean_sup=0.1577 [07/05 14:50:02]
+[taming-budget] start=54275 final=300000 steps=49 mode=final_count [07/05 14:50:20]
+[taming-stats] requiring exact renderer accumulators; scoring raises on approximation fallback [07/05 14:50:20]
+[progress] iter=1000 loss=0.2016349 it/s=26.57 sh=1 [07/05 14:50:21]
+
+[ITER 1000] Saving Gaussians [07/05 14:50:21]
+[geo] iter=1000 N=54275 LSOM=0.0152 OSF=0.0003 mean_sup=0.1478 [07/05 14:50:21]
+[taming-taming-grow] iter=1000 target=64202 clone=8022 split=1905 prune=31525 N=54275->32677 [07/05 14:50:21]
+[progress] iter=1500 loss=0.1970872 it/s=27.67 sh=1 [07/05 14:50:39]
+[geo] iter=1500 N=32677 LSOM=0.0006 OSF=0.0000 mean_sup=0.3322 [07/05 14:50:39]
+[taming-taming-grow] iter=1500 target=73925 clone=15206 split=5169 prune=3863 N=32677->49189 [07/05 14:50:39]
+[progress] iter=2000 loss=0.1789813 it/s=27.55 sh=2 [07/05 14:50:57]
+
+[ITER 2000] Saving Gaussians [07/05 14:50:57]
+[geo] iter=2000 N=49189 LSOM=0.0176 OSF=0.0019 mean_sup=0.3515 [07/05 14:50:57]
+[taming-taming-grow] iter=2000 target=83443 clone=9814 split=7325 prune=6491 N=49189->59837 [07/05 14:50:57]
+[progress] iter=2500 loss=0.1855848 it/s=26.33 sh=2 [07/05 14:51:16]
+[geo] iter=2500 N=59837 LSOM=0.0049 OSF=0.0006 mean_sup=0.3441 [07/05 14:51:16]
+[taming-taming-grow] iter=2500 target=92756 clone=23182 split=9737 prune=4734 N=59837->88022 [07/05 14:51:16]
+[progress] iter=3000 loss=0.1457593 it/s=26.20 sh=3 [07/05 14:51:35]
+
+[ITER 3000] Saving Gaussians [07/05 14:51:35]
+[geo] iter=3000 N=88022 LSOM=0.0018 OSF=0.0000 mean_sup=0.3367 [07/05 14:51:36]
+[taming-taming-grow] iter=3000 target=101864 clone=10204 split=3638 prune=8465 N=88022->93399 [07/05 14:51:36]
+
+[ITER 3000] Saving Checkpoint [07/05 14:51:36]
+[progress] iter=3500 loss=0.1543464 it/s=21.50 sh=3 [07/05 14:51:58]
+[geo] iter=3500 N=93399 LSOM=0.0082 OSF=0.0012 mean_sup=0.3940 [07/05 14:51:58]
+[taming-taming-grow] iter=3500 target=110768 clone=13824 split=3545 prune=0 N=93399->110768 [07/05 14:51:59]
+[progress] iter=4000 loss=0.1574413 it/s=21.08 sh=3 [07/05 14:52:22]
+
+[ITER 4000] Saving Gaussians [07/05 14:52:22]
+[geo] iter=4000 N=110768 LSOM=0.0007 OSF=0.0001 mean_sup=0.3810 [07/05 14:52:23]
+[taming-taming-grow] iter=4000 target=119467 clone=6893 split=1806 prune=0 N=110768->119467 [07/05 14:52:23]
+[progress] iter=4500 loss=0.1575863 it/s=20.65 sh=3 [07/05 14:52:46]
+[geo] iter=4500 N=119467 LSOM=0.0007 OSF=0.0001 mean_sup=0.3782 [07/05 14:52:46]
+[taming-taming-grow] iter=4500 target=127962 clone=6579 split=1916 prune=0 N=119467->127962 [07/05 14:52:46]
+[progress] iter=5000 loss=0.1420732 it/s=20.53 sh=3 [07/05 14:53:11]
+
+[ITER 5000] Saving Gaussians [07/05 14:53:11]
+[geo] iter=5000 N=127962 LSOM=0.0016 OSF=0.0003 mean_sup=0.3703 [07/05 14:53:11]
+[taming-taming-grow] iter=5000 target=136252 clone=6930 split=1360 prune=0 N=127962->136252 [07/05 14:53:11]
+[progress] iter=5500 loss=0.1312763 it/s=20.00 sh=3 [07/05 14:53:36]
+[geo] iter=5500 N=136252 LSOM=0.0107 OSF=0.0027 mean_sup=0.3976 [07/05 14:53:36]
+[taming-taming-grow] iter=5500 target=144337 clone=5567 split=2518 prune=0 N=136252->144337 [07/05 14:53:36]
+
+[ITER 6000] Evaluating train: L1 0.05035534799098969 PSNR 21.741969680786134 [07/05 14:54:05]
+[progress] iter=6000 loss=0.1375015 it/s=17.32 sh=3 [07/05 14:54:05]
+
+[ITER 6000] Saving Gaussians [07/05 14:54:05]
+[geo] iter=6000 N=144337 LSOM=0.0039 OSF=0.0012 mean_sup=0.4019 [07/05 14:54:05]
+[taming-taming-grow] iter=6000 target=152217 clone=6002 split=1878 prune=0 N=144337->152217 [07/05 14:54:05]
+
+[ITER 6000] Saving Checkpoint [07/05 14:54:05]
+
+Training complete. [07/05 14:54:05]

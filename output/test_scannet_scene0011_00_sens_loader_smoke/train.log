@@ -1,0 +1,15 @@
+Optimizing output/test_scannet_scene0011_00_sens_loader_smoke
+Output folder: output/test_scannet_scene0011_00_sens_loader_smoke [11/05 06:33:24]
+Found ScanNet RGB-D scene layout. [11/05 06:33:24]
+Loaded ScanNet .sens cameras: 40 of 2374 frames (skipped invalid/missing frames: 0) [11/05 06:33:29]
+Generating ScanNet RGB-D init point cloud (stride=16, frames=10, max=5000)... [11/05 06:33:29]
+Loading Training Cameras [11/05 06:33:29]
+Loading Test Cameras [11/05 06:33:29]
+Number of points at initialisation :  5000 [11/05 06:33:29]
+[parallelism] profile=off model_layout=legacy optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [11/05 06:33:30]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [11/05 06:33:30]
+Training progress:   0%|          | 0/3 [00:00<?, ?it/s]Training progress:   0%|          | 0/3 [00:05<?, ?it/s]
+
+[ITER 3] Saving Gaussians [11/05 06:33:36]
+
+Training complete. [11/05 06:33:36]

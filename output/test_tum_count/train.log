@@ -1,0 +1,12 @@
+Optimizing output/test_tum_count
+[streaming] TUM: 596 frames loaded from /data/TUM/rgbd_dataset_freiburg1_desk [12/05 16:25:27]
+[streaming] Bootstrapping from 5 frame(s)... [12/05 16:25:27]
+Number of points at initialisation :  19877 [12/05 16:25:28]
+[streaming] Initialised 19877 Gaussians from 5 frames, scene radius=1.255 [12/05 16:25:28]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [12/05 16:25:28]
+[streaming] Starting: strategy=gsplat_energy_mcmc optimizer=selective_adam sparse=True steps_per_frame=50 wallclock=False [12/05 16:25:28]
+Streaming training: 0it [00:00, ?it/s]
+[streaming] Training complete. [12/05 16:25:28]
+Streaming training: 0it [00:00, ?it/s]
+
+Training complete. [12/05 16:25:28]

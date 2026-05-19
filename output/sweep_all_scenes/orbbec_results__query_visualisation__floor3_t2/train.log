@@ -1,0 +1,26 @@
+Optimizing output/sweep_all_scenes/orbbec_results__query_visualisation__floor3_t2
+[streaming] Camera profile 'orbbec_femto_bolt':
+  streaming_min_depth: 0.1 -> 0.3
+  streaming_max_depth: 8.0 -> 5.0
+  streaming_depth_consistency_thresh: 0.05 -> 0.03
+  streaming_depth_edge_threshold: 0.02 -> 0.015
+  streaming_depth_stride: 8 -> 4
+  streaming_depth_loss_weight: 0.05 -> 0.1
+  streaming_free_space_loss_weight: 0.0 -> 0.01
+  streaming_max_new_gaussians_per_frame: 1000 -> 2000 [17/05 21:47:49]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1263, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1105, in make_frame_source
+    return OrbbecRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 866, in __init__
+    if abs(depth_ts[di] - color_ts) <= sync_ns:
+           ~~~~~~~~^^^^
+IndexError: index -1 is out of bounds for axis 0 with size 0

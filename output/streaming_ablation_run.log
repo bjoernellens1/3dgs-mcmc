@@ -1,0 +1,76 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0mtime="2026-05-12T19:59:17+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+
+======================================================
+Experiment A: mcmc_noise_stop_iter=2000
+======================================================
+Optimizing output/ablation_A_noise_stop_2000
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+
+======================================================
+Experiment B: noise_lr=50000 (10x reduction)
+======================================================
+Optimizing output/ablation_B_low_noise_lr
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+
+======================================================
+Experiment C: streaming_global_replay_ratio=0.3
+======================================================
+Optimizing output/ablation_C_replay_03
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+
+======================================================
+Experiment D1: spf=50, 100 frames, 7000 iters
+======================================================
+Optimizing output/ablation_D1_spf50_100frames
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+
+======================================================
+Experiment D2: spf=150, 100 frames, 17000 iters
+======================================================
+Optimizing output/ablation_D2_spf150_100frames
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+
+======================================================
+ALL DONE — 5 ablation runs completed
+
+Results:
+  output/ablation_A_noise_stop_2000:
+    mean_test_psnr=4.39 dB  min=4.34  max=4.43
+  output/ablation_A_noise_stop_2000:
+    mean_test_psnr=13.63 dB  min=12.09  max=15.42
+  output/ablation_A_noise_stop_2000:
+    mean_test_psnr=15.30 dB  min=15.00  max=15.55
+  output/ablation_B_low_noise_lr:
+    mean_test_psnr=4.39 dB  min=4.34  max=4.43
+  output/ablation_B_low_noise_lr:
+    mean_test_psnr=13.80 dB  min=11.88  max=16.13
+  output/ablation_B_low_noise_lr:
+    mean_test_psnr=11.91 dB  min=11.87  max=11.96
+  output/ablation_C_replay_03:
+    mean_test_psnr=4.39 dB  min=4.34  max=4.43
+  output/ablation_C_replay_03:
+    mean_test_psnr=14.10 dB  min=12.24  max=15.15
+  output/ablation_C_replay_03:
+    mean_test_psnr=14.26 dB  min=14.18  max=14.33
+  output/ablation_D1_spf50_100frames:
+    mean_test_psnr=4.39 dB  min=4.34  max=4.43
+  output/ablation_D1_spf50_100frames:
+    mean_test_psnr=12.92 dB  min=8.99  max=16.97
+  output/ablation_D1_spf50_100frames:
+    mean_test_psnr=12.80 dB  min=12.67  max=12.89
+  output/ablation_D2_spf150_100frames:
+    mean_test_psnr=4.39 dB  min=4.34  max=4.43
+  output/ablation_D2_spf150_100frames:
+    mean_test_psnr=15.25 dB  min=9.61  max=20.60
+  output/ablation_D2_spf150_100frames:
+    mean_test_psnr=12.07 dB  min=11.95  max=12.15
+
+Baseline (bootstrap_vs_iter4000): 13.64 dB mean test PSNR
+======================================================

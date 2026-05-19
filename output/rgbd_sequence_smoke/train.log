@@ -1,0 +1,15 @@
+Optimizing output/rgbd_sequence_smoke
+Output folder: output/rgbd_sequence_smoke [10/05 08:06:20]
+Found generic RGB-D sequence layout. [10/05 08:06:20]
+Loaded RGB-D sequence cameras: 6 skipped=0 [10/05 08:06:20]
+Loading Training Cameras [10/05 08:06:20]
+Loading Test Cameras [10/05 08:06:21]
+Number of points at initialisation :  192 [10/05 08:06:21]
+[parallelism] profile=off model_layout=gsplat optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [10/05 08:06:22]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [10/05 08:06:22]
+Training progress:   0%|          | 0/2 [00:00<?, ?it/s]Training progress:   0%|          | 0/2 [00:03<?, ?it/s]
+
+[ITER 2] Saving Gaussians [10/05 08:06:25]
+[gsplat-mcmc] iter=2 N=192->192 lr=4.39865e-06 [10/05 08:06:25]
+
+Training complete. [10/05 08:06:25]

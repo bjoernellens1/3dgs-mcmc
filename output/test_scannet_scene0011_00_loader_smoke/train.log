@@ -1,0 +1,12 @@
+Optimizing output/test_scannet_scene0011_00_loader_smoke
+Output folder: output/test_scannet_scene0011_00_loader_smoke [11/05 06:30:46]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1268, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 249, in training
+    scene = Scene(dataset, gaussians)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/scene/__init__.py", line 109, in __init__
+    assert False, "Could not recognize scene type!"
+           ^^^^^
+AssertionError: Could not recognize scene type!

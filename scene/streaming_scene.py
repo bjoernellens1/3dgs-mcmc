@@ -257,7 +257,14 @@ class StreamingScene:
                 if depth_raw is None:
                     continue
                 depth = np.asarray(depth_raw)
-                rgb = np.array(load_frame_rgb(frame)).astype(np.float32) / 255.0
+                _target = (int(frame.height), int(frame.width))
+                if depth.shape[:2] != _target:
+                    depth = np.array(_Image.fromarray(depth).resize(
+                        (_target[1], _target[0]), _Image.NEAREST))
+                rgb_pil = load_frame_rgb(frame)
+                if rgb_pil.size != (_target[1], _target[0]):
+                    rgb_pil = rgb_pil.resize((_target[1], _target[0]), _Image.BILINEAR)
+                rgb = np.array(rgb_pil).astype(np.float32) / 255.0
             except Exception:
                 continue
             z = depth_to_meters(depth, frame.depth_scale)
@@ -482,6 +489,9 @@ class StreamingScene:
         from utils.streaming_frames import load_frame_rgb
         R, T = c2w_to_camera_rt(frame.c2w)
         image = load_frame_rgb(frame)
+        _target = (int(frame.width), int(frame.height))
+        if image.size != _target:
+            image = image.resize(_target, Image.BILINEAR)
         orig_w, orig_h = image.size
         cam_info = CameraInfo(
             uid=frame.index,

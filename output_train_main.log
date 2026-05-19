@@ -1,0 +1,47 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0mOptimizing output/kitchen_icp_eval_test
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1394, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1804, in make_frame_source
+    return OrbbecRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1012, in __init__
+    odom_poses, odom_stats = self._estimate_open3d_odometry(
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 1309, in _estimate_open3d_odometry
+    import open3d as o3d
+  File "/opt/venv/lib/python3.12/site-packages/open3d/__init__.py", line 127, in <module>
+    import open3d.visualization
+  File "/opt/venv/lib/python3.12/site-packages/open3d/visualization/__init__.py", line 19, in <module>
+    from .draw_plotly import draw_plotly
+  File "/opt/venv/lib/python3.12/site-packages/open3d/visualization/draw_plotly.py", line 12, in <module>
+    from dash import html
+  File "/opt/venv/lib/python3.12/site-packages/dash/__init__.py", line 38, in <module>
+    from .dash import (  # noqa: F401,E402
+  File "/opt/venv/lib/python3.12/site-packages/dash/dash.py", line 83, in <module>
+    from ._jupyter import jupyter_dash, JupyterDisplayMode
+  File "/opt/venv/lib/python3.12/site-packages/dash/_jupyter.py", line 18, in <module>
+    from IPython import get_ipython  # type: ignore[attr-defined]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/IPython/__init__.py", line 56, in <module>
+    from .terminal.embed import embed
+  File "/opt/venv/lib/python3.12/site-packages/IPython/terminal/embed.py", line 16, in <module>
+    from IPython.terminal.interactiveshell import TerminalInteractiveShell
+  File "/opt/venv/lib/python3.12/site-packages/IPython/terminal/interactiveshell.py", line 11, in <module>
+    from IPython.core.kitty import (
+  File "/opt/venv/lib/python3.12/site-packages/IPython/core/kitty.py", line 36, in <module>
+    supports_kitty_graphics = _supports_kitty_graphics()
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/IPython/core/kitty.py", line 13, in _supports_kitty_graphics
+    if not sys.stdout.isatty():
+           ^^^^^^^^^^^^^^^^^
+AttributeError: 'F' object has no attribute 'isatty'
+Error: executing /usr/bin/podman-compose run --rm train python train.py -s /mnt/cps_persistent1_shared/datasets/christian/embedding_map/bags/slam/kitchen1_slam --config configs/kitchen.json --streaming_replay --orbbec_pose_source open3d_odometry --orbbec_open3d_odom_method icp --model_path output/kitchen_icp_eval_test --streaming_eval_hold 8 --cap_max 500000 --streaming_max_frames 100: exit status 1

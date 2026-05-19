@@ -1,0 +1,28 @@
+Optimizing output/scannet_scene0310_01_smoke
+Output folder: output/scannet_scene0310_01_smoke [10/05 09:39:02]
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1268, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 249, in training
+    scene = Scene(dataset, gaussians)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/scene/__init__.py", line 107, in __init__
+    assert False, "Could not recognize scene type!"
+           ^^^^^
+AssertionError: Could not recognize scene type!
+Optimizing output/scannet_scene0310_01_smoke
+Output folder: output/scannet_scene0310_01_smoke [10/05 09:39:21]
+Found ScanNet RGB-D scene layout. [10/05 09:39:21]
+Loaded ScanNet cameras: 1 (skipped invalid/missing poses: 0) [10/05 09:39:21]
+Generating ScanNet RGB-D init point cloud (stride=8, frames=20, max=50000)... [10/05 09:39:21]
+Loading Training Cameras [10/05 09:39:21]
+Loading Test Cameras [10/05 09:39:21]
+Number of points at initialisation :  3994 [10/05 09:39:21]
+[parallelism] profile=off model_layout=gsplat optimizer=adam sparse_grad=False sparse_policy=active_set sh_backend=python sh_update_interval=1 [10/05 09:39:22]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [10/05 09:39:22]
+Training progress:   0%|          | 0/2 [00:00<?, ?it/s]Training progress:   0%|          | 0/2 [00:03<?, ?it/s]
+
+[ITER 2] Saving Gaussians [10/05 09:39:26]
+[gsplat-mcmc] iter=2 N=3994->3994 lr=0 [10/05 09:39:26]
+
+Training complete. [10/05 09:39:26]

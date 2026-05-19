@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/data/mipnerf360_v2_dataset/bicycle', model_path='output/bench-bicycle-gsplat-energy-scheduled-6000-cap200k', images='images', resolution=-1, white_background=False, data_device='cuda', eval=False, cap_max=200000, init_type='sfm', model_layout='gsplat')

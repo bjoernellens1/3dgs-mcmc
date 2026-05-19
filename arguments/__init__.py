@@ -471,6 +471,7 @@ class StreamingParams(ParamGroup):
         # Save estimated trajectory as TUM .txt + PNG plot + ATE/RPE metrics
         # to <model_path>/trajectory_eval/. Default on.
         self.streaming_trajectory_eval = True
+        self.streaming_resolution = 1  # integer divisor: scale input frames before odometry and splatting
         super().__init__(parser, "Streaming Parameters")
 
 

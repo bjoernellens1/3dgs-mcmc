@@ -424,7 +424,13 @@ def insert_gaussians_from_frame(
     try:
         from utils.streaming_frames import load_frame_depth_np, load_frame_rgb
         depth = np.asarray(load_frame_depth_np(frame))
-        rgb = np.array(load_frame_rgb(frame)).astype(np.float32) / 255.0
+        _tgt_h, _tgt_w = int(frame.height), int(frame.width)
+        if depth.shape[:2] != (_tgt_h, _tgt_w):
+            depth = np.array(_Image.fromarray(depth).resize((_tgt_w, _tgt_h), _Image.NEAREST))
+        rgb_pil = load_frame_rgb(frame)
+        if rgb_pil.size != (_tgt_w, _tgt_h):
+            rgb_pil = rgb_pil.resize((_tgt_w, _tgt_h), _Image.BILINEAR)
+        rgb = np.array(rgb_pil).astype(np.float32) / 255.0
     except Exception:
         return ({} if _collect_only else 0), _stats
 

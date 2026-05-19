@@ -1,0 +1,143 @@
+comparison_tag=20260506_170027
+===== mcmc -> output/bicycle_4k_mcmc_sfm_20260506_170027 =====
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0mtime="2026-05-06T17:00:27+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/bicycle_4k_mcmc_sfm_20260506_170027
+Output folder: output/bicycle_4k_mcmc_sfm_20260506_170027 [06/05 15:00:29]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [06/05 15:00:29]
+Loading Training Cameras [06/05 15:00:29]
+Loading Test Cameras [06/05 15:00:57]
+Number of points at initialisation :  54275 [06/05 15:00:57]
+[progress] iter=500 loss=0.4287591 it/s=24.22 [06/05 15:01:20]
+
+[ITER 500] Saving Gaussians [06/05 15:01:20]
+[geo] iter=500 N=54275 LSOM=0.0037 OSF=0.0000 mean_sup=0.1287 [06/05 15:01:20]
+[progress] iter=1000 loss=0.2476805 it/s=28.38 [06/05 15:01:37]
+
+[ITER 1000] Saving Gaussians [06/05 15:01:37]
+[geo] iter=1000 N=67702 LSOM=0.0345 OSF=0.0024 mean_sup=0.0940 [06/05 15:01:37]
+[progress] iter=1500 loss=0.2254799 it/s=27.76 [06/05 15:01:55]
+[geo] iter=1500 N=67702 LSOM=0.0001 OSF=0.0000 mean_sup=0.4074 [06/05 15:01:55]
+[progress] iter=2000 loss=0.2073049 it/s=27.58 [06/05 15:02:13]
+
+[ITER 2000] Saving Gaussians [06/05 15:02:13]
+[geo] iter=2000 N=67702 LSOM=0.0000 OSF=0.0000 mean_sup=0.5128 [06/05 15:02:14]
+
+[ITER 2000] Saving Checkpoint [06/05 15:02:14]
+[progress] iter=2500 loss=0.3020986 it/s=26.54 [06/05 15:02:32]
+[geo] iter=2500 N=67702 LSOM=0.0000 OSF=0.0000 mean_sup=0.5739 [06/05 15:02:32]
+[progress] iter=3000 loss=0.2080920 it/s=27.21 [06/05 15:02:51]
+[geo] iter=3000 N=67702 LSOM=0.0000 OSF=0.0000 mean_sup=0.5892 [06/05 15:02:51]
+[progress] iter=3500 loss=0.2530616 it/s=24.46 [06/05 15:03:11]
+[geo] iter=3500 N=74318 LSOM=0.0000 OSF=0.0000 mean_sup=0.5253 [06/05 15:03:11]
+
+[ITER 4000] Evaluating train: L1 0.1104542225599289 PSNR 16.486388397216796 [06/05 15:03:34]
+[progress] iter=4000 loss=0.3426555 it/s=21.59 [06/05 15:03:34]
+
+[ITER 4000] Saving Gaussians [06/05 15:03:34]
+[geo] iter=4000 N=74318 LSOM=0.0000 OSF=0.0000 mean_sup=0.7347 [06/05 15:03:34]
+
+[ITER 4000] Saving Checkpoint [06/05 15:03:34]
+
+Training complete. [06/05 15:03:34]
+===== taming -> output/bicycle_4k_taming_sfm_20260506_170027 =====
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0mtime="2026-05-06T17:03:36+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/bicycle_4k_taming_sfm_20260506_170027
+Output folder: output/bicycle_4k_taming_sfm_20260506_170027 [06/05 15:03:37]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [06/05 15:03:37]
+Loading Training Cameras [06/05 15:03:37]
+Loading Test Cameras [06/05 15:04:04]
+Number of points at initialisation :  54275 [06/05 15:04:04]
+[progress] iter=500 loss=0.4264272 it/s=24.29 [06/05 15:04:26]
+
+[ITER 500] Saving Gaussians [06/05 15:04:26]
+[geo] iter=500 N=54275 LSOM=0.0014 OSF=0.0000 mean_sup=0.2603 [06/05 15:04:26]
+[taming-budget] start=54275 final=5900000 steps=245 mode=final_count [06/05 15:04:29]
+[progress] iter=1000 loss=0.2594364 it/s=27.19 [06/05 15:04:44]
+
+[ITER 1000] Saving Gaussians [06/05 15:04:44]
+[geo] iter=1000 N=195684 LSOM=0.0152 OSF=0.0001 mean_sup=0.3326 [06/05 15:04:45]
+[taming-taming-grow] iter=1000 target=290441 clone=91486 split=3271 prune=42083 N=195684->248358 [06/05 15:04:45]
+[progress] iter=1500 loss=0.2236272 it/s=17.86 [06/05 15:05:12]
+[geo] iter=1500 N=442239 LSOM=0.0102 OSF=0.0000 mean_sup=0.4411 [06/05 15:05:12]
+[taming-taming-grow] iter=1500 target=521738 clone=77218 split=2281 prune=36766 N=442239->484972 [06/05 15:05:12]
+[progress] iter=2000 loss=0.2002297 it/s=13.61 [06/05 15:05:49]
+
+[ITER 2000] Saving Gaussians [06/05 15:05:49]
+[geo] iter=2000 N=664362 LSOM=0.0058 OSF=0.0000 mean_sup=0.4843 [06/05 15:05:51]
+[taming-taming-grow] iter=2000 target=748166 clone=81248 split=2556 prune=34099 N=664362->714067 [06/05 15:05:51]
+
+[ITER 2000] Saving Checkpoint [06/05 15:05:51]
+[progress] iter=2500 loss=0.1817787 it/s=7.68 [06/05 15:06:54]
+[geo] iter=2500 N=903124 LSOM=0.0004 OSF=0.0000 mean_sup=0.5314 [06/05 15:06:54]
+[taming-taming-grow] iter=2500 target=969724 clone=64904 split=1696 prune=19009 N=903124->950715 [06/05 15:06:54]
+[progress] iter=3000 loss=0.1438482 it/s=6.73 [06/05 15:08:08]
+[geo] iter=3000 N=1129952 LSOM=0.0054 OSF=0.0002 mean_sup=0.5952 [06/05 15:08:08]
+[taming-taming-grow] iter=3000 target=1186412 clone=55272 split=1188 prune=13046 N=1129952->1173366 [06/05 15:08:08]
+[progress] iter=3500 loss=0.1563073 it/s=3.60 [06/05 15:10:27]
+[geo] iter=3500 N=1356257 LSOM=0.0002 OSF=0.0000 mean_sup=0.5884 [06/05 15:10:27]
+[taming-taming-grow] iter=3500 target=1398232 clone=41166 split=809 prune=0 N=1356257->1398232 [06/05 15:10:27]
+
+[ITER 4000] Evaluating train: L1 0.06241436824202538 PSNR 20.12111625671387 [06/05 15:13:08]
+[progress] iter=4000 loss=0.1403943 it/s=3.11 [06/05 15:13:08]
+
+[ITER 4000] Saving Gaussians [06/05 15:13:08]
+[geo] iter=4000 N=1564181 LSOM=0.0004 OSF=0.0000 mean_sup=0.5962 [06/05 15:13:13]
+[taming-taming-grow] iter=4000 target=1605182 clone=40105 split=896 prune=0 N=1564181->1605182 [06/05 15:13:13]
+
+[ITER 4000] Saving Checkpoint [06/05 15:13:13]
+
+Training complete. [06/05 15:13:14]
+===== hybrid -> output/bicycle_4k_hybrid_sfm_20260506_170027 =====
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0mtime="2026-05-06T17:13:15+02:00" level=warning msg="The input device is not a TTY. The --tty and --interactive flags might not work properly"
+Optimizing output/bicycle_4k_hybrid_sfm_20260506_170027
+Output folder: output/bicycle_4k_hybrid_sfm_20260506_170027 [06/05 15:13:16]
+Reading camera 1/194Reading camera 2/194Reading camera 3/194Reading camera 4/194Reading camera 5/194Reading camera 6/194Reading camera 7/194Reading camera 8/194Reading camera 9/194Reading camera 10/194Reading camera 11/194Reading camera 12/194Reading camera 13/194Reading camera 14/194Reading camera 15/194Reading camera 16/194Reading camera 17/194Reading camera 18/194Reading camera 19/194Reading camera 20/194Reading camera 21/194Reading camera 22/194Reading camera 23/194Reading camera 24/194Reading camera 25/194Reading camera 26/194Reading camera 27/194Reading camera 28/194Reading camera 29/194Reading camera 30/194Reading camera 31/194Reading camera 32/194Reading camera 33/194Reading camera 34/194Reading camera 35/194Reading camera 36/194Reading camera 37/194Reading camera 38/194Reading camera 39/194Reading camera 40/194Reading camera 41/194Reading camera 42/194Reading camera 43/194Reading camera 44/194Reading camera 45/194Reading camera 46/194Reading camera 47/194Reading camera 48/194Reading camera 49/194Reading camera 50/194Reading camera 51/194Reading camera 52/194Reading camera 53/194Reading camera 54/194Reading camera 55/194Reading camera 56/194Reading camera 57/194Reading camera 58/194Reading camera 59/194Reading camera 60/194Reading camera 61/194Reading camera 62/194Reading camera 63/194Reading camera 64/194Reading camera 65/194Reading camera 66/194Reading camera 67/194Reading camera 68/194Reading camera 69/194Reading camera 70/194Reading camera 71/194Reading camera 72/194Reading camera 73/194Reading camera 74/194Reading camera 75/194Reading camera 76/194Reading camera 77/194Reading camera 78/194Reading camera 79/194Reading camera 80/194Reading camera 81/194Reading camera 82/194Reading camera 83/194Reading camera 84/194Reading camera 85/194Reading camera 86/194Reading camera 87/194Reading camera 88/194Reading camera 89/194Reading camera 90/194Reading camera 91/194Reading camera 92/194Reading camera 93/194Reading camera 94/194Reading camera 95/194Reading camera 96/194Reading camera 97/194Reading camera 98/194Reading camera 99/194Reading camera 100/194Reading camera 101/194Reading camera 102/194Reading camera 103/194Reading camera 104/194Reading camera 105/194Reading camera 106/194Reading camera 107/194Reading camera 108/194Reading camera 109/194Reading camera 110/194Reading camera 111/194Reading camera 112/194Reading camera 113/194Reading camera 114/194Reading camera 115/194Reading camera 116/194Reading camera 117/194Reading camera 118/194Reading camera 119/194Reading camera 120/194Reading camera 121/194Reading camera 122/194Reading camera 123/194Reading camera 124/194Reading camera 125/194Reading camera 126/194Reading camera 127/194Reading camera 128/194Reading camera 129/194Reading camera 130/194Reading camera 131/194Reading camera 132/194Reading camera 133/194Reading camera 134/194Reading camera 135/194Reading camera 136/194Reading camera 137/194Reading camera 138/194Reading camera 139/194Reading camera 140/194Reading camera 141/194Reading camera 142/194Reading camera 143/194Reading camera 144/194Reading camera 145/194Reading camera 146/194Reading camera 147/194Reading camera 148/194Reading camera 149/194Reading camera 150/194Reading camera 151/194Reading camera 152/194Reading camera 153/194Reading camera 154/194Reading camera 155/194Reading camera 156/194Reading camera 157/194Reading camera 158/194Reading camera 159/194Reading camera 160/194Reading camera 161/194Reading camera 162/194Reading camera 163/194Reading camera 164/194Reading camera 165/194Reading camera 166/194Reading camera 167/194Reading camera 168/194Reading camera 169/194Reading camera 170/194Reading camera 171/194Reading camera 172/194Reading camera 173/194Reading camera 174/194Reading camera 175/194Reading camera 176/194Reading camera 177/194Reading camera 178/194Reading camera 179/194Reading camera 180/194Reading camera 181/194Reading camera 182/194Reading camera 183/194Reading camera 184/194Reading camera 185/194Reading camera 186/194Reading camera 187/194Reading camera 188/194Reading camera 189/194Reading camera 190/194Reading camera 191/194Reading camera 192/194Reading camera 193/194Reading camera 194/194 [06/05 15:13:16]
+Loading Training Cameras [06/05 15:13:16]
+Loading Test Cameras [06/05 15:13:43]
+Number of points at initialisation :  54275 [06/05 15:13:43]
+[progress] iter=500 loss=0.4278475 it/s=21.95 [06/05 15:14:08]
+
+[ITER 500] Saving Gaussians [06/05 15:14:08]
+[geo] iter=500 N=54275 LSOM=0.0037 OSF=0.0000 mean_sup=0.1287 [06/05 15:14:08]
+[taming-budget] start=54275 final=5900000 steps=245 mode=final_count [06/05 15:14:12]
+[progress] iter=1000 loss=0.2568306 it/s=22.57 [06/05 15:14:30]
+
+[ITER 1000] Saving Gaussians [06/05 15:14:30]
+[geo] iter=1000 N=232846 LSOM=0.0099 OSF=0.0000 mean_sup=0.4081 [06/05 15:14:31]
+[hybrid-taming-grow] iter=1000 target=290441 clone=55774 split=1821 prune=12680 N=232846->277761 [06/05 15:14:31]
+[progress] iter=1500 loss=0.2483964 it/s=16.30 [06/05 15:15:00]
+[geo] iter=1500 N=471929 LSOM=0.0000 OSF=0.0000 mean_sup=0.5238 [06/05 15:15:00]
+[hybrid-taming-grow] iter=1500 target=521738 clone=49203 split=606 prune=4154 N=471929->517584 [06/05 15:15:00]
+[progress] iter=2000 loss=0.2761128 it/s=12.05 [06/05 15:15:42]
+
+[ITER 2000] Saving Gaussians [06/05 15:15:42]
+[geo] iter=2000 N=700472 LSOM=0.0000 OSF=0.0000 mean_sup=0.6369 [06/05 15:15:44]
+[hybrid-taming-grow] iter=2000 target=748166 clone=47403 split=291 prune=2024 N=700472->746142 [06/05 15:15:45]
+
+[ITER 2000] Saving Checkpoint [06/05 15:15:45]
+[progress] iter=2500 loss=0.3051431 it/s=6.86 [06/05 15:16:55]
+[geo] iter=2500 N=925465 LSOM=0.0000 OSF=0.0000 mean_sup=0.6794 [06/05 15:16:55]
+[hybrid-taming-grow] iter=2500 target=969724 clone=44113 split=146 prune=67 N=925465->969657 [06/05 15:16:55]
+[progress] iter=3000 loss=0.2472664 it/s=6.28 [06/05 15:18:14]
+[geo] iter=3000 N=1143452 LSOM=0.0000 OSF=0.0000 mean_sup=0.7601 [06/05 15:18:14]
+[hybrid-taming-grow] iter=3000 target=1186412 clone=42837 split=123 prune=10 N=1143452->1186402 [06/05 15:18:15]
+[progress] iter=3500 loss=0.2387970 it/s=3.49 [06/05 15:20:38]
+[geo] iter=3500 N=1356257 LSOM=0.0000 OSF=0.0000 mean_sup=0.7764 [06/05 15:20:38]
+[hybrid-taming-grow] iter=3500 target=1398232 clone=41878 split=97 prune=0 N=1356257->1398232 [06/05 15:20:38]
+
+[ITER 4000] Evaluating train: L1 0.12432244867086412 PSNR 15.436111640930177 [06/05 15:23:25]
+[progress] iter=4000 loss=0.2356422 it/s=2.99 [06/05 15:23:25]
+
+[ITER 4000] Saving Gaussians [06/05 15:23:25]
+[geo] iter=4000 N=1564181 LSOM=0.0000 OSF=0.0000 mean_sup=0.7951 [06/05 15:23:30]
+[hybrid-taming-grow] iter=4000 target=1605182 clone=40929 split=72 prune=0 N=1564181->1605182 [06/05 15:23:30]
+
+[ITER 4000] Saving Checkpoint [06/05 15:23:30]
+
+Training complete. [06/05 15:23:31]

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Reproduces the training run stored in this output directory.
+# Auto-generated at training start.
+
+python train.py -s /data/scannet/scene0011_00 -r 2 --streaming_replay --densification_strategy gsplat_energy_mcmc --streaming_steps_per_frame 50 --iterations 15000 --mcmc_stop_growth_iter 6000 --streaming_insert_isotropic_scale --streaming_global_replay_ratio 0.4 --streaming_keyframe_window 400 --streaming_free_space_loss_weight 0.01 --streaming_insert_scale_mult 0.5 --streaming_insert_scale_max 0.05 --streaming_insert_normal_scale_ratio 0.15 --streaming_provisional_max_age 20 --streaming_eval_hold 8 --streaming_depth_loss_weight 0.05 --cap_max 200000 --scannet_frame_stride 8 --streaming_global_reservoir_stride 4 --densify_until_iter 6000 --test_iterations 1000 3000 5000 7000 9000 11000 13000 15000 -m /workspace/3dgs-mcmc/output/scannet_scene0011_fullwin
