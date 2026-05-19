@@ -433,7 +433,7 @@ class StreamingParams(ParamGroup):
         # Separate from H9 provisional anchor; covers the multi-frame seed geometry
         # that the optimizer would otherwise slide under photometric gradient.
         # Weight decays linearly to zero over bootstrap_anchor_decay_steps iterations.
-        self.streaming_bootstrap_anchor_weight = 0.0
+        self.streaming_bootstrap_anchor_weight = 1.0
         self.streaming_bootstrap_anchor_decay_steps = 2000
         # Bootstrap motion diagnostics (off by default; useful for early geometry drift).
         self.streaming_debug_bootstrap_motion = False
