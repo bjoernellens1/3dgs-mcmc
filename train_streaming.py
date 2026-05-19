@@ -27,6 +27,8 @@ import queue
 import sys
 import threading
 import time
+
+from streaming.save_worker import AsyncSaveWorker as _AsyncSaveWorker  # noqa: E402
 from argparse import Namespace
 from typing import Optional
 
@@ -131,38 +133,6 @@ def _apply_camera_profile(args) -> None:
         print(f"[streaming] Camera profile '{profile}':\n" + "\n".join(applied), flush=True)
     else:
         print(f"[streaming] Camera profile '{profile}': no default parameters to override.", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Async save worker (self-contained copy so train_streaming doesn't import
-# from train.py, which is __main__ and cannot be cleanly imported).
-# ---------------------------------------------------------------------------
-
-class _AsyncSaveWorker:
-    def __init__(self):
-        self._queue: queue.Queue = queue.Queue(maxsize=4)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while True:
-            task = self._queue.get()
-            if task is None:
-                break
-            try:
-                task()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-            finally:
-                self._queue.task_done()
-
-    def enqueue(self, fn) -> None:
-        self._queue.put(fn)
-
-    def shutdown(self) -> None:
-        self._queue.put(None)
-        self._thread.join(timeout=120)
 
 
 # ---------------------------------------------------------------------------
