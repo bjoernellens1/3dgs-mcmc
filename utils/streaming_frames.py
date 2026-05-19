@@ -872,6 +872,33 @@ class OrbbecRosBagFrameSource:
 
         _msg_ns_zero_warned: set = set()
 
+        def _raw_image_to_png(msg) -> bytes:
+            """Encode a raw sensor_msgs/Image to PNG bytes for PIL compatibility."""
+            from PIL import Image as _PILImage
+            h, w = int(msg.height), int(msg.width)
+            enc = str(getattr(msg, "encoding", "")).lower()
+            raw = bytes(msg.data)
+            if enc in ("16uc1", "16sc1", "mono16"):
+                arr = np.frombuffer(raw, dtype=np.uint16).reshape(h, w)
+                pil = _PILImage.fromarray(arr, mode="I;16")
+            elif enc in ("bgr8", "rgb8", "8uc3"):
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
+                if enc == "bgr8":
+                    arr = arr[:, :, ::-1]  # BGR→RGB
+                pil = _PILImage.fromarray(arr, mode="RGB")
+            elif enc in ("mono8", "8uc1"):
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w)
+                pil = _PILImage.fromarray(arr, mode="L")
+            else:
+                # Unknown encoding — attempt to return raw and let PIL try
+                return raw
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
+            return buf.getvalue()
+
+        def _msg_is_raw_image(msg) -> bool:
+            return bool(getattr(msg, "encoding", None))
+
         def _msg_ns(msg, fallback_ns, topic=""):
             header = getattr(msg, "header", None)
             stamp = getattr(header, "stamp", None)
@@ -915,18 +942,24 @@ class OrbbecRosBagFrameSource:
                 elif topic == color_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     msg_ts = _msg_ns(msg, ts, topic)
-                    color_msgs.append((msg_ts, bytes(msg.data)))
+                    if _msg_is_raw_image(msg):
+                        color_msgs.append((msg_ts, _raw_image_to_png(msg)))
+                    else:
+                        color_msgs.append((msg_ts, bytes(msg.data)))
                 elif topic == depth_topic:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     msg_ts = _msg_ns(msg, ts, topic)
-                    fmt = getattr(msg, "format", "")
-                    if fmt and "png" not in fmt.lower() and "16uc1" not in fmt.lower():
-                        raise RuntimeError(
-                            f"Depth topic '{depth_topic}' has format '{fmt}' — "
-                            "expected lossless PNG/16UC1, not JPEG. "
-                            "JPEG-compressed depth corrupts metric values."
-                        )
-                    depth_msgs.append((msg_ts, bytes(msg.data)))
+                    if _msg_is_raw_image(msg):
+                        depth_msgs.append((msg_ts, _raw_image_to_png(msg)))
+                    else:
+                        fmt = getattr(msg, "format", "")
+                        if fmt and "png" not in fmt.lower() and "16uc1" not in fmt.lower():
+                            raise RuntimeError(
+                                f"Depth topic '{depth_topic}' has format '{fmt}' — "
+                                "expected lossless PNG/16UC1, not JPEG. "
+                                "JPEG-compressed depth corrupts metric values."
+                            )
+                        depth_msgs.append((msg_ts, bytes(msg.data)))
                 elif topic == camera_info_topic and intrinsics is None:
                     msg = typestore.deserialize_cdr(data, conn.msgtype)
                     K = msg.k  # row-major 3×3
