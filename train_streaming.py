@@ -1538,21 +1538,15 @@ def _run_submap_stitch(
 
         print(f"[submap {sm_idx}] done, {sub_gaussians.get_xyz.shape[0]} Gaussians.", flush=True)
 
-        # Save the submap's final parameters (detached)
-        if model_layout == "gsplat":
-            all_gaussian_params.append({
-                k: sub_gaussians.params[k].detach().cpu()
-                for k in ("means", "sh0", "shN", "scales", "quats", "opacities")
-            })
-        else:
-            all_gaussian_params.append({
-                "means": sub_gaussians._xyz.detach().cpu(),
-                "sh0": sub_gaussians._features_dc.detach().cpu(),
-                "shN": sub_gaussians._features_rest.detach().cpu(),
-                "opacities": sub_gaussians._opacity.detach().cpu(),
-                "scales": sub_gaussians._scaling.detach().cpu(),
-                "quats": sub_gaussians._rotation.detach().cpu(),
-            })
+        # Save the submap's final parameters (detached) using layout-agnostic snapshot
+        all_gaussian_params.append({
+            "means":     sub_gaussians.means_param.detach().cpu(),
+            "sh0":       sub_gaussians._features_dc.detach().cpu(),
+            "shN":       sub_gaussians._features_rest.detach().cpu(),
+            "opacities": sub_gaussians.raw_opacities.detach().cpu(),
+            "scales":    sub_gaussians.raw_scales.detach().cpu(),
+            "quats":     sub_gaussians._rotation.detach().cpu(),
+        })
 
         del sub_gaussians
         torch.cuda.empty_cache()
@@ -2304,10 +2298,7 @@ def streaming_training(
                 if promote_mask.any():
                     gaussians.provisional[promote_mask] = False
                     target_op = inverse_sigmoid(torch.tensor(args.streaming_promote_opacity, device="cuda"))
-                    if model_layout == "gsplat":
-                        gaussians.params["opacities"].data[promote_mask] = target_op
-                    else:
-                        gaussians._opacity.data[promote_mask] = target_op
+                    gaussians.raw_opacities.data[promote_mask] = target_op
                     print(f"[streaming] iter={iteration} promoted {promote_mask.sum().item()} points to permanent structure.", flush=True)
 
                 # Compute stale mask but defer the actual prune to after backward.
@@ -2434,16 +2425,10 @@ def streaming_training(
                     dxyz = gaussians.get_xyz[mature_mask] - gaussians.anchor_xyz[mature_mask]
                     L_ma = L_ma + _mature_anchor_xyz_w * dxyz.pow(2).sum(dim=1).mean()
                 if _mature_anchor_scale_w > 0 and hasattr(gaussians, "anchor_scale_log"):
-                    if model_layout == "gsplat":
-                        d_scale = gaussians.params["scales"][mature_mask] - gaussians.anchor_scale_log[mature_mask]
-                    else:
-                        d_scale = gaussians._scaling[mature_mask] - gaussians.anchor_scale_log[mature_mask]
+                    d_scale = gaussians.raw_scales[mature_mask] - gaussians.anchor_scale_log[mature_mask]
                     L_ma = L_ma + _mature_anchor_scale_w * d_scale.pow(2).mean()
                 if _mature_anchor_opacity_w > 0 and hasattr(gaussians, "anchor_opacity_logit"):
-                    if model_layout == "gsplat":
-                        d_op = gaussians.params["opacities"][mature_mask] - gaussians.anchor_opacity_logit[mature_mask]
-                    else:
-                        d_op = gaussians._opacity.squeeze(-1)[mature_mask] - gaussians.anchor_opacity_logit[mature_mask]
+                    d_op = gaussians.raw_opacities[mature_mask] - gaussians.anchor_opacity_logit[mature_mask]
                     L_ma = L_ma + _mature_anchor_opacity_w * d_op.pow(2).mean()
                 loss = loss + L_ma
                 _mature_anchor_val = L_ma.item()
@@ -2521,35 +2506,20 @@ def streaming_training(
                         _young = gaussians.provisional | (_frame_age <= _young_age_frames)
                     _old = ~_young
                     if _old.any():
-                        if model_layout == "gsplat":
-                            for _pg_name in ("means", "scales", "quats"):
-                                _p = gaussians.params.get(_pg_name)
-                                if (_p is not None and _p.grad is not None
-                                        and getattr(_p.grad, "layout", torch.strided) == torch.strided):
-                                    _p.grad[_old] = 0.0
-                        else:
-                            for _param in (gaussians._xyz, gaussians._scaling, gaussians._rotation):
-                                if (_param.grad is not None
-                                        and getattr(_param.grad, "layout", torch.strided) == torch.strided):
-                                    _param.grad[_old] = 0.0
+                        for _param in gaussians.geometry_params:
+                            if (_param.grad is not None
+                                    and getattr(_param.grad, "layout", torch.strided) == torch.strided):
+                                _param.grad[_old] = 0.0
 
             # Lifecycle: zero all gradients for FROZEN Gaussians (lifecycle_state==3)
             if _lifecycle_enabled and hasattr(gaussians, "lifecycle_state"):
                 _frozen_mask = gaussians.lifecycle_state == 3
                 if _frozen_mask.any():
                     with torch.no_grad():
-                        if model_layout == "gsplat":
-                            for _pg_name in ("means", "scales", "quats", "opacities", "sh0", "shN"):
-                                _p = gaussians.params.get(_pg_name)
-                                if (_p is not None and _p.grad is not None
-                                        and getattr(_p.grad, "layout", torch.strided) == torch.strided):
-                                    _p.grad[_frozen_mask] = 0.0
-                        else:
-                            for _param in (gaussians._xyz, gaussians._scaling, gaussians._rotation,
-                                           gaussians._opacity, gaussians._features_dc, gaussians._features_rest):
-                                if (_param.grad is not None
-                                        and getattr(_param.grad, "layout", torch.strided) == torch.strided):
-                                    _param.grad[_frozen_mask] = 0.0
+                        for _param in gaussians.all_learnable_params:
+                            if (_param.grad is not None
+                                    and getattr(_param.grad, "layout", torch.strided) == torch.strided):
+                                _param.grad[_frozen_mask] = 0.0
 
             # Bootstrap means gradient masking: suppress center drift of depth-seeded
             # Gaussians (birth_frame==0) during early training. The fraction of gradients
@@ -2569,18 +2539,11 @@ def streaming_training(
                             _rand = torch.rand(_boot_m.sum(), device=gaussians.get_xyz.device)
                             _zero_boot = _boot_m.clone()
                             _zero_boot[_boot_m] = _rand >= _retain_frac
-                            if model_layout == "gsplat":
-                                _p_means = gaussians.params.get("means")
-                                if _p_means is not None and _p_means.grad is not None:
-                                    # Densify sparse grad before indexing (gsplat sparse-grad mode)
-                                    if getattr(_p_means.grad, "layout", torch.strided) != torch.strided:
-                                        _p_means.grad = _p_means.grad.to_dense().contiguous()
-                                    _p_means.grad[_zero_boot] = 0.0
-                            else:
-                                if gaussians._xyz.grad is not None:
-                                    if getattr(gaussians._xyz.grad, "layout", torch.strided) != torch.strided:
-                                        gaussians._xyz.grad = gaussians._xyz.grad.to_dense().contiguous()
-                                    gaussians._xyz.grad[_zero_boot] = 0.0
+                            _p_means = gaussians.means_param
+                            if _p_means.grad is not None:
+                                if getattr(_p_means.grad, "layout", torch.strided) != torch.strided:
+                                    _p_means.grad = _p_means.grad.to_dense().contiguous()
+                                _p_means.grad[_zero_boot] = 0.0
 
             # Insertion means gradient masking: per-Gaussian stochastic suppression
             # for depth-inserted Gaussians (birth_frame>0) during their first
@@ -2605,17 +2568,11 @@ def streaming_training(
                             )
                             _zero_ins = _within.clone()
                             _zero_ins[_within] = _rand_ins >= _retain_per
-                            if model_layout == "gsplat":
-                                _p_means = gaussians.params.get("means")
-                                if _p_means is not None and _p_means.grad is not None:
-                                    if getattr(_p_means.grad, "layout", torch.strided) != torch.strided:
-                                        _p_means.grad = _p_means.grad.to_dense().contiguous()
-                                    _p_means.grad[_zero_ins] = 0.0
-                            else:
-                                if gaussians._xyz.grad is not None:
-                                    if getattr(gaussians._xyz.grad, "layout", torch.strided) != torch.strided:
-                                        gaussians._xyz.grad = gaussians._xyz.grad.to_dense().contiguous()
-                                    gaussians._xyz.grad[_zero_ins] = 0.0
+                            _p_means = gaussians.means_param
+                            if _p_means.grad is not None:
+                                if getattr(_p_means.grad, "layout", torch.strided) != torch.strided:
+                                    _p_means.grad = _p_means.grad.to_dense().contiguous()
+                                _p_means.grad[_zero_ins] = 0.0
 
             if iteration < opt.iterations:
                 if optimizer_type == "selective_adam":

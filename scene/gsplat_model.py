@@ -105,6 +105,36 @@ class GsplatGaussianModel:
     def _features_rest(self):
         return self.params["shN"]
 
+    # ------------------------------------------------------------------
+    # Layout-agnostic adapter properties — streaming code uses these so
+    # it doesn't need to branch on model_layout.
+    # ------------------------------------------------------------------
+
+    @property
+    def raw_opacities(self):
+        """Raw (pre-sigmoid) opacity logits, shape (N,)."""
+        return self.params["opacities"]
+
+    @property
+    def raw_scales(self):
+        """Raw (log) scale parameters, shape (N, 3)."""
+        return self.params["scales"]
+
+    @property
+    def means_param(self):
+        """The means / xyz position parameter."""
+        return self.params["means"]
+
+    @property
+    def geometry_params(self):
+        """Geometric learnable parameters [means, scales, quats]."""
+        return [self.params["means"], self.params["scales"], self.params["quats"]]
+
+    @property
+    def all_learnable_params(self):
+        """All learnable parameters as a list."""
+        return list(self.params.values())
+
     @property
     def get_xyz(self):
         return self.params["means"]

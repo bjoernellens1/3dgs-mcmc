@@ -157,7 +157,38 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
-    
+
+    # ------------------------------------------------------------------
+    # Layout-agnostic adapter properties — mirrors GsplatGaussianModel so
+    # streaming code can work without branching on model_layout.
+    # ------------------------------------------------------------------
+
+    @property
+    def raw_opacities(self):
+        """Raw (pre-sigmoid) opacity logits, shape (N,)."""
+        return self._opacity.squeeze(-1)
+
+    @property
+    def raw_scales(self):
+        """Raw (log) scale parameters, shape (N, 3)."""
+        return self._scaling
+
+    @property
+    def means_param(self):
+        """The means / xyz position parameter."""
+        return self._xyz
+
+    @property
+    def geometry_params(self):
+        """Geometric learnable parameters [xyz, scaling, rotation]."""
+        return [self._xyz, self._scaling, self._rotation]
+
+    @property
+    def all_learnable_params(self):
+        """All learnable parameters as a list."""
+        return [self._xyz, self._features_dc, self._features_rest,
+                self._opacity, self._scaling, self._rotation]
+
     @property
     def get_features(self):
         features_dc = self._features_dc
