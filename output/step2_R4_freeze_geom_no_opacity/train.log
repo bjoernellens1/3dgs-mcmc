@@ -1,0 +1,35 @@
+Optimizing output/step2_R4_freeze_geom_no_opacity
+[streaming] Camera profile 'orbbec_femto_bolt':
+  streaming_min_depth: 0.1 -> 0.3
+  streaming_max_depth: 8.0 -> 5.0
+  streaming_depth_consistency_thresh: 0.05 -> 0.03
+  streaming_depth_edge_threshold: 0.02 -> 0.015
+  streaming_depth_stride: 8 -> 4
+  streaming_depth_loss_weight: 0.05 -> 0.1
+  streaming_free_space_loss_weight: 0.0 -> 0.01 [19/05 12:04:21]
+[streaming] OrbbecRosBag: loaded Open3D odometry cache output/test_streaming_bootstrap_motion_no_mcmc_smoke/odom_cache/c7fd7b5053c2e0c672622ab5.npz [19/05 12:04:22]
+[streaming] OrbbecRosBag: 10 synced frames from /mnt/cps_persistent1_shared/datasets/christian/embedding_map/bags/slam/kitchen1_slam (color=2056, depth=2055, pose=0, pose_source=open3d_odometry_live) [19/05 12:04:22]
+[streaming] Bootstrapping from 3 frame(s)... [19/05 12:04:22]
+Number of points at initialisation :  131250 [19/05 12:04:22]
+[streaming] Initial seed point cloud exported (131250 points) [19/05 12:04:22]
+[streaming] Initialised 131250 Gaussians from 3 frames, scene radius=3.349 [19/05 12:04:22]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [19/05 12:04:22]
+[streaming] freeze_params=['means', 'quats', 'scales'] [19/05 12:04:22]
+[streaming] Starting: strategy=gsplat_energy_mcmc optimizer=selective_adam sparse=True steps_per_frame=5 wallclock=False [19/05 12:04:22]
+[streaming] Dataset: 10 frames. Iterations to cover all frames: 65 (budget=30, covers 46%). Remaining frames will be flushed post-loop. [19/05 12:04:22]
+Streaming training:   0%|          | 0/30 [00:00<?, ?it/s]/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+Streaming training:   0%|          | 0/30 [00:03<?, ?it/s, Loss=0.4877201, N=131251, F=6]Streaming training:  33%|###3      | 10/30 [00:03<00:07,  2.53it/s, Loss=0.4877201, N=131251, F=6]Streaming training:  33%|###3      | 10/30 [00:04<00:07,  2.53it/s, Loss=0.4737949, N=131252, F=8]Streaming training:  67%|######6   | 20/30 [00:04<00:02,  4.47it/s, Loss=0.4737949, N=131252, F=8]Streaming training:  67%|######6   | 20/30 [00:05<00:02,  4.47it/s, Loss=0.4711656, N=131252, F=10]Streaming training: 100%|##########| 30/30 [00:05<00:00,  6.10it/s, Loss=0.4711656, N=131252, F=10]Streaming training: 100%|##########| 30/30 [00:05<00:00,  5.07it/s, Loss=0.4711656, N=131252, F=10]
+
+[ITER 30] Saving Gaussians [19/05 12:04:29]
+[streaming] Keyframe admission: 6/6 admitted (100.0%) — forced=0 moved=0 novel=6 rej_overlap=0 rej_motion=0 [19/05 12:04:29]
+[report] iter=30 test PSNR mean=8.09dB min=8.08 max=8.11 (3/3 views) [19/05 12:04:32]
+[report] iter=30 test LPIPS mean=0.6590 min=0.6530 max=0.6632 [19/05 12:04:32]
+[report] iter=30 train PSNR mean=8.09dB min=8.08 max=8.11 (3/3 views) [19/05 12:04:33]
+[report] iter=30 train LPIPS mean=0.6590 min=0.6530 max=0.6632 [19/05 12:04:33]
+[report] iter=30 no trajectory views selected — skipping trajectory MP4 [19/05 12:04:34]
+[trajectory_eval] → output/step2_R4_freeze_geom_no_opacity/trajectory_eval  n=9 ATE=None [19/05 12:04:34]
+
+[streaming] Training complete. [19/05 12:04:34]
+
+Training complete. [19/05 12:04:34]
