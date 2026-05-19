@@ -468,6 +468,9 @@ class StreamingParams(ParamGroup):
         # -----------------------------------------------------------------------
         self.streaming_insertion_debug = False
         self.streaming_insertion_debug_ply = False
+        # Save estimated trajectory as TUM .txt + PNG plot + ATE/RPE metrics
+        # to <model_path>/trajectory_eval/. Default on.
+        self.streaming_trajectory_eval = True
         super().__init__(parser, "Streaming Parameters")
 
 

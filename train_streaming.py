@@ -87,6 +87,18 @@ _CAMERA_PROFILES = {
         "streaming_free_space_loss_weight": 0.01,
         "streaming_max_new_gaussians_per_frame": 2000,
     },
+    "realsense_d435i": {
+        # Intel RealSense D435i: active IR stereo, ±2% within 0.3-3 m,
+        # higher temporal noise than Femto Bolt iToF.
+        "streaming_min_depth": 0.3,
+        "streaming_max_depth": 5.0,
+        "streaming_depth_consistency_thresh": 0.04,
+        "streaming_depth_edge_threshold": 0.02,
+        "streaming_depth_stride": 4,
+        "streaming_depth_loss_weight": 0.1,
+        "streaming_free_space_loss_weight": 0.01,
+        "streaming_max_new_gaussians_per_frame": 2000,
+    },
 }
 
 
@@ -1559,6 +1571,8 @@ def streaming_training(
     n_frames_ingested = n_init  # already ingested during init
     _n_frames_trained = 0       # frames that received at least one training iteration
     total_inserted = 0
+    # Admission-gate counters (hybrid_keyframe mode)
+    _admit_cnt = {"forced": 0, "moved": 0, "novel": 0, "rejected_overlap": 0, "rejected_motion": 0, "total": 0}
     _prev_insert_frame = None       # previous frame for depth consistency check
     _prev_insert_depth_m = None     # depth map (metres) for previous frame
     # Phase 4.1: pending batch insertion buffer
@@ -1757,6 +1771,21 @@ def streaming_training(
                     _n_frames_trained += 1
                 _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
                 _admission_stats = getattr(new_frame, "_streaming_admission_stats", None)
+                if _admission_stats and _admission_stats.get("mode") == "hybrid_keyframe":
+                    _admit_cnt["total"] += 1
+                    _reason = _admission_stats.get("reason", "")
+                    if _admission_stats.get("admitted"):
+                        if _admission_stats.get("forced"):
+                            _admit_cnt["forced"] += 1
+                        elif _admission_stats.get("moved"):
+                            _admit_cnt["moved"] += 1
+                        else:
+                            _admit_cnt["novel"] += 1
+                    else:
+                        if _reason == "low_overlap":
+                            _admit_cnt["rejected_overlap"] += 1
+                        else:
+                            _admit_cnt["rejected_motion"] += 1
                 if tb_writer and _admission_stats:
                     tb_writer.add_scalar(
                         "streaming/keyframes_admitted",
@@ -2440,6 +2469,22 @@ def streaming_training(
             _chk = os.path.join(args.model_path, f"chkpnt{iteration}.pth")
             save_worker.enqueue(lambda s=_state, i=iteration, p=_chk: torch.save((s, i), p))
 
+    # Admit-rate summary (hybrid_keyframe mode)
+    if _admit_cnt["total"] > 0:
+        _n_admitted = _admit_cnt["forced"] + _admit_cnt["moved"] + _admit_cnt["novel"]
+        _admit_rate = 100.0 * _n_admitted / _admit_cnt["total"]
+        print(
+            f"[streaming] Keyframe admission: {_n_admitted}/{_admit_cnt['total']} admitted "
+            f"({_admit_rate:.1f}%) — forced={_admit_cnt['forced']} moved={_admit_cnt['moved']} "
+            f"novel={_admit_cnt['novel']} rej_overlap={_admit_cnt['rejected_overlap']} "
+            f"rej_motion={_admit_cnt['rejected_motion']}",
+            flush=True,
+        )
+        if tb_writer:
+            tb_writer.add_scalar("streaming/admit_rate_pct", _admit_rate, opt.iterations)
+            for _gate, _cnt in _admit_cnt.items():
+                tb_writer.add_scalar(f"streaming/admit_gate/{_gate}", _cnt, opt.iterations)
+
     if streaming_scene.has_next_frame():
         _remaining = _n_total_frames - n_frames_ingested
         _eff_spf = opt.iterations / max(1, _n_frames_trained)
@@ -2488,6 +2533,18 @@ def streaming_training(
             )
     except Exception as e:
         print(f"[streaming-report] post-training report failed: {e}", flush=True)
+
+    # ---- Trajectory evaluation -----------------------------------------------
+    if getattr(args, "streaming_trajectory_eval", True):
+        try:
+            from utils.trajectory_eval import run_trajectory_eval
+            run_trajectory_eval(
+                output_dir=os.path.join(args.model_path, "trajectory_eval"),
+                train_cams=list(streaming_scene.getTrainCameras()),
+                method_label=getattr(args, "orbbec_open3d_odom_method", "estimated"),
+            )
+        except Exception as _te:
+            print(f"[trajectory_eval] failed: {_te}", flush=True)
 
     # ---- Training-progress video write ---------------------------------------
     # Signal the CPU worker to stop, then wait for it to finish any in-flight frames.
