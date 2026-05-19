@@ -435,6 +435,13 @@ class StreamingParams(ParamGroup):
         # Weight decays linearly to zero over bootstrap_anchor_decay_steps iterations.
         self.streaming_bootstrap_anchor_weight = 1.0
         self.streaming_bootstrap_anchor_decay_steps = 2000
+        # Per-frame depth-insertion anchor (applied to birth_frame>0 Gaussians).
+        # Each inserted Gaussian's means gradient is stochastically suppressed for
+        # insertion_anchor_decay_steps iterations after its own anchor_iter, giving
+        # newly added geometry time to settle before the optimizer is free to move it.
+        # Uses the same proven gradient-masking mechanism as the bootstrap anchor.
+        self.streaming_insertion_anchor_weight = 1.0
+        self.streaming_insertion_anchor_decay_steps = 200
         # Bootstrap motion diagnostics (off by default; useful for early geometry drift).
         self.streaming_debug_bootstrap_motion = False
         self.streaming_debug_bootstrap_ply_interval = 0

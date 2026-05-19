@@ -2006,6 +2006,8 @@ def streaming_training(
     # Bootstrap anchor: penalise center drift of birth_frame==0 Gaussians.
     _bootstrap_anchor_weight = float(getattr(args, "streaming_bootstrap_anchor_weight", 0.0))
     _bootstrap_anchor_decay = max(1, int(getattr(args, "streaming_bootstrap_anchor_decay_steps", 2000)))
+    _insertion_anchor_weight = float(getattr(args, "streaming_insertion_anchor_weight", 1.0))
+    _insertion_anchor_decay  = max(1, int(getattr(args, "streaming_insertion_anchor_decay_steps", 200)))
 
     # Training-progress video setup
     _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
@@ -2429,18 +2431,22 @@ def streaming_training(
                 loss = loss + _anchor_loss_weight * L_anchor
                 _anchor_loss_val = L_anchor.item()
 
-        # Bootstrap anchor: recorded position vs current, for TB only.
-        # Actual constraint is applied via gradient masking after backward (below).
-        if tb_writer is not None and _bootstrap_anchor_weight > 0 and iteration % scalar_log_interval == 0:
-            if hasattr(gaussians, "anchor_xyz") and hasattr(gaussians, "birth_frame"):
+        # Anchor diagnostics — TB only; actual constraint via gradient masking after backward.
+        if tb_writer is not None and iteration % scalar_log_interval == 0:
+            if _bootstrap_anchor_weight > 0 and hasattr(gaussians, "anchor_xyz") and hasattr(gaussians, "birth_frame"):
                 with torch.no_grad():
                     _bm = (gaussians.birth_frame == 0) if gaussians.birth_frame.shape[0] == gaussians.get_xyz.shape[0] else None
                     if _bm is not None and _bm.any():
                         _dxyz_tb = gaussians.get_xyz[_bm] - gaussians.anchor_xyz[_bm]
-                        _drift_tb = _dxyz_tb.norm(dim=1).mean().item()
-                        tb_writer.add_scalar("streaming/bootstrap_anchor/drift_mean_m", _drift_tb, iteration)
+                        tb_writer.add_scalar("streaming/bootstrap_anchor/drift_mean_m",
+                                             _dxyz_tb.norm(dim=1).mean().item(), iteration)
                 _retain = max(0.0, 1.0 - iteration / _bootstrap_anchor_decay)
                 tb_writer.add_scalar("streaming/bootstrap_anchor/grad_retain_frac", 1.0 - _retain, iteration)
+            if _insertion_anchor_weight > 0 and hasattr(gaussians, "birth_frame") and hasattr(gaussians, "anchor_iter"):
+                with torch.no_grad():
+                    _age_tb = (iteration - gaussians.anchor_iter.long()).clamp(min=0)
+                    _n_active = int(((gaussians.birth_frame > 0) & (_age_tb < _insertion_anchor_decay)).sum())
+                tb_writer.add_scalar("streaming/insertion_anchor/n_active", _n_active, iteration)
 
         # ---- Mature-Gaussian soft-anchor anti-fade losses (Component C) -----
         # Constant-weight (non-decaying) anchor losses on xyz/scale/opacity for
@@ -2603,6 +2609,41 @@ def streaming_training(
                                     if getattr(gaussians._xyz.grad, "layout", torch.strided) != torch.strided:
                                         gaussians._xyz.grad = gaussians._xyz.grad.to_dense().contiguous()
                                     gaussians._xyz.grad[_zero_boot] = 0.0
+
+            # Insertion means gradient masking: per-Gaussian stochastic suppression
+            # for depth-inserted Gaussians (birth_frame>0) during their first
+            # insertion_anchor_decay_steps iterations after anchor_iter.
+            # Each Gaussian's retain probability ramps 0→1 independently based on
+            # its own age, giving newly added geometry time to settle before the
+            # optimizer is free to slide it under photometric gradient.
+            # The bootstrap block above may have already densified means.grad.
+            if (_insertion_anchor_weight > 0
+                    and hasattr(gaussians, "birth_frame")
+                    and hasattr(gaussians, "anchor_iter")):
+                with torch.no_grad():
+                    _ins_m = (gaussians.birth_frame > 0)
+                    if _ins_m.shape[0] == gaussians.get_xyz.shape[0] and _ins_m.any():
+                        _age_all = (iteration - gaussians.anchor_iter.long()).clamp(min=0)
+                        _within = _ins_m & (_age_all < _insertion_anchor_decay)
+                        if _within.any():
+                            _age_young = _age_all[_within].float()
+                            _retain_per = (_age_young / _insertion_anchor_decay).clamp(0.0, 1.0)
+                            _rand_ins = torch.rand(
+                                _retain_per.shape[0], device=gaussians.get_xyz.device
+                            )
+                            _zero_ins = _within.clone()
+                            _zero_ins[_within] = _rand_ins >= _retain_per
+                            if model_layout == "gsplat":
+                                _p_means = gaussians.params.get("means")
+                                if _p_means is not None and _p_means.grad is not None:
+                                    if getattr(_p_means.grad, "layout", torch.strided) != torch.strided:
+                                        _p_means.grad = _p_means.grad.to_dense().contiguous()
+                                    _p_means.grad[_zero_ins] = 0.0
+                            else:
+                                if gaussians._xyz.grad is not None:
+                                    if getattr(gaussians._xyz.grad, "layout", torch.strided) != torch.strided:
+                                        gaussians._xyz.grad = gaussians._xyz.grad.to_dense().contiguous()
+                                    gaussians._xyz.grad[_zero_ins] = 0.0
 
             if iteration < opt.iterations:
                 if optimizer_type == "selective_adam":
