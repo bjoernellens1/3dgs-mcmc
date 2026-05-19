@@ -429,6 +429,12 @@ class StreamingParams(ParamGroup):
         self.streaming_anchor_loss_weight = 0.0
         # Anchor penalty decays linearly to zero over this many training iterations.
         self.streaming_anchor_decay_steps = 500
+        # Bootstrap-specific position anchor (applied to birth_frame==0 Gaussians).
+        # Separate from H9 provisional anchor; covers the multi-frame seed geometry
+        # that the optimizer would otherwise slide under photometric gradient.
+        # Weight decays linearly to zero over bootstrap_anchor_decay_steps iterations.
+        self.streaming_bootstrap_anchor_weight = 0.0
+        self.streaming_bootstrap_anchor_decay_steps = 2000
         # Bootstrap motion diagnostics (off by default; useful for early geometry drift).
         self.streaming_debug_bootstrap_motion = False
         self.streaming_debug_bootstrap_ply_interval = 0

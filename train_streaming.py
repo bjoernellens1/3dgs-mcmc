@@ -1763,6 +1763,12 @@ def streaming_training(
         gaussians.support_count = torch.zeros(_n_boot, dtype=torch.int32, device=_dev)
         gaussians.birth_frame = torch.zeros(_n_boot, dtype=torch.int32, device=_dev)
 
+    # Bootstrap position anchor: record the initial depth-seeded positions so
+    # the anchor loss can penalise center drift during early training.
+    # Only initialise if not already set (checkpoint resume preserves existing anchor).
+    if not hasattr(gaussians, "anchor_xyz"):
+        gaussians.anchor_xyz = gaussians.get_xyz.detach().clone()
+
     # Restore checkpoint if requested
     first_iter = 0
     if checkpoint:
@@ -1993,9 +1999,13 @@ def streaming_training(
     _freeze_new_frame_steps = max(0, int(getattr(args, "streaming_freeze_new_frame_steps", 50)))
     _iter_since_new_frame = _freeze_new_frame_steps  # start without strict freeze
 
-    # H9: anchor loss parameters
+    # H9: anchor loss parameters (provisional splats only)
     _anchor_loss_weight = float(getattr(args, "streaming_anchor_loss_weight", 0.0))
     _anchor_decay_steps = max(1, int(getattr(args, "streaming_anchor_decay_steps", 500)))
+
+    # Bootstrap anchor: penalise center drift of birth_frame==0 Gaussians.
+    _bootstrap_anchor_weight = float(getattr(args, "streaming_bootstrap_anchor_weight", 0.0))
+    _bootstrap_anchor_decay = max(1, int(getattr(args, "streaming_bootstrap_anchor_decay_steps", 2000)))
 
     # Training-progress video setup
     _progress_video_interval = max(0, int(getattr(args, "progress_video_interval", 200)))
@@ -2419,6 +2429,19 @@ def streaming_training(
                 loss = loss + _anchor_loss_weight * L_anchor
                 _anchor_loss_val = L_anchor.item()
 
+        # Bootstrap anchor: recorded position vs current, for TB only.
+        # Actual constraint is applied via gradient masking after backward (below).
+        if tb_writer is not None and _bootstrap_anchor_weight > 0 and iteration % scalar_log_interval == 0:
+            if hasattr(gaussians, "anchor_xyz") and hasattr(gaussians, "birth_frame"):
+                with torch.no_grad():
+                    _bm = (gaussians.birth_frame == 0) if gaussians.birth_frame.shape[0] == gaussians.get_xyz.shape[0] else None
+                    if _bm is not None and _bm.any():
+                        _dxyz_tb = gaussians.get_xyz[_bm] - gaussians.anchor_xyz[_bm]
+                        _drift_tb = _dxyz_tb.norm(dim=1).mean().item()
+                        tb_writer.add_scalar("streaming/bootstrap_anchor/drift_mean_m", _drift_tb, iteration)
+                _retain = max(0.0, 1.0 - iteration / _bootstrap_anchor_decay)
+                tb_writer.add_scalar("streaming/bootstrap_anchor/grad_retain_frac", 1.0 - _retain, iteration)
+
         # ---- Mature-Gaussian soft-anchor anti-fade losses (Component C) -----
         # Constant-weight (non-decaying) anchor losses on xyz/scale/opacity for
         # MATURE Gaussians. Prevents confirmed geometry from fading when old
@@ -2549,6 +2572,37 @@ def streaming_training(
                                 if (_param.grad is not None
                                         and getattr(_param.grad, "layout", torch.strided) == torch.strided):
                                     _param.grad[_frozen_mask] = 0.0
+
+            # Bootstrap means gradient masking: suppress center drift of depth-seeded
+            # Gaussians (birth_frame==0) during early training. The fraction of gradients
+            # zeroed decays linearly from 1 → 0 over bootstrap_anchor_decay_steps so
+            # the constraint softens gradually rather than cutting off hard.
+            if (_bootstrap_anchor_weight > 0 and iteration < _bootstrap_anchor_decay
+                    and hasattr(gaussians, "birth_frame")):
+                with torch.no_grad():
+                    _boot_m = (gaussians.birth_frame == 0)
+                    if _boot_m.shape[0] == gaussians.get_xyz.shape[0] and _boot_m.any():
+                        # retain_frac ramps 0→1; zero out the complementary fraction
+                        _retain_frac = iteration / _bootstrap_anchor_decay
+                        if _retain_frac < 1.0:
+                            # Stochastic ramp: each bootstrap splat keeps its gradient
+                            # with probability retain_frac, is zeroed otherwise.
+                            # At iter=0: zero all; at iter=decay: keep all.
+                            _rand = torch.rand(_boot_m.sum(), device=gaussians.get_xyz.device)
+                            _zero_boot = _boot_m.clone()
+                            _zero_boot[_boot_m] = _rand >= _retain_frac
+                            if model_layout == "gsplat":
+                                _p_means = gaussians.params.get("means")
+                                if _p_means is not None and _p_means.grad is not None:
+                                    # Densify sparse grad before indexing (gsplat sparse-grad mode)
+                                    if getattr(_p_means.grad, "layout", torch.strided) != torch.strided:
+                                        _p_means.grad = _p_means.grad.to_dense().contiguous()
+                                    _p_means.grad[_zero_boot] = 0.0
+                            else:
+                                if gaussians._xyz.grad is not None:
+                                    if getattr(gaussians._xyz.grad, "layout", torch.strided) != torch.strided:
+                                        gaussians._xyz.grad = gaussians._xyz.grad.to_dense().contiguous()
+                                    gaussians._xyz.grad[_zero_boot] = 0.0
 
             if iteration < opt.iterations:
                 if optimizer_type == "selective_adam":
