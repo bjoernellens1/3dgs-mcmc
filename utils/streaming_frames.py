@@ -18,6 +18,7 @@ from typing import Iterator, List, Optional
 
 from utils.rosbag_sync import (
     StampedMsg,
+    SyncStats,
     SyncedRGBD,
     attach_pose,
     check_p95_within_threshold,
@@ -881,6 +882,8 @@ class OrbbecRosBagFrameSource:
         open3d_odom_downscale: int = 1,
         open3d_odom_async: bool = False,
         open3d_odom_async_queue_size: int = 32,
+        open3d_odom_motion_prior: bool = False,
+        open3d_odom_motion_gate: bool = False,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
         open3d_odom_depth_min: float = 0.1,
@@ -1273,6 +1276,8 @@ class OrbbecRosBagFrameSource:
                 icp_max_distance=open3d_icp_max_distance,
                 icp_robust_kernel=open3d_icp_robust_kernel,
                 icp_sigma=open3d_icp_sigma,
+                motion_prior=open3d_odom_motion_prior,
+                motion_gate=open3d_odom_motion_gate,
                 mode="precompute",
             )
             cache_path = self._open3d_odom_cache_path(
@@ -1325,6 +1330,13 @@ class OrbbecRosBagFrameSource:
                 f"stride={open3d_odom_stride} downscale={open3d_odom_downscale}"
             )
 
+        # Invariant: the odometry detour above rebuilds `synced` but never
+        # reorders or filters it, so synced[i] still corresponds to
+        # synced_records[i]. Guard against a future filter desyncing them.
+        assert len(synced) == len(synced_records), (
+            f"streaming sync invariant violated: len(synced)={len(synced)} "
+            f"!= len(synced_records)={len(synced_records)}"
+        )
         self._frames: List[StreamingRGBDFrame] = []
         for sync_idx, (color_ts, rgb_bytes, depth_bytes, c2w) in enumerate(synced):
             rec = synced_records[sync_idx]
@@ -1342,6 +1354,8 @@ class OrbbecRosBagFrameSource:
         self._live_odom_stride = open3d_odom_stride
         self._live_odom_downscale = open3d_odom_downscale
         self._live_odom_max_failure_ratio = float(open3d_odom_max_failure_ratio)
+        self._live_odom_motion_prior = bool(open3d_odom_motion_prior)
+        self._live_odom_motion_gate = bool(open3d_odom_motion_gate)
         self._live_odom_max_trans = float(open3d_odom_max_trans_per_edge) if open3d_odom_max_trans_per_edge > 0 else float("inf")
         self._live_odom_max_rot = float(open3d_odom_max_rot_deg_per_edge) if open3d_odom_max_rot_deg_per_edge > 0 else float("inf")
         self._live_odom_method = open3d_odom_method
@@ -1354,9 +1368,8 @@ class OrbbecRosBagFrameSource:
         self._live_odom_computed_idx = -1
         self._live_odom_prev_key_idx = 0
         self._live_odom_prev_key_rgbd = None
-        # Constant-velocity prior: reuse last successful relative transform as
-        # the init guess for the next frame instead of identity.  Reset to None
-        # on failure so a bad estimate doesn't compound.
+        # Optional constant-velocity prior state. Reset to None on failure so a
+        # bad estimate does not compound when the prior is enabled.
         self._live_odom_last_trans: np.ndarray | None = None
         self._live_odom_last_n_edges: int = 1
         self._live_odom_cache_path = None
@@ -1394,6 +1407,8 @@ class OrbbecRosBagFrameSource:
                 icp_max_distance=open3d_icp_max_distance,
                 icp_robust_kernel=open3d_icp_robust_kernel,
                 icp_sigma=open3d_icp_sigma,
+                motion_prior=open3d_odom_motion_prior,
+                motion_gate=open3d_odom_motion_gate,
                 mode="live",
             )
             live_cache_path = self._open3d_odom_cache_path(
@@ -1425,7 +1440,13 @@ class OrbbecRosBagFrameSource:
         print(
             f"[streaming] OrbbecRosBag: {len(self._frames)} synced frames from {path} "
             f"(color={len(color_msgs)}, depth={len(depth_msgs)}, pose={len(pose_msgs)}, "
-            f"pose_source={pose_source})"
+            f"pose_source={pose_source}"
+            + (
+                f", motion_prior={self._live_odom_motion_prior}, "
+                f"motion_gate={self._live_odom_motion_gate}"
+                if self._live_odom_enabled else ""
+            )
+            + ")"
         )
 
     @staticmethod
@@ -1451,7 +1472,13 @@ class OrbbecRosBagFrameSource:
         icp_max_distance: float = 0.07,
         icp_robust_kernel: str = "huber",
         icp_sigma: float = 0.05,
+        motion_prior: bool = False,
+        motion_gate: bool = False,
         mode: str = "precompute",
+        depth_scale: float = 1000.0,
+        depth_info_topic: str = "",
+        sync_offset_ns: int = 0,
+        profile: str = "",
     ) -> str:
         import hashlib
         import json
@@ -1471,10 +1498,13 @@ class OrbbecRosBagFrameSource:
             "mode": str(mode),
             "path": os.path.abspath(path),
             "metadata": metadata_sig,
-            "topics": [color_topic, depth_topic, camera_info_topic],
+            "topics": [color_topic, depth_topic, camera_info_topic, depth_info_topic],
             "sync_threshold_ms": float(sync_threshold_ms),
+            "sync_offset_ns": int(sync_offset_ns),
             "frame_stride": int(frame_stride),
             "max_frames": int(max_frames),
+            "profile": str(profile),
+            "depth_scale": round(float(depth_scale), 6),
             "intrinsics": [
                 round(float(fx), 6),
                 round(float(fy), 6),
@@ -1491,6 +1521,8 @@ class OrbbecRosBagFrameSource:
                 str(icp_robust_kernel),
                 round(float(icp_sigma), 6),
             ],
+            "motion_prior": bool(motion_prior),
+            "motion_gate": bool(motion_gate),
             "n_frames": len(timestamps),
             "first_ts": timestamps[0] if timestamps else None,
             "last_ts": timestamps[-1] if timestamps else None,
@@ -1868,6 +1900,28 @@ class OrbbecRosBagFrameSource:
             with cond:
                 cond.notify_all()
 
+    def _live_odom_initial_guess(self, idx: int):
+        import numpy as np
+
+        if not self._live_odom_motion_prior or self._live_odom_last_trans is None:
+            return np.eye(4, dtype=np.float64)
+        n_prev = max(1, self._live_odom_last_n_edges)
+        n_curr = max(1, idx - self._live_odom_prev_key_idx)
+        if n_curr == n_prev:
+            return self._live_odom_last_trans.copy()
+        trans = self._live_odom_last_trans.copy()
+        trans[:3, 3] *= float(n_curr) / float(n_prev)
+        return trans
+
+    def _live_odom_motion_rejected(self, edge_t: float, edge_r: float, n_edges: int) -> bool:
+        if not self._live_odom_motion_gate:
+            return False
+        n_edges = max(1, int(n_edges))
+        return (
+            edge_t > self._live_odom_max_trans * n_edges
+            or edge_r > self._live_odom_max_rot * n_edges
+        )
+
     def _start_live_odom_worker(self) -> None:
         """Phase 5: queue-bounded producer for live Open3D odometry.
 
@@ -1911,7 +1965,9 @@ class OrbbecRosBagFrameSource:
         self._live_odom_async_thread.start()
         print(
             f"[streaming] live Open3D odometry async worker started "
-            f"(queue_size={self._live_odom_queue_size}, queue-bounded)",
+            f"(queue_size={self._live_odom_queue_size}, queue-bounded, "
+            f"motion_prior={self._live_odom_motion_prior}, "
+            f"motion_gate={self._live_odom_motion_gate})",
             flush=True,
         )
 
@@ -2035,24 +2091,7 @@ class OrbbecRosBagFrameSource:
                 continue
 
             curr_rgbd = self._live_odom_to_rgbd(self._frames[idx])
-            # Constant-velocity prior: use the last successful relative transform
-            # as the initial guess instead of identity.  This dramatically improves
-            # convergence when the camera starts moving from rest, reducing the
-            # "double edge" artifact at depth discontinuities during motion onset.
-            # Scale by the number of elapsed frames so the prediction is correct
-            # for variable stride (for stride=1 last_trans is used as-is).
-            if self._live_odom_last_trans is not None:
-                n_prev = max(1, self._live_odom_last_n_edges)
-                n_curr = max(1, idx - self._live_odom_prev_key_idx)
-                if n_curr == n_prev:
-                    init_guess = self._live_odom_last_trans.copy()
-                else:
-                    # Scale translation proportionally; rotation stays same direction
-                    T = self._live_odom_last_trans.copy()
-                    T[:3, 3] *= float(n_curr) / float(n_prev)
-                    init_guess = T
-            else:
-                init_guess = np.eye(4, dtype=np.float64)
+            init_guess = self._live_odom_initial_guess(idx)
 
             if self._live_odom_method == "icp":
                 success, trans_prev_to_curr, odom_info = self._estimate_icp_odometry(
@@ -2076,7 +2115,7 @@ class OrbbecRosBagFrameSource:
             self._live_odom_pairs += 1
             key_pose = self._frames[self._live_odom_prev_key_idx].c2w
 
-            # Phase 2.3: sanity-gate on estimated per-edge motion
+            # Optional sanity gate on estimated per-edge motion.
             edge_t = None
             edge_r = None
             n_edges = max(1, idx - self._live_odom_prev_key_idx)
@@ -2085,8 +2124,7 @@ class OrbbecRosBagFrameSource:
                 edge_t = float(np.linalg.norm(delta[:3, 3]))
                 cos_r = float(np.clip((np.trace(delta[:3, :3]) - 1.0) * 0.5, -1.0, 1.0))
                 edge_r = float(np.degrees(np.arccos(cos_r)))
-                if (edge_t > self._live_odom_max_trans * n_edges or
-                        edge_r > self._live_odom_max_rot * n_edges):
+                if self._live_odom_motion_rejected(edge_t, edge_r, n_edges):
                     print(
                         f"[live-o3d] idx={idx} sanity-gate reject: "
                         f"dt={edge_t:.3f}m dr={edge_r:.1f}° over {n_edges} edges "
@@ -2162,7 +2200,9 @@ class OrbbecRosBagFrameSource:
                     "[streaming] live Open3D odometry failed "
                     f"source_frame={idx} successes={self._live_odom_successes} "
                     f"failures={self._live_odom_failures} method={self._live_odom_method} "
-                    f"stride={self._live_odom_stride}{_motion}{_quality}",
+                    f"stride={self._live_odom_stride} "
+                    f"motion_prior={self._live_odom_motion_prior} "
+                    f"motion_gate={self._live_odom_motion_gate}{_motion}{_quality}",
                     flush=True,
                 )
                 failure_ratio = self._live_odom_failures / max(1, self._live_odom_pairs)
@@ -2212,7 +2252,9 @@ class OrbbecRosBagFrameSource:
                     "[streaming] live Open3D odometry "
                     f"source_frame={idx} successes={self._live_odom_successes} "
                     f"failures={self._live_odom_failures} method={self._live_odom_method} "
-                    f"stride={self._live_odom_stride}{_motion}{_quality}",
+                    f"stride={self._live_odom_stride} "
+                    f"motion_prior={self._live_odom_motion_prior} "
+                    f"motion_gate={self._live_odom_motion_gate}{_motion}{_quality}",
                     flush=True,
                 )
             self._live_odom_computed_idx = idx
@@ -2229,6 +2271,7 @@ class OrbbecRosBagFrameSource:
 
     def get_all(self) -> List[StreamingRGBDFrame]:
         if self._live_odom_async_enabled and not self._live_odom_cached_full:
+            self._signal_consumer_progress(len(self._frames) - 1)
             self._wait_live_odom_until(len(self._frames) - 1)
         elif self._live_odom_enabled:
             self._ensure_live_odom_until(len(self._frames) - 1)
@@ -2250,18 +2293,71 @@ class OrbbecRosBagFrameSource:
         return self._frames[index]
 
 
+_ROS1_BAG_PROFILES = {
+    "realsense": {
+        "label": "RealsenseBag",
+        "color_topic": "/device_0/sensor_1/Color_0/image/data",
+        "depth_topic": "/device_0/sensor_0/Depth_0/image/data",
+        "color_info_topic": "/device_0/sensor_1/Color_0/info/camera_info",
+        "depth_info_topic": "/device_0/sensor_0/Depth_0/info/camera_info",
+        "depth_scale": 1000.0,
+    },
+    "tum": {
+        "label": "TUMRosbag",
+        "color_topic": "/camera/rgb/image_color",
+        "depth_topic": "/camera/depth/image",
+        "color_info_topic": "/camera/rgb/camera_info",
+        "depth_info_topic": "/camera/depth/camera_info",
+        "depth_scale": 5000.0,
+    },
+}
+
+
+def _ros1_bag_topics(path: str) -> set[str]:
+    try:
+        from rosbags.highlevel import AnyReader
+        with AnyReader([Path(path)]) as reader:
+            return {c.topic for c in reader.connections}
+    except Exception:
+        return set()
+
+
+def _select_ros1_bag_profile(path: str, profile: str) -> str:
+    profile = str(profile or "auto").lower()
+    if profile in _ROS1_BAG_PROFILES:
+        return profile
+    topics = _ros1_bag_topics(path)
+    tum_topics = {
+        _ROS1_BAG_PROFILES["tum"]["color_topic"],
+        _ROS1_BAG_PROFILES["tum"]["depth_topic"],
+        _ROS1_BAG_PROFILES["tum"]["color_info_topic"],
+    }
+    if tum_topics.issubset(topics):
+        return "tum"
+    return "realsense"
+
+
+def _parse_ms_offset(value, default: float = 0.0) -> float:
+    text = str(value).strip().lower()
+    if not text or text == "auto":
+        return default
+    return float(text)
+
+
 class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
-    """Frames from an Intel RealSense D435i bag recorded via RealSense Viewer.
+    """Frames from a ROS1 RGB-D bag with Open3D live odometry.
 
     Reads a ROS1 ``.bag`` file using ``rosbags.rosbag1.Reader``.
     Only ``open3d_odometry_live`` is supported as pose source (no camera_pose
-    topic in RealSense Viewer bags).
+    topic in RealSense Viewer or TUM public bags).
 
     Topic conventions (RealSense Viewer default export)::
         /device_0/sensor_0/Depth_0/image/data       — raw uint16 depth (mm)
         /device_0/sensor_0/Depth_0/info/camera_info
         /device_0/sensor_1/Color_0/image/data       — raw BGR8 color
         /device_0/sensor_1/Color_0/info/camera_info
+
+    TUM public RGB-D bags use ``--rosbag_profile tum`` or auto-detection.
     """
 
     def __init__(
@@ -2281,6 +2377,8 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         open3d_odom_downscale: int = 1,
         open3d_odom_async: bool = False,
         open3d_odom_async_queue_size: int = 32,
+        open3d_odom_motion_prior: bool = False,
+        open3d_odom_motion_gate: bool = False,
         open3d_odom_max_trans_per_edge: float = 0.15,
         open3d_odom_max_rot_deg_per_edge: float = 8.0,
         open3d_odom_depth_min: float = 0.1,
@@ -2291,11 +2389,18 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         open3d_icp_robust_kernel: str = "huber",
         open3d_icp_sigma: float = 0.05,
         streaming_resolution: int = 1,
+        depth_scale: float = 1000.0,
+        sync_estimate_offset: bool = False,
+        sync_offset_ms: str | float = "0",
+        sync_report_json: str = "",
+        rgb_encoding_override: str = "",
+        source_label: str = "RealsenseBag",
+        profile: str = "realsense",
     ):
         # Intentionally bypass OrbbecRosBagFrameSource.__init__ — we read a
         # different bag format and set up the same instance state directly.
         try:
-            from rosbags.rosbag1 import Reader as Rosbag1Reader
+            from rosbags.highlevel import AnyReader
         except ImportError:
             raise ImportError(
                 "rosbags is required for RealsenseRosBagFrameSource. "
@@ -2304,45 +2409,63 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         import io as _io
         import numpy as np
         from PIL import Image as _Img
+        from utils.rgbd_frames import decode_color_image, decode_depth_image, depth_to_uint16_png
+        from utils.rosbag_rgbd_source import _image_msg_to_array
 
         sync_ns = int(sync_threshold_ms * 1e6)
 
-        color_msgs: list = []   # (ts_ns, height, width, bgr_bytes)
-        depth_msgs: list = []   # (ts_ns, height, width, raw_uint16_bytes)
+        color_msgs: list[StampedMsg] = []
+        depth_msgs: list[StampedMsg] = []
         color_intrinsics: Optional[tuple] = None  # (fx,fy,cx,cy,W,H)
         depth_intrinsics: Optional[tuple] = None
 
-        with Rosbag1Reader(path) as reader:
+        def _msg_stamp_ns(msg, fallback_ns: int) -> int:
+            header = getattr(msg, "header", None)
+            stamp = getattr(header, "stamp", None)
+            if stamp is not None:
+                sec = int(getattr(stamp, "secs", getattr(stamp, "sec", 0)))
+                nsec = int(getattr(stamp, "nsecs", getattr(stamp, "nanosec", 0)))
+                if sec or nsec:
+                    return sec * 1_000_000_000 + nsec
+            return int(fallback_ns)
+
+        with AnyReader([Path(path)]) as reader:
             conns = [c for c in reader.connections
                      if c.topic in {color_topic, depth_topic, color_info_topic, depth_info_topic}]
             for conn, ts, data in reader.messages(connections=conns):
                 topic = conn.topic
                 msg = reader.deserialize(data, conn.msgtype)
-                header = getattr(msg, "header", None)
-                stamp = getattr(header, "stamp", None)
-                if stamp is not None:
-                    sec = int(getattr(stamp, "secs", getattr(stamp, "sec", 0)))
-                    nsec = int(getattr(stamp, "nsecs", getattr(stamp, "nanosec", 0)))
-                    msg_ts = sec * 1_000_000_000 + nsec if (sec or nsec) else ts
-                else:
-                    msg_ts = ts
+                msg_ts = _msg_stamp_ns(msg, ts)
+                frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))
 
                 if topic == color_topic:
-                    h, w = int(msg.height), int(msg.width)
-                    raw = bytes(msg.data)
-                    color_msgs.append((msg_ts, h, w, raw))
+                    arr, enc = _image_msg_to_array(msg)
+                    color_msgs.append(StampedMsg(
+                        topic=topic,
+                        header_ns=msg_ts,
+                        bag_ns=int(ts),
+                        payload=arr,
+                        frame_id=frame_id,
+                        encoding=str(enc),
+                    ))
                 elif topic == depth_topic:
-                    h, w = int(msg.height), int(msg.width)
-                    raw = bytes(msg.data)
-                    depth_msgs.append((msg_ts, h, w, raw))
+                    arr, enc = _image_msg_to_array(msg)
+                    depth_msgs.append(StampedMsg(
+                        topic=topic,
+                        header_ns=msg_ts,
+                        bag_ns=int(ts),
+                        payload=arr,
+                        frame_id=frame_id,
+                        encoding=str(enc),
+                    ))
                 elif topic == color_info_topic and color_intrinsics is None:
-                    K = msg.k
+                    K = getattr(msg, "k", getattr(msg, "K"))
                     color_intrinsics = (
                         float(K[0]), float(K[4]), float(K[2]), float(K[5]),
                         int(msg.width), int(msg.height),
                     )
                 elif topic == depth_info_topic and depth_intrinsics is None:
-                    K = msg.k
+                    K = getattr(msg, "k", getattr(msg, "K"))
                     depth_intrinsics = (
                         float(K[0]), float(K[4]), float(K[2]), float(K[5]),
                         int(msg.width), int(msg.height),
@@ -2352,49 +2475,105 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
             raise RuntimeError(f"No '{color_info_topic}' messages found in {path}")
         fx, fy, cx, cy, width, height = color_intrinsics
 
-        # Sync color and depth by nearest timestamp
-        depth_ts_arr = np.array([m[0] for m in depth_msgs], dtype=np.int64)
-        synced: list = []
-        for color_ts, c_h, c_w, c_raw in color_msgs[::frame_stride]:
-            di = int(np.searchsorted(depth_ts_arr, color_ts))
-            di = min(di, len(depth_ts_arr) - 1)
-            if di > 0 and abs(depth_ts_arr[di - 1] - color_ts) < abs(depth_ts_arr[di] - color_ts):
-                di -= 1
-            if abs(depth_ts_arr[di] - color_ts) > sync_ns:
-                continue
-            d_ts, d_h, d_w, d_raw = depth_msgs[di]
-            synced.append((color_ts, c_h, c_w, c_raw, d_h, d_w, d_raw))
-            if max_frames > 0 and len(synced) >= max_frames:
-                break
+        color_for_sync = color_msgs[::max(1, int(frame_stride))]
+        estimated_offset_ns = estimate_stream_offset_ns(
+            [m.header_ns for m in color_for_sync],
+            [m.header_ns for m in depth_msgs],
+        )
+        offset_ns = estimated_offset_ns if sync_estimate_offset else int(round(_parse_ms_offset(sync_offset_ms) * 1e6))
+        pairs, pair_stats = sync_color_depth_unique(
+            color_for_sync,
+            depth_msgs,
+            max_dt_ns=sync_ns,
+            offset_ns=offset_ns,
+        )
+        if max_frames > 0:
+            pairs = pairs[:max_frames]
+        synced = [(color_for_sync[ci], depth_msgs[di], dt) for ci, di, dt in pairs]
 
-        def _encode_rgb_png(h: int, w: int, bgr_bytes: bytes) -> bytes:
-            arr = np.frombuffer(bgr_bytes, dtype=np.uint8).reshape(h, w, 3)
-            rgb = arr[:, :, ::-1]  # BGR→RGB
+        rgb_depth_stats = dict(pair_stats.rgb_depth_dt_ns)
+        raw_dts = rgb_depth_stats.pop("_raw", None)
+        sync_stats = SyncStats(
+            accepted=len(synced),
+            rejected_no_depth=pair_stats.rejected_no_depth,
+            reused_depth=0,
+            rgb_depth_dt_ns=rgb_depth_stats,
+            estimated_offset_ns=int(estimated_offset_ns),
+            compensated_dt_ns=(
+                None if not offset_ns or not raw_dts
+                else {
+                    "count": len(raw_dts),
+                    "median_ns": float(np.median(np.asarray(raw_dts, dtype=np.int64) - offset_ns)),
+                    "abs_p95_ns": float(np.percentile(np.abs(np.asarray(raw_dts, dtype=np.int64) - offset_ns), 95)),
+                }
+            ),
+            p95_violation=not check_p95_within_threshold(pair_stats, sync_ns),
+        )
+        report_path = sync_report_json
+        if not report_path:
+            report_path = str(Path(path).parent / "ros1_rgbd_sync_report.json")
+        write_sync_report(report_path, sync_stats, extras={
+            "source": source_label,
+            "profile": profile,
+            "bag": str(path),
+            "color_topic": color_topic,
+            "depth_topic": depth_topic,
+            "color_info_topic": color_info_topic,
+            "depth_info_topic": depth_info_topic,
+            "sync_threshold_ms": float(sync_threshold_ms),
+            "estimated_offset_ms": float(estimated_offset_ns) / 1e6,
+            "applied_offset_ms": float(offset_ns) / 1e6,
+            "frame_stride": int(frame_stride),
+            "max_frames": int(max_frames),
+            "color_count": len(color_msgs),
+            "depth_count": len(depth_msgs),
+        })
+
+        def _encode_rgb_png(msg: StampedMsg) -> bytes:
+            rgb = decode_color_image(msg.payload, msg.encoding, encoding_override=rgb_encoding_override)
             buf = _io.BytesIO()
             _Img.fromarray(rgb, mode="RGB").save(buf, format="PNG")
             return buf.getvalue()
 
-        def _encode_depth_png(h: int, w: int, raw_bytes: bytes) -> bytes:
-            arr = np.frombuffer(raw_bytes, dtype=np.uint16).reshape(h, w)
+        def _encode_depth_png(msg: StampedMsg) -> bytes:
+            depth = decode_depth_image(msg.payload, msg.encoding)
+            depth_u16 = depth_to_uint16_png(depth, depth_scale)
             buf = _io.BytesIO()
-            _Img.fromarray(arr, mode="I;16").save(buf, format="PNG")
+            _Img.fromarray(depth_u16, mode="I;16").save(buf, format="PNG")
             return buf.getvalue()
 
         self._frames: List[StreamingRGBDFrame] = []
-        for color_ts, c_h, c_w, c_raw, d_h, d_w, d_raw in synced:
-            rgb_png = _encode_rgb_png(c_h, c_w, c_raw)
-            depth_png = _encode_depth_png(d_h, d_w, d_raw)
+        for color_msg, depth_msg, raw_dt_ns in synced:
+            rgb_png = _encode_rgb_png(color_msg)
+            depth_png = _encode_depth_png(depth_msg)
+            depth_kwargs = {}
+            if depth_intrinsics is not None:
+                dfx, dfy, dcx, dcy, dw, dh = depth_intrinsics
+                depth_kwargs = {
+                    "depth_fx": dfx,
+                    "depth_fy": dfy,
+                    "depth_cx": dcx,
+                    "depth_cy": dcy,
+                    "depth_width": dw,
+                    "depth_height": dh,
+                }
             self._frames.append(StreamingRGBDFrame(
                 index=len(self._frames),
-                timestamp=float(color_ts) * 1e-9,
+                timestamp=float(color_msg.header_ns) * 1e-9,
                 rgb_path="",
                 depth_path=None,
                 c2w=None,
                 fx=fx, fy=fy, cx=cx, cy=cy,
                 width=width, height=height,
-                depth_scale=1000.0,
+                depth_scale=float(depth_scale),
                 _rgb_bytes=rgb_png,
                 _depth_bytes=depth_png,
+                color_ts_ns=color_msg.header_ns,
+                depth_ts_ns=depth_msg.header_ns,
+                rgb_depth_dt_ns=int(raw_dt_ns),
+                color_bag_ns=color_msg.bag_ns,
+                depth_bag_ns=depth_msg.bag_ns,
+                **depth_kwargs,
             ))
 
         self._fx = fx
@@ -2403,7 +2582,7 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._cy = cy
         self._width = width
         self._height = height
-        self._depth_scale = 1000.0
+        self._depth_scale = float(depth_scale)
 
         _R = int(streaming_resolution)
         if _R > 1:
@@ -2423,6 +2602,8 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._live_odom_stride = max(1, int(open3d_odom_stride))
         self._live_odom_downscale = max(1, int(open3d_odom_downscale))
         self._live_odom_max_failure_ratio = float(open3d_odom_max_failure_ratio)
+        self._live_odom_motion_prior = bool(open3d_odom_motion_prior)
+        self._live_odom_motion_gate = bool(open3d_odom_motion_gate)
         self._live_odom_max_trans = float(open3d_odom_max_trans_per_edge) if open3d_odom_max_trans_per_edge > 0 else float("inf")
         self._live_odom_max_rot = float(open3d_odom_max_rot_deg_per_edge) if open3d_odom_max_rot_deg_per_edge > 0 else float("inf")
         self._odom_depth_min = float(open3d_odom_depth_min)
@@ -2467,14 +2648,20 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
             max_frames=max_frames,
             fx=fx, fy=fy, cx=cx, cy=cy,
             width=width, height=height,
-            synced=[(ts,) for ts, *_ in synced],
+            synced=[(color_msg.header_ns,) for color_msg, *_ in synced],
             odom_stride=open3d_odom_stride,
             odom_downscale=open3d_odom_downscale,
             odom_method=open3d_odom_method,
             icp_max_distance=open3d_icp_max_distance,
             icp_robust_kernel=open3d_icp_robust_kernel,
             icp_sigma=open3d_icp_sigma,
+            motion_prior=open3d_odom_motion_prior,
+            motion_gate=open3d_odom_motion_gate,
             mode="live",
+            depth_scale=depth_scale,
+            depth_info_topic=depth_info_topic,
+            sync_offset_ns=offset_ns,
+            profile=profile,
         )
         live_cache_path = self._open3d_odom_cache_path(
             bag_path=str(Path(path).parent),  # .bag is a file; put cache beside it
@@ -2499,8 +2686,11 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
             self._start_live_odom_worker()
 
         print(
-            f"[streaming] RealsenseBag: {len(self._frames)} synced frames from {path} "
-            f"(color={len(color_msgs)}, depth={len(depth_msgs)}, pose_source=open3d_odometry_live)"
+            f"[streaming] {source_label}: {len(self._frames)} synced frames from {path} "
+            f"(color={len(color_msgs)}, depth={len(depth_msgs)}, sync={format_stats_oneline(sync_stats)}, "
+            f"pose_source=open3d_odometry_live, "
+            f"motion_prior={self._live_odom_motion_prior}, "
+            f"motion_gate={self._live_odom_motion_gate}, sync_report={report_path})"
         )
 
 
@@ -2591,13 +2781,31 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
         if len(_bags) == 1:
             _bag_file = os.path.join(path, _bags[0])
     if _bag_file is not None:
+        _profile = _select_ros1_bag_profile(_bag_file, getattr(args, "rosbag_profile", "auto"))
+        _defaults = _ROS1_BAG_PROFILES[_profile]
+        _color_topic = getattr(args, "rosbag_color_topic", "") or (
+            getattr(args, "realsense_color_topic", "") if _profile == "realsense" else ""
+        ) or _defaults["color_topic"]
+        _depth_topic = getattr(args, "rosbag_depth_topic", "") or (
+            getattr(args, "realsense_depth_topic", "") if _profile == "realsense" else ""
+        ) or _defaults["depth_topic"]
+        _color_info_topic = getattr(args, "rosbag_color_info_topic", "") or (
+            getattr(args, "realsense_color_info_topic", "") if _profile == "realsense" else ""
+        ) or _defaults["color_info_topic"]
+        _depth_info_topic = getattr(args, "rosbag_depth_info_topic", "") or (
+            getattr(args, "realsense_depth_info_topic", "") if _profile == "realsense" else ""
+        ) or _defaults["depth_info_topic"]
+        _sync_report_json = getattr(args, "rosbag_sync_report_json", "")
+        if not _sync_report_json and getattr(args, "model_path", ""):
+            _sync_report_json = os.path.join(args.model_path, "rosbag_sync_report.json")
+        _depth_scale = float(getattr(args, "rosbag_depth_scale", 0.0) or _defaults["depth_scale"])
         return RealsenseRosBagFrameSource(
             _bag_file,
-            color_topic=getattr(args, "realsense_color_topic", "/device_0/sensor_1/Color_0/image/data"),
-            depth_topic=getattr(args, "realsense_depth_topic", "/device_0/sensor_0/Depth_0/image/data"),
-            color_info_topic=getattr(args, "realsense_color_info_topic", "/device_0/sensor_1/Color_0/info/camera_info"),
-            depth_info_topic=getattr(args, "realsense_depth_info_topic", "/device_0/sensor_0/Depth_0/info/camera_info"),
-            sync_threshold_ms=getattr(args, "realsense_sync_threshold_ms", 33.0),
+            color_topic=_color_topic,
+            depth_topic=_depth_topic,
+            color_info_topic=_color_info_topic,
+            depth_info_topic=_depth_info_topic,
+            sync_threshold_ms=getattr(args, "rosbag_sync_threshold_ms", getattr(args, "realsense_sync_threshold_ms", 33.0)),
             max_frames=getattr(args, "streaming_max_frames", 0),
             frame_stride=getattr(args, "streaming_frame_stride", 1),
             open3d_odom_max_failure_ratio=getattr(args, "orbbec_open3d_odom_max_failure_ratio", 0.25),
@@ -2607,6 +2815,8 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
             open3d_odom_async=getattr(args, "orbbec_open3d_odom_async", False),
             open3d_odom_async_queue_size=getattr(args, "orbbec_open3d_odom_async_queue_size", 32),
+            open3d_odom_motion_prior=getattr(args, "orbbec_open3d_odom_motion_prior", False),
+            open3d_odom_motion_gate=getattr(args, "orbbec_open3d_odom_motion_gate", False),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
             open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
@@ -2617,6 +2827,13 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_icp_robust_kernel=getattr(args, "orbbec_open3d_icp_robust_kernel", "huber"),
             open3d_icp_sigma=getattr(args, "orbbec_open3d_icp_sigma", 0.05),
             streaming_resolution=getattr(args, "streaming_resolution", 1),
+            depth_scale=_depth_scale,
+            sync_estimate_offset=getattr(args, "rosbag_sync_estimate_offset", False),
+            sync_offset_ms=getattr(args, "rosbag_sync_offset_ms", "0"),
+            sync_report_json=_sync_report_json,
+            rgb_encoding_override=getattr(args, "rosbag_rgb_encoding_override", ""),
+            source_label=str(_defaults["label"]),
+            profile=_profile,
         )
     # Orbbec ROS2 slam bag: metadata.yaml (rosbag2 format)
     if os.path.exists(os.path.join(path, "metadata.yaml")):
@@ -2643,6 +2860,8 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             open3d_odom_downscale=getattr(args, "orbbec_open3d_odom_downscale", 1),
             open3d_odom_async=getattr(args, "orbbec_open3d_odom_async", False),
             open3d_odom_async_queue_size=getattr(args, "orbbec_open3d_odom_async_queue_size", 32),
+            open3d_odom_motion_prior=getattr(args, "orbbec_open3d_odom_motion_prior", False),
+            open3d_odom_motion_gate=getattr(args, "orbbec_open3d_odom_motion_gate", False),
             open3d_odom_max_trans_per_edge=getattr(args, "orbbec_open3d_odom_max_trans_per_edge", 0.15),
             open3d_odom_max_rot_deg_per_edge=getattr(args, "orbbec_open3d_odom_max_rot_deg_per_edge", 8.0),
             open3d_odom_depth_min=getattr(args, "streaming_min_depth", 0.1),
