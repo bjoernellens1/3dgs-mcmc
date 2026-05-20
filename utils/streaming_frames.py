@@ -2400,7 +2400,8 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         # Intentionally bypass OrbbecRosBagFrameSource.__init__ — we read a
         # different bag format and set up the same instance state directly.
         try:
-            from rosbags.highlevel import AnyReader
+            from rosbags.rosbag1 import Reader
+            from rosbags.typesys import Stores, get_typestore
         except ImportError:
             raise ImportError(
                 "rosbags is required for RealsenseRosBagFrameSource. "
@@ -2411,6 +2412,11 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         from PIL import Image as _Img
         from utils.rgbd_frames import decode_color_image, decode_depth_image, depth_to_uint16_png
         from utils.rosbag_rgbd_source import _image_msg_to_array
+
+        # RealSense Viewer bags are ROS1 format but use CDR serialization internally.
+        # AnyReader.deserialize() dispatches to deserialize_ros1 which fails on CDR payloads.
+        # Use rosbag1.Reader + typestore.deserialize_cdr() — same pattern as OrbbecRosBagFrameSource.
+        typestore = get_typestore(Stores.ROS2_HUMBLE)
 
         sync_ns = int(sync_threshold_ms * 1e6)
 
@@ -2429,12 +2435,12 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
                     return sec * 1_000_000_000 + nsec
             return int(fallback_ns)
 
-        with AnyReader([Path(path)]) as reader:
+        with Reader(path) as reader:
             conns = [c for c in reader.connections
                      if c.topic in {color_topic, depth_topic, color_info_topic, depth_info_topic}]
             for conn, ts, data in reader.messages(connections=conns):
                 topic = conn.topic
-                msg = reader.deserialize(data, conn.msgtype)
+                msg = typestore.deserialize_cdr(data, conn.msgtype)
                 msg_ts = _msg_stamp_ns(msg, ts)
                 frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))
 
