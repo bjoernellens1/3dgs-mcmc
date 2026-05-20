@@ -211,7 +211,9 @@ class OptimizationParams(ParamGroup):
         self.sparse_energy_global_interval = 500
         self.benchmark_dir = ""
         self.noise_lr = 5e5
-        self.noise_max_step = 0.01  # max per-iter MCMC displacement (metres); 0 = unclamped
+        self.noise_max_step = 0.01   # max per-iter MCMC L2 displacement (metres); 0 = unclamped
+        self.noise_max_scale = 0.05  # per-axis scale cap for noise covariance; 0 = unclamped
+        self.anisotropy_reg = 0.01   # weight for max/min scale ratio penalty; 0 = disabled
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01

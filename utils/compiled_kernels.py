@@ -209,12 +209,21 @@ def _utility_core(
     )
 
 
-def _active_reg_core(opacity, scaling, w_opacity, w_scale):
+def _active_reg_core(opacity, scaling, w_opacity, w_scale, w_aniso=0.0, aniso_max=10.0):
     """
     Active-set L1 regularizer core.
     NOTE: Always runs eager — active-set shapes change every iteration.
+
+    w_aniso > 0 adds a penalty on the max/min scale ratio, discouraging
+    needle-shaped Gaussians that cause axis-aligned MCMC drift.
     """
-    return w_opacity * torch.abs(opacity).mean() + w_scale * torch.abs(scaling).mean()
+    loss = w_opacity * torch.abs(opacity).mean() + w_scale * torch.abs(scaling).mean()
+    if w_aniso > 0.0 and scaling.shape[-1] >= 2:
+        s_max = scaling.max(dim=-1).values
+        s_min = scaling.min(dim=-1).values.clamp(min=1e-6)
+        ratio = (s_max / s_min).clamp(max=aniso_max)
+        loss = loss + w_aniso * ratio.mean()
+    return loss
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +301,9 @@ def utility_core(
     )
 
 
-def active_reg_core(opacity, scaling, w_opacity=0.01, w_scale=0.01):
+def active_reg_core(opacity, scaling, w_opacity=0.01, w_scale=0.01, w_aniso=0.0, aniso_max=10.0):
     """Active-set L1 regularizer — always eager (shape changes every iteration)."""
-    return _active_reg_core(opacity, scaling, w_opacity, w_scale)
+    return _active_reg_core(opacity, scaling, w_opacity, w_scale, w_aniso=w_aniso, aniso_max=aniso_max)
 
 
 # ---------------------------------------------------------------------------

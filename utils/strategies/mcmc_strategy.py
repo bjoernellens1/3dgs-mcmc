@@ -62,8 +62,16 @@ class ScheduledMCMCStrategy:
             if noise_idx.numel() == 0:
                 return
 
+            # Cap per-axis scale before building noise covariance.
+            # Without this, needles (e.g. scale=(0.3, 0.02, 0.02)) have a 225×
+            # eigenvalue ratio, so the noise direction is overwhelmingly biased
+            # along the major axis — causing persistent axis-aligned drift.
+            noise_max_scale = float(getattr(args, "noise_max_scale", 0.05))
+            scales_for_noise = gaussians.get_scaling[noise_idx]
+            if noise_max_scale > 0:
+                scales_for_noise = scales_for_noise.clamp(max=noise_max_scale)
             L = build_scaling_rotation(
-                gaussians.get_scaling[noise_idx],
+                scales_for_noise,
                 gaussians.get_rotation[noise_idx],
             )
             actual_covariance = L @ L.transpose(1, 2)

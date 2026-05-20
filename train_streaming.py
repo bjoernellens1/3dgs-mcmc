@@ -1405,6 +1405,7 @@ def _run_rolling_seed(
             
             # Regularization to prevent Gaussians from exploding
             from utils.compiled_kernels import active_reg_core
+            _w_aniso = float(getattr(args, "anisotropy_reg", 0.0))
             if _global_is_selective:
                 _active_reg = pkg["visibility_filter"].detach()
                 _reg_loss = active_reg_core(
@@ -1412,6 +1413,7 @@ def _run_rolling_seed(
                     gaussians.get_scaling[_active_reg],
                     w_opacity=args.opacity_reg,
                     w_scale=args.scale_reg,
+                    w_aniso=_w_aniso,
                 )
             else:
                 _reg_loss = active_reg_core(
@@ -1419,9 +1421,10 @@ def _run_rolling_seed(
                     gaussians.get_scaling,
                     w_opacity=args.opacity_reg,
                     w_scale=args.scale_reg,
+                    w_aniso=_w_aniso,
                 )
             loss = loss + _reg_loss
-            
+
             mcmc_strategy.step_pre_backward(gaussians=gaussians, args=args, iteration=_it, render_pkg=pkg, loss=loss)
             loss.backward()
             
@@ -2453,17 +2456,19 @@ def streaming_training(
 
         # Regularisation: local (visible) or global depending on active-set mode
         from utils.compiled_kernels import active_reg_core
+        _w_aniso = float(getattr(args, "anisotropy_reg", 0.0))
         if sparse_active_set:
             # Step 10: Refine active set to include provisional/new points
             _visible = render_pkg["visibility_filter"].detach()
             _provisional = gaussians.provisional.detach()
             _active = _visible | _provisional
-            
+
             loss = loss + active_reg_core(
                 gaussians.get_opacity[_active],
                 gaussians.get_scaling[_active],
                 w_opacity=args.opacity_reg,
                 w_scale=args.scale_reg,
+                w_aniso=_w_aniso,
             )
         else:
             loss = loss + active_reg_core(
@@ -2471,6 +2476,7 @@ def streaming_training(
                 gaussians.get_scaling,
                 w_opacity=args.opacity_reg,
                 w_scale=args.scale_reg,
+                w_aniso=_w_aniso,
             )
 
         # Energy-guided losses (full path, same as offline when enabled)
@@ -3062,6 +3068,11 @@ def streaming_training(
                         (gaussians.get_opacity.squeeze(-1) < 0.05).float().mean().item(),
                         iteration,
                     )
+                    # Track anisotropy: mean ratio of max/min scale (healthy = near 1–3)
+                    with torch.no_grad():
+                        _s = gaussians.get_scaling
+                        _aniso = (_s.max(dim=-1).values / _s.min(dim=-1).values.clamp(min=1e-6)).mean()
+                    tb_writer.add_scalar("streaming/anisotropy_mean", _aniso.item(), iteration)
                 if _depth_loss_val is not None:
                     tb_writer.add_scalar("train/depth_loss", _depth_loss_val, iteration)
                 if _free_loss_val is not None:
