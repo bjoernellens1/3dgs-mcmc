@@ -203,9 +203,14 @@ def compute_dead_mask(
     """
     Compute dead mask combining opacity, support, and optionally utility.
 
-    Core rule (OR so that drifters with stale visibility EMA are still pruned):
-        dead_j = (alpha_j < opacity_threshold) OR (support_j < support_threshold * 0.5)
-    optionally OR (low opacity AND utility_j < quantile(utility, q))
+    Composite rule:
+        1. Unconditional kill: alpha < opacity_threshold * 0.1 (near-zero, no recovery)
+        2. Conservative kill: alpha < opacity_threshold AND support < support_threshold
+           (both weak — requires convergent evidence, not just one signal)
+        3. Optional utility bottom-quantile kill (requires 1+2 opacity gate)
+
+    This avoids the pure support-based OR from the previous version which
+    killed valid geometry after ~260 invisible iterations (< 2 frames at spf=150).
 
     Args:
         gaussians: GaussianModel instance
@@ -214,7 +219,7 @@ def compute_dead_mask(
         support_threshold: support EMA dead threshold
         utility_quantile: bottom quantile for utility-based death
         use_utility_quantile: whether to append utility quantile death
-        min_visibility_count: minimum times visible to survive
+        min_visibility_count: unused (kept for API compatibility)
     Returns:
         [N] bool mask
     """
@@ -222,17 +227,17 @@ def compute_dead_mask(
     alpha = gaussians.get_opacity.squeeze(-1)
     support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else torch.ones_like(alpha)
 
-    # OR so low-opacity drifters are killed even when their stale visibility EMA
-    # keeps them above the support threshold.  The support clause uses 0.5× the
-    # threshold to avoid over-pruning Gaussians that are simply momentarily occluded.
-    dead = (alpha < opacity_threshold) | (support < support_threshold * 0.5)
-    
+    very_low_opacity = opacity_threshold * 0.1  # ~0.0005 — unambiguously dead
+
+    # Clause 1: unconditionally kill near-zero opacity regardless of visibility
+    dead = alpha < very_low_opacity
+
+    # Clause 2: kill only when BOTH opacity AND support are below threshold
+    # (avoids killing temporarily-occluded Gaussians based on support alone)
+    dead = dead | ((alpha < opacity_threshold) & (support < support_threshold))
+
     if use_utility_quantile and utility is not None and utility.numel() > 0:
         q_val = torch.quantile(utility, utility_quantile)
         dead = dead | ((alpha < opacity_threshold) & (utility < q_val))
-    
-    # NOTE: visibility tracking across iterations would require
-    # accumulating visibility counts. For now we use current frame only.
-    # Future enhancement: track xyz_gradient_accum as proxy for activity.
-    
+
     return dead
