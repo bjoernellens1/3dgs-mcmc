@@ -373,6 +373,14 @@ class StreamingScene:
             o_fy = other_frame.depth_fy if other_frame.depth_fy is not None else other_frame.fy
             o_cx = other_frame.depth_cx if other_frame.depth_cx is not None else other_frame.cx
             o_cy = other_frame.depth_cy if other_frame.depth_cy is not None else other_frame.cy
+            if other_frame.depth_fx is not None:
+                _odw = getattr(other_frame, 'depth_width', None) or other_w
+                _odh = getattr(other_frame, 'depth_height', None) or other_h
+                if _odw != other_w or _odh != other_h:
+                    o_fx = o_fx * other_w / _odw
+                    o_fy = o_fy * other_h / _odh
+                    o_cx = o_cx * other_w / _odw
+                    o_cy = o_cy * other_h / _odh
             u = np.round((pts_other[:, 0] / np.maximum(z_other, 1e-6)) * float(o_fx) + float(o_cx)).astype(np.int32)
             v = np.round((pts_other[:, 1] / np.maximum(z_other, 1e-6)) * float(o_fy) + float(o_cy)).astype(np.int32)
 
@@ -396,6 +404,15 @@ class StreamingScene:
         max_depth = getattr(self.args, "streaming_max_depth", 8.0)
         max_pts = getattr(self.args, "rgbd_max_init_points", 250000)
 
+        # When depth is globally disabled, skip to random bootstrap immediately
+        if not getattr(self.args, "streaming_insert_from_depth", True):
+            r = self.cameras_extent
+            n = max(1000, getattr(self.args, "cap_max", 10000) // 10)
+            pts = np.random.uniform(-r, r, (n, 3)).astype(np.float32)
+            cols = np.random.uniform(0.3, 0.7, (n, 3)).astype(np.float32)
+            print("[streaming] Bootstrap: depth disabled, using random init.", flush=True)
+            return BasicPointCloud(points=pts, colors=cols, normals=np.zeros_like(pts))
+
         loaded = []
         for frame in frames:
             if frame.depth_path is None and frame._depth_bytes is None:
@@ -411,6 +428,7 @@ class StreamingScene:
                     loaded.append(None)
                     continue
                 depth = np.asarray(depth_raw)
+                _depth_native_h, _depth_native_w = depth.shape[:2]
                 _target = (int(frame.height), int(frame.width))
                 if depth.shape[:2] != _target:
                     depth = np.array(_Image.fromarray(depth).resize(
@@ -442,6 +460,11 @@ class StreamingScene:
             d_fy = frame.depth_fy if frame.depth_fy is not None else frame.fy
             d_cx = frame.depth_cx if frame.depth_cx is not None else frame.cx
             d_cy = frame.depth_cy if frame.depth_cy is not None else frame.cy
+            if frame.depth_fx is not None and (_depth_native_w != _target[1] or _depth_native_h != _target[0]):
+                d_fx = d_fx * _target[1] / _depth_native_w
+                d_fy = d_fy * _target[0] / _depth_native_h
+                d_cx = d_cx * _target[1] / _depth_native_w
+                d_cy = d_cy * _target[0] / _depth_native_h
             if seed_temporal and len(loaded) > 1:
                 other_item = None
                 for j in (idx - 1, idx + 1):
@@ -479,6 +502,20 @@ class StreamingScene:
             z_v = z_v[valid].astype(np.float32)
             pts_world, cols = backproject_depth_pixels(
                 z_v, xs_v, ys_v, d_fx, d_fy, d_cx, d_cy, frame.c2w, rgb, (h, w))
+            if frame.depth_fx is not None and (_depth_native_w != _target[1] or _depth_native_h != _target[0]):
+                x_over_z = (xs_v - d_cx) / d_fx
+                y_over_z = (ys_v - d_cy) / d_fy
+                u_color = (x_over_z * frame.fx + frame.cx).round().astype(np.int32)
+                v_color = (y_over_z * frame.fy + frame.cy).round().astype(np.int32)
+                in_fov = (u_color >= 0) & (u_color < frame.width) & (v_color >= 0) & (v_color < frame.height)
+                if not in_fov.all():
+                    pts_world = pts_world[in_fov]
+                    u_color = u_color[in_fov]
+                    v_color = v_color[in_fov]
+                rgb_h, rgb_w = rgb.shape[:2]
+                uc = np.clip(u_color, 0, rgb_w - 1)
+                vc = np.clip(v_color, 0, rgb_h - 1)
+                cols = rgb[vc, uc].astype(np.float32)
             points_all.append(pts_world)
             colors_all.append(cols)
 
