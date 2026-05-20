@@ -154,6 +154,26 @@ docker compose run --rm \
     --iterations 30000
 ```
 
+## Run Contracts
+
+Rules that apply to every non-smoke evaluation run. Violating these makes results incomparable.
+
+### Full trajectory coverage (streaming runs)
+Every frame in the dataset must be ingested at least once. The training loop enforces this automatically: `streaming_enforce_full_coverage=True` (default) auto-adjusts `steps_per_frame` down so that `steps_per_frame × n_frames ≤ iterations`.
+
+**Do not pass `--streaming_steps_per_frame` without also verifying coverage.** Instead, set `--iterations` to the desired budget and let enforcement compute the right `steps_per_frame`:
+```
+steps_per_frame = floor(iterations / n_dataset_frames)
+```
+
+**Opt-out for smoke tests only**: `--no-streaming_enforce_full_coverage` — must never appear in evaluation or ablation runs.
+
+### Comparison runs must share the same scene
+When comparing two configs, both must use the same dataset, same `--cap_max`, same `--iterations`. Differences in frame count (e.g. `--streaming_max_frames`) must be identical between compared runs.
+
+### Sequential GPU runs
+All evaluation runs must be run **sequentially**, never in parallel — the system has a single AMD iGPU with shared VRAM. Launching two docker containers simultaneously causes OOM.
+
 ## Output Structure
 
 Each run writes to `output/<model_path>/`:

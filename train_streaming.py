@@ -1797,6 +1797,23 @@ def streaming_training(
     if len(frame_source) == 0:
         raise RuntimeError("[streaming] Frame source is empty — check dataset path.")
 
+    # --- Full-coverage enforcement ------------------------------------------
+    # Contract: every frame must be ingested at least once unless
+    # --no-streaming_enforce_full_coverage is passed (smoke tests only).
+    if getattr(args, "streaming_enforce_full_coverage", True):
+        n_frames = len(frame_source)
+        total_iters = opt.iterations
+        configured_spf = max(1, getattr(args, "streaming_steps_per_frame", 150))
+        max_spf = max(1, total_iters // n_frames) if n_frames > 0 else configured_spf
+        if configured_spf > max_spf:
+            print(
+                f"[streaming] Full-coverage enforcement: steps_per_frame {configured_spf} → {max_spf} "
+                f"({n_frames} frames × {max_spf} steps = {n_frames * max_spf} iters ≤ {total_iters}). "
+                f"Pass --no-streaming_enforce_full_coverage to override (smoke tests only).",
+                flush=True,
+            )
+            args.streaming_steps_per_frame = max_spf
+
     streaming_scene = StreamingScene(args, gaussians, frame_source)
 
     # Initialise Gaussians from first K frames BEFORE training_setup() so

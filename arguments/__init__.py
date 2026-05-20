@@ -325,6 +325,7 @@ class StreamingParams(ParamGroup):
         self.streaming_input_fps = 30.0
         self.streaming_wallclock = False          # False = deterministic step-based simulation (legacy)
         self.streaming_steps_per_frame = 150      # release one frame every N training iterations
+        self.streaming_enforce_full_coverage = True  # auto-adjust steps_per_frame so all frames are seen
         # Ingestion pacing mode: iter_based | dataset_fps | wallclock_strict
         # iter_based      — deterministic, release every streaming_steps_per_frame iters (default)
         # dataset_fps     — simulated clock; train as many iters as possible per real-time second;
