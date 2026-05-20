@@ -341,6 +341,9 @@ class StreamingParams(ParamGroup):
         # Compatibility mode: make depth insertion obey cap_max. Default False
         # because SLAM map size is unknown and depth insertion is sensor-driven.
         self.streaming_depth_respects_cap = False
+        # Out-of-bounds Gaussian pruning at global maintenance cadence.
+        # Prunes Gaussians outside the camera-trajectory AABB expanded by 3×max_depth.
+        self.streaming_bbox_prune = True
         # Local MCMC: restrict noise/reloc to visible/active Gaussians only
         self.streaming_mcmc_local_only = True
         # Global maintenance: run full MCMC pass every N iterations (0 = never)

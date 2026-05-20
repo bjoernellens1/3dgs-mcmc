@@ -77,6 +77,7 @@ class ScheduledMCMCStrategy:
             noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
             max_step = float(getattr(args, "noise_max_step", 0.01))
             if max_step > 0:
+                # Clamp per-Gaussian L2 displacement to max_step metres
                 step_norm = noise.norm(dim=-1, keepdim=True).clamp_min(max_step)
                 noise = noise * (max_step / step_norm)
             gaussians._xyz[noise_idx].add_(noise)
