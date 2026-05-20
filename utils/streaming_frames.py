@@ -2413,10 +2413,18 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         from utils.rgbd_frames import decode_color_image, decode_depth_image, depth_to_uint16_png
         from utils.rosbag_rgbd_source import _image_msg_to_array
 
-        # RealSense Viewer bags are ROS1 format but use CDR serialization internally.
-        # AnyReader.deserialize() dispatches to deserialize_ros1 which fails on CDR payloads.
-        # Use rosbag1.Reader + typestore.deserialize_cdr() — same pattern as OrbbecRosBagFrameSource.
-        typestore = get_typestore(Stores.ROS2_HUMBLE)
+        # RealSense Viewer bags are ROS1 bags with standard ROS1 serialization, but the
+        # Viewer appends a 4-byte metadata block after each Image message payload.
+        # deserialize_ros1 parses the message correctly but raises AssertionError because
+        # pos != len(rawdata) (4 trailing bytes remain). Retry with data[:-4] in that case.
+        # CameraInfo messages are unaffected (no trailing bytes).
+        typestore = get_typestore(Stores.ROS1_NOETIC)
+
+        def _deser(data: bytes, msgtype: str):
+            try:
+                return typestore.deserialize_ros1(data, msgtype)
+            except AssertionError:
+                return typestore.deserialize_ros1(data[:-4], msgtype)
 
         sync_ns = int(sync_threshold_ms * 1e6)
 
@@ -2440,7 +2448,7 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
                      if c.topic in {color_topic, depth_topic, color_info_topic, depth_info_topic}]
             for conn, ts, data in reader.messages(connections=conns):
                 topic = conn.topic
-                msg = typestore.deserialize_cdr(data, conn.msgtype)
+                msg = _deser(data, conn.msgtype)
                 msg_ts = _msg_stamp_ns(msg, ts)
                 frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))
 
