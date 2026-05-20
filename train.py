@@ -908,6 +908,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 beta_opacity=getattr(args, "energy_beta_opacity", 1.0),
                 beta_scale=getattr(args, "energy_beta_scale", 0.5),
                 alpha_dead=getattr(args, "energy_alpha_dead", 0.005),
+                w_aniso_utility=float(getattr(args, "utility_aniso_weight", 0.1)),
+                aniso_soft_limit=float(getattr(args, "utility_aniso_soft_limit", 10.0)),
             )
 
             # Temperature annealing for birth/death sampling

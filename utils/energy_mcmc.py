@@ -130,6 +130,8 @@ def compute_gaussian_utility(
     w_support=2.0,
     beta_opacity=1.0, beta_scale=0.5,
     alpha_dead=0.005,
+    w_aniso_utility=0.1,
+    aniso_soft_limit=10.0,
 ):
     """
     Compute per-Gaussian utility score for MCMC birth/death decisions.
@@ -182,14 +184,24 @@ def compute_gaussian_utility(
         scale_grad = grad.norm(dim=1)
 
     # Scale penalty: penalize oversized Gaussians
-    max_scale = gaussians.get_scaling.max(dim=1).values
+    s = gaussians.get_scaling
+    max_scale = s.max(dim=1).values
 
-    return utility_core(
+    scores = utility_core(
         alpha, v, support, xyz_grad, opacity_grad, scale_grad, max_scale,
         w_alpha=w_alpha, w_vis=w_vis, w_support=w_support, w_grad=w_grad,
         w_scale=w_scale, w_dead=w_dead, beta_opacity=beta_opacity,
         beta_scale=beta_scale, alpha_dead=alpha_dead,
     )
+
+    # Anisotropy penalty: discourage elongated splats from winning parent-selection lottery
+    if w_aniso_utility > 0 and aniso_soft_limit > 0:
+        min_scale = s.min(dim=1).values.clamp_min(1e-6)
+        aniso_ratio = max_scale / min_scale
+        aniso_penalty = torch.clamp(aniso_ratio - aniso_soft_limit, min=0.0) ** 2
+        scores = scores - w_aniso_utility * aniso_penalty
+
+    return scores
 
 
 def compute_dead_mask(
@@ -201,20 +213,27 @@ def compute_dead_mask(
     min_visibility_count=3,
     scale_kill_threshold=0.20,
     scale_moderate_threshold=0.05,
+    scale_moderate_opacity_mult=4.0,
+    scale_dead_support_mult=1.0,
+    anisotropy_kill_ratio=20.0,
 ):
     """
-    Compute dead mask combining opacity, support, scale, and optionally utility.
+    Compute dead mask combining opacity, support, scale, anisotropy, and optionally utility.
 
     Composite rule:
         1. Unconditional kill: alpha < opacity_threshold * 0.1  (near-zero, no recovery)
         2. Conservative kill:  alpha < opacity_threshold AND support < support_threshold
-        3. Scale kill:         max_scale > scale_kill_threshold AND support < support_threshold
+        3. Scale kill:         max_scale > scale_kill_threshold AND support low
            (large Gaussians must be well-supported or they are runaway floaters)
         4. Medium-scale kill:  max_scale > scale_moderate_threshold
-                               AND alpha < opacity_threshold * 4
-                               AND support < support_threshold
+                               AND alpha < opacity_threshold * scale_moderate_opacity_mult
+                               AND support low
            (semi-transparent medium-size splats that are unsupported = blue-dot floaters)
-        5. Optional utility bottom-quantile kill (opacity-gated)
+        5. Anisotropy kill:    s_max/s_min > anisotropy_kill_ratio
+                               AND alpha < opacity_threshold * scale_moderate_opacity_mult
+                               AND support low
+           (needle Gaussians with high axis ratio = white-streak floaters below 0.2m threshold)
+        6. Optional utility bottom-quantile kill (opacity-gated)
 
     Args:
         gaussians: GaussianModel instance
@@ -226,6 +245,9 @@ def compute_dead_mask(
         min_visibility_count: unused (kept for API compatibility)
         scale_kill_threshold: max_scale above which low support = dead (default 0.2 m)
         scale_moderate_threshold: max_scale above which relaxed opacity gate applies (default 0.05 m)
+        scale_moderate_opacity_mult: opacity multiplier for clauses 4+5 (default 4.0)
+        scale_dead_support_mult: multiplier on support_threshold for scale/aniso clauses (default 1.0)
+        anisotropy_kill_ratio: s_max/s_min ratio above which needles are dead (0 = disabled)
     Returns:
         [N] bool mask
     """
@@ -234,6 +256,7 @@ def compute_dead_mask(
     support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else torch.ones_like(alpha)
 
     very_low_opacity = opacity_threshold * 0.1  # ~0.0005 — unambiguously dead
+    eff_support = support_threshold * scale_dead_support_mult
 
     # Clause 1: unconditionally kill near-zero opacity
     dead = alpha < very_low_opacity
@@ -241,18 +264,28 @@ def compute_dead_mask(
     # Clause 2: both opacity AND support below threshold
     dead = dead | ((alpha < opacity_threshold) & (support < support_threshold))
 
-    # Clauses 3+4: scale-aware kills — large/medium unsupported Gaussians are floaters
+    # Clauses 3–5: scale/anisotropy-aware kills
     if hasattr(gaussians, "get_scaling"):
-        max_scale = gaussians.get_scaling.max(dim=-1).values
+        s = gaussians.get_scaling
+        max_scale = s.max(dim=-1).values
         # Clause 3: large Gaussian with any low support → floater (white-streak case)
         if scale_kill_threshold > 0:
-            dead = dead | ((max_scale > scale_kill_threshold) & (support < support_threshold))
+            dead = dead | ((max_scale > scale_kill_threshold) & (support < eff_support))
         # Clause 4: medium-scale semi-transparent with low support → blue-dot floater
         if scale_moderate_threshold > 0:
             dead = dead | (
                 (max_scale > scale_moderate_threshold)
-                & (alpha < opacity_threshold * 4)
-                & (support < support_threshold)
+                & (alpha < opacity_threshold * scale_moderate_opacity_mult)
+                & (support < eff_support)
+            )
+        # Clause 5: highly anisotropic needle with low support → white-streak floater
+        if anisotropy_kill_ratio > 0:
+            min_scale = s.min(dim=-1).values.clamp_min(1e-6)
+            anisotropy = max_scale / min_scale
+            dead = dead | (
+                (anisotropy > anisotropy_kill_ratio)
+                & (alpha < opacity_threshold * scale_moderate_opacity_mult)
+                & (support < eff_support)
             )
 
     if use_utility_quantile and utility is not None and utility.numel() > 0:

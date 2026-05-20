@@ -215,7 +215,10 @@ class OptimizationParams(ParamGroup):
         self.noise_max_scale = 0.05   # per-axis scale cap for noise covariance; 0 = unclamped
         self.scale_kill_threshold     = 0.20  # dead_mask: relocate when max_scale > this AND support low
         self.scale_moderate_threshold = 0.05  # dead_mask: relax opacity gate for splats above this scale
+        self.anisotropy_kill_ratio    = 20.0  # dead_mask: kill needles with s_max/s_min > this AND low support; 0 = off
         self.anisotropy_reg = 0.01   # weight for max/min scale ratio penalty; 0 = disabled
+        self.utility_aniso_weight     = 0.1   # anisotropy penalty weight in compute_gaussian_utility
+        self.utility_aniso_soft_limit = 10.0  # anisotropy ratio below which no utility penalty
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01

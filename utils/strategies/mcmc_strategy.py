@@ -7,6 +7,39 @@ from utils.general_utils import build_scaling_rotation
 from utils.streaming_depth_lock import depth_lock_enabled, depth_locked_mask
 
 
+def _dead_clause_breakdown(gaussians, sched, args):
+    """Return per-clause dead counts for TB logging (non-exclusive — Gaussian may match several)."""
+    alpha = gaussians.get_opacity.squeeze(-1)
+    support = (
+        gaussians.visibility_ema.squeeze(-1)
+        if hasattr(gaussians, "visibility_ema")
+        else torch.ones_like(alpha)
+    )
+    thresh = sched["dead_opacity_threshold"]
+    sup_thresh = 0.01
+    scale_kill = float(getattr(args, "scale_kill_threshold", 0.20))
+    scale_mod = float(getattr(args, "scale_moderate_threshold", 0.05))
+    aniso_ratio = float(getattr(args, "anisotropy_kill_ratio", 20.0))
+
+    counts = {
+        "very_low_opacity": int((alpha < thresh * 0.1).sum()),
+        "low_opacity_low_support": int(((alpha < thresh) & (support < sup_thresh)).sum()),
+    }
+    if hasattr(gaussians, "get_scaling"):
+        s = gaussians.get_scaling
+        max_s = s.max(dim=-1).values
+        min_s = s.min(dim=-1).values.clamp_min(1e-6)
+        aniso = max_s / min_s
+        counts["large_low_support"] = int(((max_s > scale_kill) & (support < sup_thresh)).sum())
+        counts["moderate_transparent"] = int(
+            ((max_s > scale_mod) & (alpha < thresh * 4) & (support < sup_thresh)).sum()
+        )
+        counts["anisotropic"] = int(
+            ((aniso > aniso_ratio) & (alpha < thresh * 4) & (support < sup_thresh)).sum()
+        ) if aniso_ratio > 0 else 0
+    return counts
+
+
 def _locked_depth_mask(gaussians, args):
     if not depth_lock_enabled(args):
         return None
@@ -120,7 +153,11 @@ class ScheduledMCMCStrategy:
                         utility_quantile=0.05,
                         scale_kill_threshold=float(getattr(args, "scale_kill_threshold", 0.20)),
                         scale_moderate_threshold=float(getattr(args, "scale_moderate_threshold", 0.05)),
+                        anisotropy_kill_ratio=float(getattr(args, "anisotropy_kill_ratio", 20.0)),
                     )
+                    if tb_writer:
+                        for clause, cnt in _dead_clause_breakdown(gaussians, sched, args).items():
+                            tb_writer.add_scalar(f"mcmc/dead_{clause}", cnt, iteration)
                     dead_mask = _exclude_locked_from_mask(dead_mask, gaussians, args)
                     dead_count = int(dead_mask.sum().item())
                     gaussians.relocate_gs_energy_guided(
@@ -428,7 +465,11 @@ class GsplatEnergyMCMCStrategy:
                         utility_quantile=0.05,
                         scale_kill_threshold=float(getattr(args, "scale_kill_threshold", 0.20)),
                         scale_moderate_threshold=float(getattr(args, "scale_moderate_threshold", 0.05)),
+                        anisotropy_kill_ratio=float(getattr(args, "anisotropy_kill_ratio", 20.0)),
                     )
+                    if tb_writer:
+                        for clause, cnt in _dead_clause_breakdown(gaussians, sched, args).items():
+                            tb_writer.add_scalar(f"mcmc/dead_{clause}", cnt, iteration)
                 else:
                     dead_mask = (
                         torch.sigmoid(params["opacities"].flatten())

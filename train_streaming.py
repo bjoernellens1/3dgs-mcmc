@@ -1464,6 +1464,8 @@ def _run_rolling_seed(
                         beta_opacity=getattr(args, "energy_beta_opacity", 1.0),
                         beta_scale=getattr(args, "energy_beta_scale", 0.5),
                         alpha_dead=getattr(args, "energy_alpha_dead", 0.005),
+                        w_aniso_utility=float(getattr(args, "utility_aniso_weight", 0.1)),
+                        aniso_soft_limit=float(getattr(args, "utility_aniso_soft_limit", 10.0)),
                     )
                     import math
                     u_temp = min(_it / 30000.0, 1.0)
@@ -2803,6 +2805,8 @@ def streaming_training(
                 beta_opacity=getattr(args, "energy_beta_opacity", 1.0),
                 beta_scale=getattr(args, "energy_beta_scale", 0.5),
                 alpha_dead=getattr(args, "energy_alpha_dead", 0.005),
+                w_aniso_utility=float(getattr(args, "utility_aniso_weight", 0.1)),
+                aniso_soft_limit=float(getattr(args, "utility_aniso_soft_limit", 10.0)),
             )
             u_temp = min(iteration / 30000.0, 1.0)
             tau_t = max(getattr(args, "energy_temp_tau", 0.4), 1e-6)
