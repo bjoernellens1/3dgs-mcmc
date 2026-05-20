@@ -570,8 +570,22 @@ class StreamingScene:
     # Camera sampling
     # ------------------------------------------------------------------
 
+    def _effective_keyframe_window(self) -> int:
+        """Return the effective keyframe window size.
+
+        When streaming_keyframe_coverage > 0, the window grows to keep at least
+        that fraction of all ingested train frames in the active window.  The
+        fixed streaming_keyframe_window acts as a minimum floor.
+        """
+        k_floor = getattr(self.args, "streaming_keyframe_window", 8)
+        coverage = float(getattr(self.args, "streaming_keyframe_coverage", 0.0))
+        if coverage > 0 and self.train_cameras:
+            k_adaptive = int(coverage * len(self.train_cameras))
+            return max(k_floor, k_adaptive)
+        return k_floor
+
     def get_local_cameras(self) -> List:
-        k = getattr(self.args, "streaming_keyframe_window", 8)
+        k = self._effective_keyframe_window()
         return self.train_cameras[-k:] if self.train_cameras else []
 
     def sample_training_camera(self):
@@ -655,7 +669,7 @@ class StreamingScene:
                 cam_idx = self.train_cameras.index(cam)
             except ValueError:
                 cam_idx = len(self.train_cameras) - 1
-            k_win = getattr(self.args, "streaming_keyframe_window", 8)
+            k_win = self._effective_keyframe_window()
             # Covisible = cameras within 2×window of current cam, excluding local window
             lo = max(0, cam_idx - 2 * k_win)
             hi = max(0, cam_idx - k_win)

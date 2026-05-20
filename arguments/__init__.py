@@ -328,7 +328,8 @@ class StreamingParams(ParamGroup):
         self.streaming_max_frames = 0             # 0 = all frames in dataset
         self.streaming_frame_stride = 1           # Release every Nth frame from the source
         self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
-        self.streaming_keyframe_window = 120       # recent cameras used for local training
+        self.streaming_keyframe_window = 120       # minimum keyframe window (floor)
+        self.streaming_keyframe_coverage = 0.6    # adaptive: keep >= this fraction of ingested frames in window (0 = disabled)
         self.streaming_replay_buffer = 32         # size of older-frame replay ring buffer
         self.streaming_global_replay_ratio = 0.3  # fraction of steps drawn from replay buffer
         # Depth-based incremental Gaussian insertion (Phase 2)
