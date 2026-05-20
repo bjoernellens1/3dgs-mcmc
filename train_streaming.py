@@ -2958,6 +2958,44 @@ def streaming_training(
             if _occ_rebuild_every > 0 and iteration % _occ_rebuild_every == 0:
                 streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
 
+        # ---- Out-of-bounds bbox prune (at global-maintenance cadence) ---------
+        # Gaussians that have drifted outside the camera trajectory bbox + margin
+        # can never contribute positively.  Remove them to keep N bounded and stop
+        # the runaway-extent feedback loop.
+        _bbox_prune_enabled = getattr(args, "streaming_bbox_prune", True)
+        if (
+            _bbox_prune_enabled
+            and global_maint_interval > 0
+            and iteration % global_maint_interval == 0
+        ):
+            with torch.no_grad():
+                _all_cams = list(streaming_scene.getTrainCameras())
+                if len(_all_cams) >= 2:
+                    import numpy as _np
+                    _max_d = float(getattr(args, "streaming_max_depth", 8.0))
+                    _margin = 3.0 * _max_d
+                    # camera positions in world space: -R_c2w @ t_w2c
+                    _cam_pos = torch.tensor(
+                        _np.stack([
+                            (-_np.array(c.R) @ _np.array(c.T))
+                            for c in _all_cams
+                        ]),
+                        dtype=torch.float32,
+                        device=gaussians.get_xyz.device,
+                    )
+                    _bbox_min = _cam_pos.min(dim=0).values - _margin
+                    _bbox_max = _cam_pos.max(dim=0).values + _margin
+                    _xyz = gaussians.get_xyz
+                    _oob = ((_xyz < _bbox_min) | (_xyz > _bbox_max)).any(dim=-1)
+                    _oob_count = int(_oob.sum().item())
+                    if _oob_count > 0:
+                        gaussians.prune_points(_oob)
+                        streaming_scene.maintain_occupancy_hash(
+                            getattr(args, "streaming_insert_voxel_size", 0.02)
+                        )
+                        if tb_writer:
+                            tb_writer.add_scalar("streaming/oob_pruned", _oob_count, iteration)
+
         # ---- Logging ------------------------------------------------------
         with torch.no_grad():
             _loss_val = loss.item()

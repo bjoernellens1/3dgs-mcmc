@@ -75,6 +75,10 @@ class ScheduledMCMCStrategy:
                 op_sigmoid(1 - gaussians.get_opacity[noise_idx])
             ) * args.noise_lr * xyz_lr
             noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+            max_step = float(getattr(args, "noise_max_step", 0.01))
+            if max_step > 0:
+                step_norm = noise.norm(dim=-1, keepdim=True).clamp_min(max_step)
+                noise = noise * (max_step / step_norm)
             gaussians._xyz[noise_idx].add_(noise)
 
     def step_post_backward(

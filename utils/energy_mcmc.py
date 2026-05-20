@@ -202,10 +202,11 @@ def compute_dead_mask(
 ):
     """
     Compute dead mask combining opacity, support, and optionally utility.
-    
-    dead_j = alpha_j < opacity_threshold AND support_j < support_threshold
+
+    Core rule (OR so that drifters with stale visibility EMA are still pruned):
+        dead_j = (alpha_j < opacity_threshold) OR (support_j < support_threshold * 0.5)
     optionally OR (low opacity AND utility_j < quantile(utility, q))
-    
+
     Args:
         gaussians: GaussianModel instance
         utility: [N] optional utility scores
@@ -220,9 +221,11 @@ def compute_dead_mask(
     # get_opacity is already activated (sigmoid applied)
     alpha = gaussians.get_opacity.squeeze(-1)
     support = gaussians.visibility_ema.squeeze(-1) if hasattr(gaussians, "visibility_ema") else torch.ones_like(alpha)
-    
-    # Core death: low opacity AND low support
-    dead = (alpha < opacity_threshold) & (support < support_threshold)
+
+    # OR so low-opacity drifters are killed even when their stale visibility EMA
+    # keeps them above the support threshold.  The support clause uses 0.5× the
+    # threshold to avoid over-pruning Gaussians that are simply momentarily occluded.
+    dead = (alpha < opacity_threshold) | (support < support_threshold * 0.5)
     
     if use_utility_quantile and utility is not None and utility.numel() > 0:
         q_val = torch.quantile(utility, utility_quantile)

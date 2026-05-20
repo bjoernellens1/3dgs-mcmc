@@ -211,6 +211,7 @@ class OptimizationParams(ParamGroup):
         self.sparse_energy_global_interval = 500
         self.benchmark_dir = ""
         self.noise_lr = 5e5
+        self.noise_max_step = 0.01  # max per-iter MCMC displacement (metres); 0 = unclamped
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
         self.opacity_reg = 0.01
@@ -316,7 +317,7 @@ class StreamingParams(ParamGroup):
         self.streaming_replay = False
         self.streaming_input_fps = 30.0
         self.streaming_wallclock = False          # False = deterministic step-based simulation (legacy)
-        self.streaming_steps_per_frame = 50       # release one frame every N training iterations
+        self.streaming_steps_per_frame = 150      # release one frame every N training iterations
         # Ingestion pacing mode: iter_based | dataset_fps | wallclock_strict
         # iter_based      — deterministic, release every streaming_steps_per_frame iters (default)
         # dataset_fps     — simulated clock; train as many iters as possible per real-time second;
@@ -327,9 +328,9 @@ class StreamingParams(ParamGroup):
         self.streaming_max_frames = 0             # 0 = all frames in dataset
         self.streaming_frame_stride = 1           # Release every Nth frame from the source
         self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
-        self.streaming_keyframe_window = 8        # recent cameras used for local training
+        self.streaming_keyframe_window = 120       # recent cameras used for local training
         self.streaming_replay_buffer = 32         # size of older-frame replay ring buffer
-        self.streaming_global_replay_ratio = 0.1  # fraction of steps drawn from replay buffer
+        self.streaming_global_replay_ratio = 0.3  # fraction of steps drawn from replay buffer
         # Depth-based incremental Gaussian insertion (Phase 2)
         self.streaming_insert_from_depth = True
         self.streaming_depth_stride = 8

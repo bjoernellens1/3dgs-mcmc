@@ -382,13 +382,12 @@ def _cams_to_c2w(cams) -> tuple[np.ndarray, np.ndarray]:
     import torch
     ts, mats = [], []
     for cam in cams:
-        # world-from-camera: column-major stored as R (3×3) and T (3,)
-        # In the 3DGS convention cam.R is world-to-camera rotation,
-        # cam.T is world-to-camera translation. Invert to get c2w.
-        R_w2c = np.array(cam.R, dtype=np.float64)   # 3×3
+        # 3DGS convention: cam.R stores R_c2w (camera-to-world rotation, i.e. the
+        # camera basis vectors as columns), cam.T stores t_w2c (the translation in
+        # the world-to-camera matrix).  getWorld2View2 builds: Rt[:3,:3] = R.T,
+        # so Rt_rotation = R_c2w.T = R_w2c.
+        R_c2w = np.array(cam.R, dtype=np.float64)   # 3×3 (cam.R = R_c2w)
         t_w2c = np.array(cam.T, dtype=np.float64)   # 3,
-        # c2w
-        R_c2w = R_w2c.T
         t_c2w = -R_c2w @ t_w2c
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = R_c2w
