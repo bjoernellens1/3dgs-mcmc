@@ -469,6 +469,16 @@ def _sample_temporal_depth_mask(
         p_fy = prev_frame.depth_fy if prev_frame.depth_fy is not None else prev_frame.fy
         p_cx = prev_frame.depth_cx if prev_frame.depth_cx is not None else prev_frame.cx
         p_cy = prev_frame.depth_cy if prev_frame.depth_cy is not None else prev_frame.cy
+        # Scale prev-frame depth intrinsics if they are at a different resolution than the
+        # color image (same correction as the main backprojection path in insert_gaussians_from_frame).
+        if prev_frame.depth_fx is not None:
+            _pdw = prev_frame.depth_width or prev_w
+            _pdh = prev_frame.depth_height or prev_h
+            if _pdw != prev_w or _pdh != prev_h:
+                p_fx = p_fx * prev_w / _pdw
+                p_fy = p_fy * prev_h / _pdh
+                p_cx = p_cx * prev_w / _pdw
+                p_cy = p_cy * prev_h / _pdh
         u = np.round((pts_prev[:, 0] / np.maximum(z_prev, 1e-6)) * float(p_fx) + float(p_cx)).astype(np.int32)
         v = np.round((pts_prev[:, 1] / np.maximum(z_prev, 1e-6)) * float(p_fy) + float(p_cy)).astype(np.int32)
 
@@ -542,6 +552,7 @@ def insert_gaussians_from_frame(
     try:
         from utils.streaming_frames import load_frame_depth_np, load_frame_rgb
         depth = np.asarray(load_frame_depth_np(frame))
+        _depth_native_h, _depth_native_w = depth.shape[:2]
         _tgt_h, _tgt_w = int(frame.height), int(frame.width)
         if depth.shape[:2] != (_tgt_h, _tgt_w):
             depth = np.array(_Image.fromarray(depth).resize((_tgt_w, _tgt_h), _Image.NEAREST))
@@ -552,12 +563,20 @@ def insert_gaussians_from_frame(
     except Exception:
         return ({} if _collect_only else 0), _stats
 
-    # Use sensor-specific depth intrinsics when available (e.g. ScanNet has
-    # separate color (1296×968) and depth (640×480) cameras).
+    # Use sensor-specific depth intrinsics when available (e.g. ScanNet/RealSense
+    # have separate color and depth cameras with different resolutions).
     d_fx = frame.depth_fx if frame.depth_fx is not None else frame.fx
     d_fy = frame.depth_fy if frame.depth_fy is not None else frame.fy
     d_cx = frame.depth_cx if frame.depth_cx is not None else frame.cx
     d_cy = frame.depth_cy if frame.depth_cy is not None else frame.cy
+    # Scale depth intrinsics when the depth image was resized to color dimensions.
+    # Without this, backprojection uses native-resolution intrinsics on a resized
+    # image, placing 3D points at wrong lateral positions.
+    if frame.depth_fx is not None and (_depth_native_w != _tgt_w or _depth_native_h != _tgt_h):
+        d_fx = d_fx * _tgt_w / _depth_native_w
+        d_fy = d_fy * _tgt_h / _depth_native_h
+        d_cx = d_cx * _tgt_w / _depth_native_w
+        d_cy = d_cy * _tgt_h / _depth_native_h
 
     z = depth_to_meters(depth, frame.depth_scale)
     h, w = z.shape
@@ -741,6 +760,25 @@ def insert_gaussians_from_frame(
     from utils.rgbd_frames import backproject_depth_pixels
     pts, cols = backproject_depth_pixels(
         z_v, xs_v, ys_v, d_fx, d_fy, d_cx, d_cy, frame.c2w, rgb, (h, w))
+
+    # ---- Color FOV alignment (when depth and color cameras differ in FOV) ----
+    # After scaling depth intrinsics to resized resolution, 3D positions are correct
+    # but the depth image may cover a wider FOV than the color image. Re-project each
+    # 3D point onto the color camera to get correct RGB and filter out-of-FOV points.
+    if frame.depth_fx is not None and (_depth_native_w != _tgt_w or _depth_native_h != _tgt_h):
+        x_over_z = (xs_v - d_cx) / d_fx
+        y_over_z = (ys_v - d_cy) / d_fy
+        u_color = (x_over_z * frame.fx + frame.cx).round().astype(np.int32)
+        v_color = (y_over_z * frame.fy + frame.cy).round().astype(np.int32)
+        in_fov = (u_color >= 0) & (u_color < frame.width) & (v_color >= 0) & (v_color < frame.height)
+        if not in_fov.all():
+            pts = pts[in_fov]; z_v = z_v[in_fov]; score_v = score_v[in_fov]
+            nx = nx[in_fov]; ny = ny[in_fov]; nz = nz[in_fov]
+            u_color = u_color[in_fov]; v_color = v_color[in_fov]
+        rgb_h, rgb_w = rgb.shape[:2]
+        uc = np.clip(u_color, 0, rgb_w - 1)
+        vc = np.clip(v_color, 0, rgb_h - 1)
+        cols = rgb[vc, uc].astype(np.float32)
 
     # ---- Persistent Voxel coverage filter (Step 7) --------------------------
     occupied = streaming_scene.check_occupancy(pts, cover_voxel, check_neighbors=True)
