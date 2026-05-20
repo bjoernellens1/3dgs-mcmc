@@ -118,6 +118,8 @@ class ScheduledMCMCStrategy:
                         utility=utility,
                         opacity_threshold=sched["dead_opacity_threshold"],
                         utility_quantile=0.05,
+                        scale_kill_threshold=float(getattr(args, "scale_kill_threshold", 0.20)),
+                        scale_moderate_threshold=float(getattr(args, "scale_moderate_threshold", 0.05)),
                     )
                     dead_mask = _exclude_locked_from_mask(dead_mask, gaussians, args)
                     dead_count = int(dead_mask.sum().item())
@@ -424,6 +426,8 @@ class GsplatEnergyMCMCStrategy:
                         utility=utility,
                         opacity_threshold=sched["dead_opacity_threshold"],
                         utility_quantile=0.05,
+                        scale_kill_threshold=float(getattr(args, "scale_kill_threshold", 0.20)),
+                        scale_moderate_threshold=float(getattr(args, "scale_moderate_threshold", 0.05)),
                     )
                 else:
                     dead_mask = (

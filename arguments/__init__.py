@@ -211,8 +211,10 @@ class OptimizationParams(ParamGroup):
         self.sparse_energy_global_interval = 500
         self.benchmark_dir = ""
         self.noise_lr = 5e5
-        self.noise_max_step = 0.01   # max per-iter MCMC L2 displacement (metres); 0 = unclamped
-        self.noise_max_scale = 0.05  # per-axis scale cap for noise covariance; 0 = unclamped
+        self.noise_max_step = 0.01    # max per-iter MCMC L2 displacement (metres); 0 = unclamped
+        self.noise_max_scale = 0.05   # per-axis scale cap for noise covariance; 0 = unclamped
+        self.scale_kill_threshold     = 0.20  # dead_mask: relocate when max_scale > this AND support low
+        self.scale_moderate_threshold = 0.05  # dead_mask: relax opacity gate for splats above this scale
         self.anisotropy_reg = 0.01   # weight for max/min scale ratio penalty; 0 = disabled
         self.mcmc_noise_stop_iter = 30_000
         self.scale_reg = 0.01
@@ -509,7 +511,10 @@ class StreamingParams(ParamGroup):
         # H10: Global keyframe reservoir.
         # Every Nth ingested train frame is kept in a permanent reservoir for
         # trajectory-wide replay. 0 = disabled.
-        self.streaming_global_reservoir_stride = 0
+        # Default 1: keep every frame. When the replay buffer falls back to this
+        # reservoir the 30% replay steps sample uniformly over ALL historical frames,
+        # preventing early-frame forgetting once they exit the sliding window.
+        self.streaming_global_reservoir_stride = 1
         # H11: Submap-stitching mode parameters.
         # streaming_training_mode = "submap_stitch" enables the submap path.
         self.streaming_submap_frames = 20       # frames per independent submap

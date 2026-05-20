@@ -199,18 +199,22 @@ def compute_dead_mask(
     utility_quantile=0.05,
     use_utility_quantile=True,
     min_visibility_count=3,
+    scale_kill_threshold=0.20,
+    scale_moderate_threshold=0.05,
 ):
     """
-    Compute dead mask combining opacity, support, and optionally utility.
+    Compute dead mask combining opacity, support, scale, and optionally utility.
 
     Composite rule:
-        1. Unconditional kill: alpha < opacity_threshold * 0.1 (near-zero, no recovery)
-        2. Conservative kill: alpha < opacity_threshold AND support < support_threshold
-           (both weak — requires convergent evidence, not just one signal)
-        3. Optional utility bottom-quantile kill (requires 1+2 opacity gate)
-
-    This avoids the pure support-based OR from the previous version which
-    killed valid geometry after ~260 invisible iterations (< 2 frames at spf=150).
+        1. Unconditional kill: alpha < opacity_threshold * 0.1  (near-zero, no recovery)
+        2. Conservative kill:  alpha < opacity_threshold AND support < support_threshold
+        3. Scale kill:         max_scale > scale_kill_threshold AND support < support_threshold
+           (large Gaussians must be well-supported or they are runaway floaters)
+        4. Medium-scale kill:  max_scale > scale_moderate_threshold
+                               AND alpha < opacity_threshold * 4
+                               AND support < support_threshold
+           (semi-transparent medium-size splats that are unsupported = blue-dot floaters)
+        5. Optional utility bottom-quantile kill (opacity-gated)
 
     Args:
         gaussians: GaussianModel instance
@@ -220,6 +224,8 @@ def compute_dead_mask(
         utility_quantile: bottom quantile for utility-based death
         use_utility_quantile: whether to append utility quantile death
         min_visibility_count: unused (kept for API compatibility)
+        scale_kill_threshold: max_scale above which low support = dead (default 0.2 m)
+        scale_moderate_threshold: max_scale above which relaxed opacity gate applies (default 0.05 m)
     Returns:
         [N] bool mask
     """
@@ -229,12 +235,25 @@ def compute_dead_mask(
 
     very_low_opacity = opacity_threshold * 0.1  # ~0.0005 — unambiguously dead
 
-    # Clause 1: unconditionally kill near-zero opacity regardless of visibility
+    # Clause 1: unconditionally kill near-zero opacity
     dead = alpha < very_low_opacity
 
-    # Clause 2: kill only when BOTH opacity AND support are below threshold
-    # (avoids killing temporarily-occluded Gaussians based on support alone)
+    # Clause 2: both opacity AND support below threshold
     dead = dead | ((alpha < opacity_threshold) & (support < support_threshold))
+
+    # Clauses 3+4: scale-aware kills — large/medium unsupported Gaussians are floaters
+    if hasattr(gaussians, "get_scaling"):
+        max_scale = gaussians.get_scaling.max(dim=-1).values
+        # Clause 3: large Gaussian with any low support → floater (white-streak case)
+        if scale_kill_threshold > 0:
+            dead = dead | ((max_scale > scale_kill_threshold) & (support < support_threshold))
+        # Clause 4: medium-scale semi-transparent with low support → blue-dot floater
+        if scale_moderate_threshold > 0:
+            dead = dead | (
+                (max_scale > scale_moderate_threshold)
+                & (alpha < opacity_threshold * 4)
+                & (support < support_threshold)
+            )
 
     if use_utility_quantile and utility is not None and utility.numel() > 0:
         q_val = torch.quantile(utility, utility_quantile)
