@@ -4,6 +4,23 @@ import torch
 
 from utils.energy_mcmc import compute_dead_mask
 from utils.general_utils import build_scaling_rotation
+from utils.streaming_depth_lock import depth_lock_enabled, depth_locked_mask
+
+
+def _locked_depth_mask(gaussians, args):
+    if not depth_lock_enabled(args):
+        return None
+    mask = depth_locked_mask(gaussians, args)
+    if mask.shape[0] != gaussians.get_xyz.shape[0] or not mask.any():
+        return None
+    return mask
+
+
+def _exclude_locked_from_mask(mask, gaussians, args):
+    locked = _locked_depth_mask(gaussians, args)
+    if locked is None or mask is None or mask.shape[0] != locked.shape[0]:
+        return mask
+    return mask & ~locked
 
 
 class ScheduledMCMCStrategy:
@@ -39,6 +56,9 @@ class ScheduledMCMCStrategy:
                 noise_idx = visible.nonzero(as_tuple=True)[0]
             else:
                 noise_idx = torch.arange(gaussians.get_xyz.shape[0], device=gaussians.get_xyz.device)
+            locked = _locked_depth_mask(gaussians, args)
+            if locked is not None:
+                noise_idx = noise_idx[~locked[noise_idx]]
             if noise_idx.numel() == 0:
                 return
 
@@ -86,11 +106,13 @@ class ScheduledMCMCStrategy:
                         opacity_threshold=sched["dead_opacity_threshold"],
                         utility_quantile=0.05,
                     )
+                    dead_mask = _exclude_locked_from_mask(dead_mask, gaussians, args)
                     dead_count = int(dead_mask.sum().item())
                     gaussians.relocate_gs_energy_guided(
                         dead_mask=dead_mask,
                         parent_scores=utility,
                         temperature=temperature,
+                        exclude_parent_mask=_locked_depth_mask(gaussians, args),
                     )
                     self._log_reloc(
                         tb_writer, should_log, iteration, dead_count, sched,
@@ -106,6 +128,7 @@ class ScheduledMCMCStrategy:
                         growth_factor=sched["growth_factor"],
                         parent_scores=utility,
                         temperature=temperature,
+                        exclude_parent_mask=_locked_depth_mask(gaussians, args),
                     )
                     self._log_growth(tb_writer, should_log, iteration, before, gaussians.get_xyz.shape[0], added, sched)
             return
@@ -115,6 +138,7 @@ class ScheduledMCMCStrategy:
                 "reloc", iteration, sched["relocate_interval"], getattr(args, "densify_from_iter", 500)
             ):
                 dead_mask = (gaussians.get_opacity <= sched["dead_opacity_threshold"]).squeeze(-1)
+                dead_mask = _exclude_locked_from_mask(dead_mask, gaussians, args)
                 dead_count = int(dead_mask.sum().item())
                 gaussians.relocate_gs(dead_mask=dead_mask)
                 self._log_reloc(tb_writer, should_log, iteration, dead_count, sched, gaussians.get_xyz.shape[0])
@@ -187,6 +211,7 @@ class GsplatMCMCBaselineStrategy(ScheduledMCMCStrategy):
         with torch.no_grad():
             min_opacity = float(getattr(args, "mcmc_dead_opacity_end", 0.01))
             dead_mask = (gaussians.get_opacity <= min_opacity).squeeze(-1)
+            dead_mask = _exclude_locked_from_mask(dead_mask, gaussians, args)
             dead_count = int(dead_mask.sum().item())
             gaussians.relocate_gs(dead_mask=dead_mask)
             self._log_reloc(
@@ -392,9 +417,11 @@ class GsplatEnergyMCMCStrategy:
                         torch.sigmoid(params["opacities"].flatten())
                         <= sched["dead_opacity_threshold"]
                     )
+                dead_mask = _exclude_locked_from_mask(dead_mask, gaussians, args)
 
                 n_relocated = self._relocate_energy_guided(
                     gaussians=gaussians,
+                    args=args,
                     dead_mask=dead_mask,
                     utility=utility if use_energy_mcmc else None,
                     temperature=temperature,
@@ -407,6 +434,7 @@ class GsplatEnergyMCMCStrategy:
             ):
                 n_added = self._add_energy_guided(
                     gaussians=gaussians,
+                    args=args,
                     utility=utility if use_energy_mcmc else None,
                     temperature=temperature,
                     binoms=binoms,
@@ -467,7 +495,7 @@ class GsplatEnergyMCMCStrategy:
             return weights
         return probs
 
-    def _relocate_energy_guided(self, gaussians, dead_mask, utility, temperature, binoms, min_opacity):
+    def _relocate_energy_guided(self, gaussians, args, dead_mask, utility, temperature, binoms, min_opacity):
         if dead_mask is None or dead_mask.sum() == 0:
             return 0
 
@@ -476,8 +504,13 @@ class GsplatEnergyMCMCStrategy:
         params = gaussians.params
         optimizers = gaussians.optimizers
         opacities = torch.sigmoid(params["opacities"].flatten())
+        locked = _locked_depth_mask(gaussians, args)
+        if locked is not None and locked.shape[0] == dead_mask.shape[0]:
+            dead_mask = dead_mask & ~locked
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = (~dead_mask).nonzero(as_tuple=True)[0]
+        if locked is not None and locked.shape[0] == opacities.shape[0]:
+            alive_indices = alive_indices[~locked[alive_indices]]
         n = int(dead_indices.numel())
         if n == 0 or alive_indices.numel() == 0:
             return 0
@@ -512,7 +545,7 @@ class GsplatEnergyMCMCStrategy:
         self._reset_relocated_state(gaussians, dead_indices, sampled_idxs)
         return n
 
-    def _add_energy_guided(self, gaussians, utility, temperature, binoms, min_opacity, cap_max, growth_factor):
+    def _add_energy_guided(self, gaussians, args, utility, temperature, binoms, min_opacity, cap_max, growth_factor):
         from gsplat.strategy.ops import _multinomial_sample, _update_param_with_optimizer, compute_relocation
 
         params = gaussians.params
@@ -525,8 +558,14 @@ class GsplatEnergyMCMCStrategy:
 
         opacities = torch.sigmoid(params["opacities"].flatten())
         all_indices = torch.arange(current_n, device=opacities.device)
-        weights = self._energy_weights(opacities, utility, all_indices, temperature)
-        sampled_idxs = _multinomial_sample(weights, n, replacement=True)
+        locked = _locked_depth_mask(gaussians, args)
+        if locked is not None and locked.shape[0] == current_n:
+            all_indices = all_indices[~locked]
+        if all_indices.numel() == 0:
+            return 0
+        weights = self._energy_weights(opacities[all_indices], utility, all_indices, temperature)
+        sampled_local = _multinomial_sample(weights, n, replacement=True)
+        sampled_idxs = all_indices[sampled_local]
         ratios = torch.bincount(sampled_idxs, minlength=current_n)[sampled_idxs] + 1
 
         eps = torch.finfo(torch.float32).eps
@@ -566,13 +605,27 @@ class GsplatEnergyMCMCStrategy:
             gaussians.provisional[dead_indices] = gaussians.provisional[sampled_idxs]
             gaussians.birth_frame[dead_indices] = gaussians.birth_frame[sampled_idxs]
             gaussians.support_count[dead_indices] = gaussians.support_count[sampled_idxs]
+        for name in ("depth_conflict_count", "depth_last_support_uid", "depth_last_conflict_uid"):
+            tensor = getattr(gaussians, name, None)
+            if tensor is not None and tensor.shape[0] == gaussians.get_xyz.shape[0]:
+                tensor[dead_indices] = tensor[sampled_idxs]
 
     def _append_running_state(self, gaussians, old_count, added_count):
         for name in ("visibility_ema", "xyz_gradient_accum", "denom", "birth_frame", "support_count", "provisional",
-                     "anchor_iter", "lifecycle_state", "utility_ema"):
+                     "anchor_iter", "depth_conflict_count", "lifecycle_state", "utility_ema"):
             tensor = getattr(gaussians, name, None)
             if tensor is not None and tensor.shape[0] == old_count:
                 pad = torch.zeros((added_count, *tensor.shape[1:]), device=tensor.device, dtype=tensor.dtype)
+                setattr(gaussians, name, torch.cat([tensor, pad], dim=0))
+        for name in ("depth_last_support_uid", "depth_last_conflict_uid"):
+            tensor = getattr(gaussians, name, None)
+            if tensor is not None and tensor.shape[0] == old_count:
+                pad = torch.full(
+                    (added_count,),
+                    -1,
+                    device=tensor.device,
+                    dtype=tensor.dtype,
+                )
                 setattr(gaussians, name, torch.cat([tensor, pad], dim=0))
         # anchor_xyz needs its own path: pad with the new Gaussian positions so anchor=current pos at birth
         anchor_xyz = getattr(gaussians, "anchor_xyz", None)

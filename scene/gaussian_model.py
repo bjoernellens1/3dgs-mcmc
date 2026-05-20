@@ -75,10 +75,14 @@ class GaussianModel:
         self.provisional = torch.empty(0, dtype=torch.bool, device="cuda")
         self.anchor_xyz = torch.empty((0, 3), dtype=torch.float32, device="cuda")
         self.anchor_iter = torch.empty(0, dtype=torch.int32, device="cuda")
+        self.depth_conflict_count = torch.empty(0, dtype=torch.int16, device="cuda")
+        self.depth_last_support_uid = torch.empty(0, dtype=torch.int32, device="cuda")
+        self.depth_last_conflict_uid = torch.empty(0, dtype=torch.int32, device="cuda")
         self.setup_functions()
 
     _STREAMING_BUFFER_NAMES: tuple = (
         "birth_frame", "support_count", "provisional", "anchor_iter",
+        "depth_conflict_count", "depth_last_support_uid", "depth_last_conflict_uid",
         "lifecycle_state", "utility_ema", "anchor_scale_log", "anchor_opacity_logit",
         "anchor_xyz",
     )
@@ -271,6 +275,9 @@ class GaussianModel:
         self.provisional = torch.zeros(count, dtype=torch.bool, device="cuda")
         self.anchor_xyz = self._xyz.detach().clone()
         self.anchor_iter = torch.zeros(count, dtype=torch.int32, device="cuda")
+        self.depth_conflict_count = torch.zeros(count, dtype=torch.int16, device="cuda")
+        self.depth_last_support_uid = torch.full((count,), -1, dtype=torch.int32, device="cuda")
+        self.depth_last_conflict_uid = torch.full((count,), -1, dtype=torch.int32, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -510,6 +517,12 @@ class GaussianModel:
         self.provisional = self.provisional[valid_points_mask]
         self.anchor_xyz = self.anchor_xyz[valid_points_mask]
         self.anchor_iter = self.anchor_iter[valid_points_mask]
+        if self.depth_conflict_count.shape[0] == mask.shape[0]:
+            self.depth_conflict_count = self.depth_conflict_count[valid_points_mask]
+        if self.depth_last_support_uid.shape[0] == mask.shape[0]:
+            self.depth_last_support_uid = self.depth_last_support_uid[valid_points_mask]
+        if self.depth_last_conflict_uid.shape[0] == mask.shape[0]:
+            self.depth_last_conflict_uid = self.depth_last_conflict_uid[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -589,6 +602,9 @@ class GaussianModel:
             self.provisional = new_provisional
             self.anchor_xyz = new_xyz.detach().clone()
             self.anchor_iter = torch.zeros(N_new, dtype=torch.int32, device="cuda")
+            self.depth_conflict_count = torch.zeros(N_new, dtype=torch.int16, device="cuda")
+            self.depth_last_support_uid = torch.full((N_new,), -1, dtype=torch.int32, device="cuda")
+            self.depth_last_conflict_uid = torch.full((N_new,), -1, dtype=torch.int32, device="cuda")
         else:
             self.birth_frame = torch.cat([self.birth_frame, new_birth], dim=0)
             self.support_count = torch.cat([self.support_count, new_support], dim=0)
@@ -597,6 +613,18 @@ class GaussianModel:
             self.anchor_iter = torch.cat([
                 self.anchor_iter,
                 torch.zeros(N_new, dtype=torch.int32, device="cuda"),
+            ], dim=0)
+            self.depth_conflict_count = torch.cat([
+                self.depth_conflict_count,
+                torch.zeros(N_new, dtype=torch.int16, device="cuda"),
+            ], dim=0)
+            self.depth_last_support_uid = torch.cat([
+                self.depth_last_support_uid,
+                torch.full((N_new,), -1, dtype=torch.int32, device="cuda"),
+            ], dim=0)
+            self.depth_last_conflict_uid = torch.cat([
+                self.depth_last_conflict_uid,
+                torch.full((N_new,), -1, dtype=torch.int32, device="cuda"),
             ], dim=0)
 
     def add_points_as_gaussians(
@@ -842,7 +870,7 @@ class GaussianModel:
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = alive_mask.nonzero(as_tuple=True)[0]
 
-        if alive_indices.shape[0] <= 0:
+        if dead_indices.shape[0] <= 0 or alive_indices.shape[0] <= 0:
             return
 
         # sample from alive ones based on opacity
@@ -865,7 +893,13 @@ class GaussianModel:
         self.visibility_ema[dead_indices] = 0.0
         self.visibility_ema[reinit_idx] = self.visibility_ema[reinit_idx].clamp_max(0.5)
 
-    def relocate_gs_energy_guided(self, dead_mask=None, parent_scores=None, temperature=1.0):
+    def relocate_gs_energy_guided(
+        self,
+        dead_mask=None,
+        parent_scores=None,
+        temperature=1.0,
+        exclude_parent_mask=None,
+    ):
         """
         Utility-guided relocation.
         
@@ -875,11 +909,14 @@ class GaussianModel:
         if dead_mask.sum() == 0:
             return
 
-        alive_mask = ~dead_mask 
+        alive_mask = ~dead_mask
+        if exclude_parent_mask is not None and exclude_parent_mask.shape[0] == alive_mask.shape[0]:
+            dead_mask = dead_mask & ~exclude_parent_mask
+            alive_mask &= ~exclude_parent_mask
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = alive_mask.nonzero(as_tuple=True)[0]
 
-        if alive_indices.shape[0] <= 0:
+        if dead_indices.shape[0] <= 0 or alive_indices.shape[0] <= 0:
             return
 
         # Sample alive parents by utility scores
@@ -910,7 +947,14 @@ class GaussianModel:
         self.visibility_ema[dead_indices] = 0.0
         self.visibility_ema[reinit_idx] = self.visibility_ema[reinit_idx].clamp_max(0.5)
 
-    def add_new_gs_energy_guided(self, cap_max, growth_factor=1.05, parent_scores=None, temperature=1.0):
+    def add_new_gs_energy_guided(
+        self,
+        cap_max,
+        growth_factor=1.05,
+        parent_scores=None,
+        temperature=1.0,
+        exclude_parent_mask=None,
+    ):
         """
         Utility-guided growth.
         
@@ -925,14 +969,20 @@ class GaussianModel:
             return 0
 
         # Sample parents by utility scores
+        parent_indices = torch.arange(current_num_points, device=self.get_xyz.device)
+        if exclude_parent_mask is not None and exclude_parent_mask.shape[0] == current_num_points:
+            parent_indices = parent_indices[~exclude_parent_mask]
+        if parent_indices.numel() == 0:
+            return 0
+
         if parent_scores is not None:
-            scores = parent_scores
+            scores = parent_scores[parent_indices]
         else:
             scores = None
         
-        probs = self.get_opacity.squeeze(-1)
+        probs = self.get_opacity.squeeze(-1)[parent_indices]
         add_idx, ratio = self._sample_alives(
-            probs=probs, num=num_gs,
+            alive_indices=parent_indices, probs=probs, num=num_gs,
             scores=scores, temperature=temperature,
         )
 

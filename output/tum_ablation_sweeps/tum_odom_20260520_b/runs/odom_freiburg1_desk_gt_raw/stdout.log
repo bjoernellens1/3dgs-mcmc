@@ -1,0 +1,23 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0m[streaming] TUM: 120 frames loaded from /mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rgbd_dataset_freiburg1_desk
+{
+  "method": "gt_raw",
+  "source_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rgbd_dataset_freiburg1_desk",
+  "n_frames": 120,
+  "n_invalid_or_missing": 0,
+  "distance_m": 1.7272038923512643,
+  "gt_distance_m": 1.727203899867003,
+  "association": {
+    "n_matches": 120,
+    "max_dt": 0.03,
+    "dt_mean": -0.00027117530504862467,
+    "dt_abs_p95": 0.0023112893104553223,
+    "dt_abs_max": 0.00418400764465332
+  },
+  "gt_tum_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rgbd_dataset_freiburg1_desk/groundtruth.txt",
+  "ate_rmse": 4.7111666763345766e-08,
+  "ate_mean": 4.403381303404367e-08,
+  "rpe_trans_rmse": 6.889247655049496e-08,
+  "rpe_rot_deg_rmse": 0.017986065380254115
+}

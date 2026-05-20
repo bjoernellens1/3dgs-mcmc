@@ -1,0 +1,28 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0m[streaming] live Open3D odometry async worker started (queue_size=32, queue-bounded, motion_prior=False, motion_gate=False)
+[streaming] TUMRosbag: 120 synced frames from /mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg3_long_office_household/rosbag/rgbd_dataset_freiburg3_long_office_household.bag (color=2585, depth=2509, sync=accepted=120 | reject_depth=102 | reject_pose=0 | reused_depth=0 | rgb-depth dt: med=0.03ms p95=0.68ms max=4.72ms | est_offset=+0.03ms, pose_source=open3d_odometry_live, motion_prior=False, motion_gate=False, sync_report=output/tum_ablation_sweeps/tum_odom_focused_20260520/runs/odom_freiburg3_long_office_household_hybrid_sync5/rosbag_sync_report.json)
+[streaming] live Open3D odometry source_frame=1 successes=1 failures=0 method=hybrid stride=1 motion_prior=False motion_gate=False dt=0.0062m dr=0.15deg info_trace=3.956e+06
+[streaming] live Open3D odometry source_frame=50 successes=50 failures=0 method=hybrid stride=1 motion_prior=False motion_gate=False dt=0.0020m dr=0.31deg info_trace=4.303e+06
+[streaming] live Open3D odometry source_frame=100 successes=100 failures=0 method=hybrid stride=1 motion_prior=False motion_gate=False dt=0.0178m dr=0.19deg info_trace=4.444e+06
+[streaming] OrbbecRosBag: saved Open3D odometry cache output/tum_ablation_sweeps/tum_odom_focused_20260520/runs/odom_freiburg3_long_office_household_hybrid_sync5/open3d_odometry_cache/b3aa3c65bc93d5b6f27f3208.npz
+{
+  "method": "hybrid_sync5",
+  "source_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg3_long_office_household/rosbag/rgbd_dataset_freiburg3_long_office_household.bag",
+  "n_frames": 118,
+  "n_invalid_or_missing": 0,
+  "distance_m": 1.053437869695579,
+  "gt_distance_m": 1.0479983424848658,
+  "association": {
+    "n_matches": 118,
+    "max_dt": 0.03,
+    "dt_mean": -0.0007039914696903552,
+    "dt_abs_p95": 0.004802882671356201,
+    "dt_abs_max": 0.0066699981689453125
+  },
+  "gt_tum_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg3_long_office_household/groundtruth/rgbd_dataset_freiburg3_long_office_household-groundtruth.txt",
+  "ate_rmse": 0.044755629225932805,
+  "ate_mean": 0.039483493448835956,
+  "rpe_trans_rmse": 0.005075905512882229,
+  "rpe_rot_deg_rmse": 0.2798317031284337
+}

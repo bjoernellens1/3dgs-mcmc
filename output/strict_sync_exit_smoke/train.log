@@ -1,0 +1,33 @@
+Optimizing output/strict_sync_exit_smoke
+[streaming] OrbbecRosBag sync: accepted=2055 | reject_depth=1 | reject_pose=0 | reused_depth=0 | rgb-depth dt: med=1.39ms p95=1.40ms max=1.52ms report=output/strict_sync_exit_smoke/sync_report.json [19/05 19:21:05]
+[streaming] live Open3D odometry async worker started (queue_size=32, queue-bounded) [19/05 19:21:05]
+[streaming] OrbbecRosBag: 2055 synced frames from /mnt/cps_persistent1_shared/datasets/christian/embedding_map/bags/slam/kitchen1_slam (color=2056, depth=2055, pose=0, pose_source=open3d_odometry_live) [19/05 19:21:05]
+[streaming] Bootstrapping from 5 frame(s)... [19/05 19:21:05]
+[streaming] live Open3D odometry source_frame=1 successes=1 failures=0 method=hybrid stride=1 dt=0.0003m dr=0.02deg info_trace=1.659e+07 [19/05 19:21:10]
+Number of points at initialisation :  54656 [19/05 19:21:17]
+[streaming] Initial seed point cloud exported (54656 points) [19/05 19:21:17]
+[streaming] Initialised 54656 Gaussians from 5 frames, scene radius=3.345 [19/05 19:21:17]
+[compiled-kernels] torch.compile disabled (--compile_mode=off) [19/05 19:21:17]
+[streaming] Starting: strategy=gsplat_energy_mcmc optimizer=selective_adam sparse=True steps_per_frame=50 wallclock=False [19/05 19:21:17]
+[streaming] Dataset: 2055 frames. Iterations to cover all frames: 103000 (budget=20, covers 0%). Remaining frames will be flushed post-loop. [19/05 19:21:17]
+Streaming training:   0%|          | 0/20 [00:00<?, ?it/s]/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)
+Streaming training:   0%|          | 0/20 [00:11<?, ?it/s, Loss=0.5546369, N=54656, F=6]Streaming training:  50%|#####     | 10/20 [00:11<00:11,  1.20s/it, Loss=0.5546369, N=54656, F=6]Streaming training:  50%|#####     | 10/20 [00:12<00:11,  1.20s/it, Loss=0.5330683, N=54656, F=6]Streaming training: 100%|##########| 20/20 [00:12<00:00,  1.85it/s, Loss=0.5330683, N=54656, F=6]Streaming training: 100%|##########| 20/20 [00:12<00:00,  1.56it/s, Loss=0.5330683, N=54656, F=6]
+
+[ITER 20] Saving Gaussians [19/05 19:21:30]
+[streaming] Keyframe admission: 0/1 admitted (0.0%) — forced=0 moved=0 novel=0 rej_overlap=1 rej_motion=0 [19/05 19:21:30]
+[streaming] Iteration budget exhausted with 2049 dataset frames unseen. Coverage: 0 frames optimized × 20.0 avg steps/frame = 6/2055 dataset frames. [19/05 19:21:30]
+[report] iter=20 no test views — skipping test PSNR/LPIPS/contact sheet [19/05 19:21:31]
+[report] iter=20 train PSNR mean=6.76dB min=6.76 max=6.76 (5/5 views) [19/05 19:22:23]
+[report] iter=20 train LPIPS mean=0.6466 min=0.6376 max=0.6528 [19/05 19:22:23]
+[report] trajectory.mp4 written (5 frames @ 30fps) [19/05 19:22:24]
+[report] iter=20 test PSNR mean=6.76dB min=6.76 max=6.76 (5/5 views) [19/05 19:22:28]
+[report] iter=20 test LPIPS mean=0.6466 min=0.6376 max=0.6528 [19/05 19:22:28]
+[report] iter=20 train PSNR mean=6.76dB min=6.76 max=6.76 (5/5 views) [19/05 19:22:31]
+[report] iter=20 train LPIPS mean=0.6466 min=0.6376 max=0.6528 [19/05 19:22:31]
+[report] trajectory.mp4 written (5 frames @ 30fps) [19/05 19:22:32]
+[trajectory_eval] → output/strict_sync_exit_smoke/trajectory_eval  n=5 ATE=None [19/05 19:22:33]
+
+[streaming] Training complete. [19/05 19:22:33]
+
+Training complete. [19/05 19:22:33]

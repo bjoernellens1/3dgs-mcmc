@@ -1,0 +1,27 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0m[streaming] live Open3D odometry async worker started (queue_size=32, queue-bounded, motion_prior=False, motion_gate=False)
+[streaming] TUMRosbag: 90 synced frames from /mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rosbag/rgbd_dataset_freiburg1_desk.bag (color=613, depth=595, sync=accepted=90 | reject_depth=523 | reject_pose=0 | reused_depth=0 | rgb-depth dt: med=2.98ms p95=3.84ms max=4.77ms | est_offset=-7.32ms, pose_source=open3d_odometry_live, motion_prior=False, motion_gate=False, sync_report=output/tum_ablation_sweeps/tum_odom_20260520_c/runs/odom_freiburg1_desk_hybrid_sync5/rosbag_sync_report.json)
+[streaming] live Open3D odometry source_frame=1 successes=1 failures=0 method=hybrid stride=1 motion_prior=False motion_gate=False dt=0.0743m dr=1.87deg info_trace=2.262e+06
+[streaming] live Open3D odometry source_frame=50 successes=50 failures=0 method=hybrid stride=1 motion_prior=False motion_gate=False dt=0.0038m dr=1.91deg info_trace=9.281e+05
+[streaming] OrbbecRosBag: saved Open3D odometry cache output/tum_ablation_sweeps/tum_odom_20260520_c/runs/odom_freiburg1_desk_hybrid_sync5/open3d_odometry_cache/0282ddf9b99d30e88540b623.npz
+{
+  "method": "hybrid_sync5",
+  "source_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rosbag/rgbd_dataset_freiburg1_desk.bag",
+  "n_frames": 90,
+  "n_invalid_or_missing": 0,
+  "distance_m": 1.5400363539641644,
+  "gt_distance_m": 1.317574315815466,
+  "association": {
+    "n_matches": 90,
+    "max_dt": 0.03,
+    "dt_mean": 0.00070801575978597,
+    "dt_abs_p95": 0.004392933845520019,
+    "dt_abs_max": 0.004655599594116211
+  },
+  "gt_tum_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rgbd_dataset_freiburg1_desk/groundtruth.txt",
+  "ate_rmse": 0.05380904559624109,
+  "ate_mean": 0.03820563538875938,
+  "rpe_trans_rmse": 0.02253438052663857,
+  "rpe_rot_deg_rmse": 1.1275890901055377
+}

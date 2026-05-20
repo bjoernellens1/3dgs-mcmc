@@ -1,0 +1,6 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0m[streaming] live Open3D odometry async worker started (queue_size=32, queue-bounded, motion_prior=False, motion_gate=False)
+[streaming] TUMRosbag: 90 synced frames from /mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rosbag/rgbd_dataset_freiburg1_desk.bag (color=613, depth=595, sync=accepted=90 | reject_depth=523 | reject_pose=0 | reused_depth=0 | rgb-depth dt: med=2.98ms p95=3.84ms max=4.77ms | est_offset=-7.32ms, pose_source=open3d_odometry_live, motion_prior=False, motion_gate=False, sync_report=output/tum_ablation_sweeps/tum_odom_20260520_b/runs/odom_freiburg1_desk_hybrid_sync5/rosbag_sync_report.json)
+[streaming] live Open3D odometry source_frame=1 successes=1 failures=0 method=hybrid stride=1 motion_prior=False motion_gate=False dt=0.0743m dr=1.87deg info_trace=2.262e+06
+time="2026-05-20T07:33:53+02:00" level=error msg="forwarding signal 15 to container aacc4dfca386a111f514f9359db8b00e72c99f60a025ef58c24b2a9b2ec9d994: sending signal to container aacc4dfca386a111f514f9359db8b00e72c99f60a025ef58c24b2a9b2ec9d994: `/usr/bin/crun kill aacc4dfca386a111f514f9359db8b00e72c99f60a025ef58c24b2a9b2ec9d994 15` failed: signal: hangup"

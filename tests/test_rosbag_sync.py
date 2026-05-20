@@ -25,7 +25,7 @@ from utils.rosbag_sync import (  # noqa: E402
     sync_color_depth_unique,
     write_sync_report,
 )
-from utils.streaming_frames import streaming_frame_from_synced_rgbd  # noqa: E402
+from utils.streaming_frames import OrbbecRosBagFrameSource, streaming_frame_from_synced_rgbd  # noqa: E402
 
 
 MS = 1_000_000  # ns per ms
@@ -241,3 +241,79 @@ def test_streaming_frame_from_synced_rgbd_audit_fields():
     assert frame._rgb_bytes == b"rgb"
     assert frame._depth_bytes == b"depth"
     np.testing.assert_allclose(frame.c2w, c2w)
+
+
+# ---------- live Open3D odometry controls ----------
+
+def _live_odom_source_for_controls(*, motion_prior: bool, motion_gate: bool):
+    src = object.__new__(OrbbecRosBagFrameSource)
+    src._live_odom_motion_prior = motion_prior
+    src._live_odom_motion_gate = motion_gate
+    src._live_odom_prev_key_idx = 10
+    src._live_odom_last_n_edges = 2
+    src._live_odom_max_trans = 0.15
+    src._live_odom_max_rot = 8.0
+    src._live_odom_last_trans = np.eye(4, dtype=np.float64)
+    src._live_odom_last_trans[:3, 3] = [0.2, 0.0, 0.0]
+    return src
+
+
+def test_live_odom_defaults_use_identity_init_and_do_not_gate_motion():
+    src = _live_odom_source_for_controls(motion_prior=False, motion_gate=False)
+
+    init_guess = src._live_odom_initial_guess(12)
+
+    np.testing.assert_allclose(init_guess, np.eye(4, dtype=np.float64))
+    assert not src._live_odom_motion_rejected(edge_t=10.0, edge_r=180.0, n_edges=1)
+
+
+def test_live_odom_motion_prior_uses_scaled_last_transform():
+    src = _live_odom_source_for_controls(motion_prior=True, motion_gate=False)
+
+    init_guess = src._live_odom_initial_guess(14)
+
+    expected = np.eye(4, dtype=np.float64)
+    expected[:3, 3] = [0.4, 0.0, 0.0]
+    np.testing.assert_allclose(init_guess, expected)
+
+
+def test_live_odom_motion_gate_rejects_over_threshold_motion():
+    src = _live_odom_source_for_controls(motion_prior=False, motion_gate=True)
+
+    assert src._live_odom_motion_rejected(edge_t=0.31, edge_r=1.0, n_edges=2)
+    assert src._live_odom_motion_rejected(edge_t=0.01, edge_r=16.1, n_edges=2)
+    assert not src._live_odom_motion_rejected(edge_t=0.30, edge_r=16.0, n_edges=2)
+
+
+def test_open3d_odom_cache_key_separates_motion_controls(tmp_path):
+    kwargs = dict(
+        path=str(tmp_path),
+        color_topic="/color",
+        depth_topic="/depth",
+        camera_info_topic="/info",
+        sync_threshold_ms=5.0,
+        frame_stride=1,
+        max_frames=0,
+        fx=500.0,
+        fy=501.0,
+        cx=320.0,
+        cy=240.0,
+        width=640,
+        height=480,
+        synced=[(100,), (200,)],
+        odom_stride=1,
+        odom_downscale=1,
+        mode="live",
+    )
+
+    default_key = OrbbecRosBagFrameSource._open3d_odom_cache_key(**kwargs)
+    prior_key = OrbbecRosBagFrameSource._open3d_odom_cache_key(
+        **kwargs,
+        motion_prior=True,
+    )
+    gate_key = OrbbecRosBagFrameSource._open3d_odom_cache_key(
+        **kwargs,
+        motion_gate=True,
+    )
+
+    assert len({default_key, prior_key, gate_key}) == 3

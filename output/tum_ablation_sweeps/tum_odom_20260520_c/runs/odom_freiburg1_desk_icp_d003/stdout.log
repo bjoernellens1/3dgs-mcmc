@@ -1,0 +1,28 @@
+[4m>>>> Executing external compose provider "/usr/bin/podman-compose". Please see podman-compose(1) for how to disable this message. <<<<
+
+[0m[streaming] live Open3D odometry async worker started (queue_size=32, queue-bounded, motion_prior=False, motion_gate=False)
+[streaming] TUMRosbag: 120 synced frames from /mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rosbag/rgbd_dataset_freiburg1_desk.bag (color=613, depth=595, sync=accepted=120 | reject_depth=18 | reject_pose=0 | reused_depth=0 | rgb-depth dt: med=19.47ms p95=28.73ms max=29.71ms | est_offset=-7.32ms, pose_source=open3d_odometry_live, motion_prior=False, motion_gate=False, sync_report=output/tum_ablation_sweeps/tum_odom_20260520_c/runs/odom_freiburg1_desk_icp_d003/rosbag_sync_report.json)
+[streaming] live Open3D odometry source_frame=1 successes=1 failures=0 method=icp stride=1 motion_prior=False motion_gate=False dt=0.0132m dr=1.06deg fitness=0.9980 rmse=0.0040
+[streaming] live Open3D odometry source_frame=50 successes=50 failures=0 method=icp stride=1 motion_prior=False motion_gate=False dt=0.0112m dr=0.41deg fitness=0.9988 rmse=0.0031
+[streaming] live Open3D odometry source_frame=100 successes=100 failures=0 method=icp stride=1 motion_prior=False motion_gate=False dt=0.0175m dr=1.20deg fitness=0.9988 rmse=0.0033
+[streaming] OrbbecRosBag: saved Open3D odometry cache output/tum_ablation_sweeps/tum_odom_20260520_c/runs/odom_freiburg1_desk_icp_d003/open3d_odometry_cache/d8880caccaaf048cc3b8c04f.npz
+{
+  "method": "icp_d003",
+  "source_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rosbag/rgbd_dataset_freiburg1_desk.bag",
+  "n_frames": 120,
+  "n_invalid_or_missing": 0,
+  "distance_m": 1.7261355740813529,
+  "gt_distance_m": 1.727203899867003,
+  "association": {
+    "n_matches": 120,
+    "max_dt": 0.03,
+    "dt_mean": -0.0002712686856587728,
+    "dt_abs_p95": 0.002310824394226074,
+    "dt_abs_max": 0.00418400764465332
+  },
+  "gt_tum_path": "/mnt/cps_persistent1_shared/datasets/public/TUM/tum_rgbd/freiburg1_desk/rgbd_dataset_freiburg1_desk/groundtruth.txt",
+  "ate_rmse": 0.12145447892550701,
+  "ate_mean": 0.11200219953017808,
+  "rpe_trans_rmse": 0.02935672510515062,
+  "rpe_rot_deg_rmse": 2.7391668867541696
+}

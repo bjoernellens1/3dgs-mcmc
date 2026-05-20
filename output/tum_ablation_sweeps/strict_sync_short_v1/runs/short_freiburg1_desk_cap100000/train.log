@@ -1,0 +1,3 @@
+Optimizing output/tum_ablation_sweeps/strict_sync_short_v1/runs/short_freiburg1_desk_cap100000
+/workspace/3dgs-mcmc/utils/energy_mcmc.py:40: UserWarning: The .grad attribute of a Tensor that is not a leaf Tensor is being accessed. Its .grad attribute won't be populated during autograd.backward(). If you indeed want the .grad field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor instead. See github.com/pytorch/pytorch/pull/30531 for more information. (Triggered internally at /pytorch/build/aten/src/ATen/core/TensorBody.h:492.)
+  return _dense_grad(getattr(gaussians, legacy_attr).grad)

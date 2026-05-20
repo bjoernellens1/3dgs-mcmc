@@ -95,6 +95,66 @@ def load_tum_trajectory(path: str) -> tuple[np.ndarray, np.ndarray]:
     return np.array(ts), np.stack(mats)
 
 
+def associate_by_timestamp(
+    ts_est: np.ndarray,
+    c2w_est: np.ndarray,
+    ts_ref: np.ndarray,
+    c2w_ref: np.ndarray,
+    *,
+    max_dt: float = 0.03,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Nearest-neighbor timestamp association for trajectory metrics."""
+    if len(ts_est) == 0 or len(ts_ref) == 0:
+        return (
+            np.asarray([], dtype=np.float64),
+            np.empty((0, 4, 4), dtype=np.float64),
+            np.empty((0, 4, 4), dtype=np.float64),
+            {"n_matches": 0, "max_dt": float(max_dt)},
+        )
+    ref_order = np.argsort(ts_ref)
+    ts_ref_sorted = ts_ref[ref_order]
+    c2w_ref_sorted = c2w_ref[ref_order]
+    est_out, ref_out, ts_out, dts = [], [], [], []
+    for t, pose in zip(ts_est, c2w_est):
+        idx = int(np.searchsorted(ts_ref_sorted, t))
+        candidates = []
+        if idx < len(ts_ref_sorted):
+            candidates.append(idx)
+        if idx > 0:
+            candidates.append(idx - 1)
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda i: abs(float(ts_ref_sorted[i]) - float(t)))
+        dt = float(ts_ref_sorted[best]) - float(t)
+        if abs(dt) > max_dt:
+            continue
+        ts_out.append(float(t))
+        est_out.append(pose)
+        ref_out.append(c2w_ref_sorted[best])
+        dts.append(dt)
+    if not est_out:
+        return (
+            np.asarray([], dtype=np.float64),
+            np.empty((0, 4, 4), dtype=np.float64),
+            np.empty((0, 4, 4), dtype=np.float64),
+            {"n_matches": 0, "max_dt": float(max_dt)},
+        )
+    dts_np = np.asarray(dts, dtype=np.float64)
+    info = {
+        "n_matches": len(est_out),
+        "max_dt": float(max_dt),
+        "dt_mean": float(dts_np.mean()),
+        "dt_abs_p95": float(np.percentile(np.abs(dts_np), 95)),
+        "dt_abs_max": float(np.max(np.abs(dts_np))),
+    }
+    return (
+        np.asarray(ts_out, dtype=np.float64),
+        np.stack(est_out).astype(np.float64),
+        np.stack(ref_out).astype(np.float64),
+        info,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
@@ -334,7 +394,7 @@ def _cams_to_c2w(cams) -> tuple[np.ndarray, np.ndarray]:
         T[:3, :3] = R_c2w
         T[:3, 3] = t_c2w
         mats.append(T)
-        ts.append(getattr(cam, "fid", float(len(ts))))
+        ts.append(float(getattr(cam, "_streaming_timestamp", getattr(cam, "fid", float(len(ts))))))
     return np.array(ts, dtype=np.float64), np.stack(mats)
 
 
@@ -347,6 +407,8 @@ def run_trajectory_eval(
     train_cams: Sequence,
     *,
     gt_cams: Optional[Sequence] = None,
+    gt_tum_path: Optional[str] = None,
+    association_max_dt: float = 0.03,
     method_label: str = "estimated",
 ) -> None:
     """Save TUM trajectory, PNG plot, and metrics.json for one run."""
@@ -361,8 +423,28 @@ def run_trajectory_eval(
     save_tum_trajectory(tum_path, ts, c2w)
 
     gt_c2w = None
+    association_info = None
     if gt_cams:
         _, gt_c2w = _cams_to_c2w(gt_cams)
+    elif gt_tum_path:
+        if os.path.exists(gt_tum_path):
+            gt_ts, gt_all = load_tum_trajectory(gt_tum_path)
+            matched_ts, c2w_matched, gt_c2w, association_info = associate_by_timestamp(
+                ts,
+                c2w,
+                gt_ts,
+                gt_all,
+                max_dt=association_max_dt,
+            )
+            if len(matched_ts) > 0:
+                ts = matched_ts
+                c2w = c2w_matched
+                save_tum_trajectory(os.path.join(output_dir, "trajectory_tum_associated.txt"), ts, c2w)
+                save_tum_trajectory(os.path.join(output_dir, "groundtruth_tum_associated.txt"), ts, gt_c2w)
+            else:
+                gt_c2w = None
+        else:
+            print(f"[trajectory_eval] GT path not found: {gt_tum_path}", flush=True)
 
     if gt_c2w is not None:
         metrics = trajectory_metrics(c2w, gt_c2w)
@@ -374,6 +456,10 @@ def run_trajectory_eval(
                    "gt_distance_m": None}
     metrics["method"] = method_label
     metrics["n_train_cams"] = len(train_cams)
+    if gt_tum_path:
+        metrics["gt_tum_path"] = gt_tum_path
+    if association_info:
+        metrics["association"] = association_info
 
     png_path = os.path.join(output_dir, "trajectory.png")
     plot_trajectory(png_path, c2w, title=f"Trajectory — {method_label}", gt=gt_c2w, metrics=metrics)

@@ -105,11 +105,25 @@ def estimate_stream_offset_ns(color_ts: list[int], depth_ts: list[int]) -> int:
     return int(np.median(nearest))
 
 
+_CLOCK_SKEW_WARN_NS = 60 * 1_000_000_000  # 60 seconds
+
+
 def _header_minus_bag(msgs: list[StampedMsg]) -> dict:
+    """(header.stamp - bag receive time) summary.
+
+    The diagnostic is only meaningful when both clocks share an epoch. Many
+    sensor drivers publish header.stamp as time-since-boot or a separate
+    NTP-disciplined clock, producing huge constant offsets that swamp the
+    real per-message latency. We flag that case via `clock_skew_warning` so
+    callers can ignore the field instead of treating the gap as latency.
+    """
     if not msgs:
         return {"count": 0}
     diffs = [m.header_ns - m.bag_ns for m in msgs if m.header_ns and m.bag_ns]
-    return _dt_stats(diffs)
+    stats = _dt_stats(diffs)
+    if stats.get("count"):
+        stats["clock_skew_warning"] = bool(stats.get("abs_median_ns", 0) > _CLOCK_SKEW_WARN_NS)
+    return stats
 
 
 def sync_color_depth_unique(

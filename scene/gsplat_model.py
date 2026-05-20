@@ -73,6 +73,9 @@ class GsplatGaussianModel:
         self.provisional = torch.empty(0, dtype=torch.bool, device="cuda")
         self.anchor_xyz = torch.empty((0, 3), dtype=torch.float32, device="cuda")
         self.anchor_iter = torch.empty(0, dtype=torch.int32, device="cuda")
+        self.depth_conflict_count = torch.empty(0, dtype=torch.int16, device="cuda")
+        self.depth_last_support_uid = torch.empty(0, dtype=torch.int32, device="cuda")
+        self.depth_last_conflict_uid = torch.empty(0, dtype=torch.int32, device="cuda")
         # Four-state lifecycle: 0=PROVISIONAL, 1=YOUNG, 2=MATURE, 3=FROZEN
         self.lifecycle_state = torch.empty(0, dtype=torch.int8, device="cuda")
         # Per-Gaussian utility EMA (rolling average of energy_mcmc utility score)
@@ -289,6 +292,7 @@ class GsplatGaussianModel:
     # reference the same list.
     _STREAMING_BUFFER_NAMES: tuple = (
         "birth_frame", "support_count", "provisional", "anchor_iter",
+        "depth_conflict_count", "depth_last_support_uid", "depth_last_conflict_uid",
         "lifecycle_state", "utility_ema", "anchor_scale_log", "anchor_opacity_logit",
         "anchor_xyz",
     )
@@ -427,6 +431,9 @@ class GsplatGaussianModel:
         xyz = self.get_xyz.detach() if count > 0 else torch.zeros((0, 3), device="cuda")
         self.anchor_xyz = xyz.clone()
         self.anchor_iter = torch.zeros(count, dtype=torch.int32, device="cuda")
+        self.depth_conflict_count = torch.zeros(count, dtype=torch.int16, device="cuda")
+        self.depth_last_support_uid = torch.full((count,), -1, dtype=torch.int32, device="cuda")
+        self.depth_last_conflict_uid = torch.full((count,), -1, dtype=torch.int32, device="cuda")
         self.lifecycle_state = torch.zeros(count, dtype=torch.int8, device="cuda")
         self.utility_ema = torch.zeros(count, dtype=torch.float32, device="cuda")
         scales = self.params["scales"].detach() if count > 0 else torch.zeros((0, 3), device="cuda")
@@ -466,6 +473,12 @@ class GsplatGaussianModel:
         self.provisional = self.provisional[valid_points_mask]
         self.anchor_xyz = self.anchor_xyz[valid_points_mask]
         self.anchor_iter = self.anchor_iter[valid_points_mask]
+        if self.depth_conflict_count.shape[0] == mask.shape[0]:
+            self.depth_conflict_count = self.depth_conflict_count[valid_points_mask]
+        if self.depth_last_support_uid.shape[0] == mask.shape[0]:
+            self.depth_last_support_uid = self.depth_last_support_uid[valid_points_mask]
+        if self.depth_last_conflict_uid.shape[0] == mask.shape[0]:
+            self.depth_last_conflict_uid = self.depth_last_conflict_uid[valid_points_mask]
         if self.lifecycle_state.shape[0] == mask.shape[0]:
             self.lifecycle_state = self.lifecycle_state[valid_points_mask]
         if self.utility_ema.shape[0] == mask.shape[0]:
@@ -599,6 +612,18 @@ class GsplatGaussianModel:
         new_anchor_iter = torch.zeros(N, dtype=torch.int32, device="cuda")
         self.anchor_xyz = torch.cat([self.anchor_xyz, new_anchor_xyz], dim=0)
         self.anchor_iter = torch.cat([self.anchor_iter, new_anchor_iter], dim=0)
+        self.depth_conflict_count = torch.cat([
+            self.depth_conflict_count,
+            torch.zeros(N, dtype=torch.int16, device="cuda"),
+        ], dim=0)
+        self.depth_last_support_uid = torch.cat([
+            self.depth_last_support_uid,
+            torch.full((N,), -1, dtype=torch.int32, device="cuda"),
+        ], dim=0)
+        self.depth_last_conflict_uid = torch.cat([
+            self.depth_last_conflict_uid,
+            torch.full((N,), -1, dtype=torch.int32, device="cuda"),
+        ], dim=0)
 
         # Lifecycle state: new insertions start as PROVISIONAL (0)
         self.lifecycle_state = torch.cat([

@@ -45,6 +45,20 @@ from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
 from utils.stream_scheduler import FrameScheduler
 from utils.streaming_frames import make_frame_source
+from utils.streaming_depth_lock import (
+    depth_conflict_enabled,
+    depth_conflict_prune_mask,
+    depth_lock_conflict_threshold,
+    depth_lock_enabled,
+    depth_lock_geometry_stats,
+    depth_lock_candidate_mask,
+    depth_locked_mask,
+    ensure_depth_lock_buffers,
+    record_depth_conflicts,
+    record_depth_support_views,
+    restore_depth_locked_centers,
+    zero_depth_locked_mean_grads,
+)
 from utils.general_utils import inverse_sigmoid
 
 try:
@@ -267,6 +281,9 @@ def _sync_streaming_state_lengths(gaussians):
         ("support_count", 0),
         ("provisional", False),
         ("anchor_iter", 0),
+        ("depth_conflict_count", 0),
+        ("depth_last_support_uid", -1),
+        ("depth_last_conflict_uid", -1),
         ("lifecycle_state", 0),
         ("utility_ema", 0.0),
     ):
@@ -547,6 +564,7 @@ def insert_gaussians_from_frame(
     ys, xs = np.mgrid[0:h:depth_stride, 0:w:depth_stride]
     z_v = z[ys, xs]
     valid = np.isfinite(z_v) & (z_v > min_depth) & (z_v < max_depth)
+    score_grid = np.ones_like(valid, dtype=np.float32)
     if _debug:
         _stats["raw_candidates"] = int(valid.sum())
 
@@ -615,6 +633,7 @@ def insert_gaussians_from_frame(
         low_alpha = np.zeros(sh2d, dtype=bool)
         no_rend_depth = np.ones(sh2d, dtype=bool)   # default: treat as "no depth"
         sensor_closer = np.zeros(sh2d, dtype=bool)
+        score_grid = np.zeros(sh2d, dtype=np.float32)
 
         if render_alpha is not None:
             alpha_cpu = render_alpha.detach().cpu().numpy().squeeze()  # [Hr, Wr]
@@ -622,7 +641,11 @@ def insert_gaussians_from_frame(
             xs_r = np.clip(np.round(xs / max(w - 1, 1) * (Wr - 1)).astype(np.int32), 0, Wr - 1)
             ys_r = np.clip(np.round(ys / max(h - 1, 1) * (Hr - 1)).astype(np.int32), 0, Hr - 1)
             alpha_v = alpha_cpu[ys_r, xs_r]
-            low_alpha = alpha_v < 0.3
+            alpha_thresh = float(getattr(args, "streaming_insert_alpha_threshold", 0.3))
+            low_alpha = alpha_v < alpha_thresh
+            score_grid += np.maximum(alpha_thresh - alpha_v, 0.0).astype(np.float32) * float(
+                getattr(args, "streaming_insert_score_alpha_weight", 1.0)
+            )
 
         if render_depth is not None:
             rend_d_cpu = render_depth.detach().cpu().numpy().squeeze()
@@ -633,11 +656,28 @@ def insert_gaussians_from_frame(
             consistency_thresh = getattr(args, "streaming_depth_consistency_thresh", 0.05)
             no_rend_depth = rend_d_v <= 0
             sensor_closer = rend_d_v - z_v > consistency_thresh
+            score_grid += no_rend_depth.astype(np.float32) * float(
+                getattr(args, "streaming_insert_score_no_depth_weight", 1.0)
+            )
+            score_grid += np.maximum(rend_d_v - z_v, 0.0).astype(np.float32) * float(
+                getattr(args, "streaming_insert_score_sensor_closer_weight", 2.0)
+            )
             if (temporal_ok is not None and
                     getattr(args, "streaming_depth_temporal_require_for_sensor_closer", True)):
                 sensor_closer = sensor_closer & temporal_ok
 
-        valid = valid & (low_alpha | no_rend_depth | sensor_closer)
+        score_mode = str(getattr(args, "streaming_insert_score_mode", "boolean_or"))
+        if score_mode == "alpha_only":
+            insert_mask = low_alpha
+        elif score_mode == "depth_gap_only":
+            insert_mask = no_rend_depth | sensor_closer
+        elif score_mode == "sensor_closer_only":
+            insert_mask = sensor_closer
+        elif score_mode == "weighted_topk":
+            insert_mask = score_grid > 0
+        else:
+            insert_mask = low_alpha | no_rend_depth | sensor_closer
+        valid = valid & insert_mask
         if _debug:
             _stats["after_alpha_depth_mask"] = int(valid.sum())
             _stats["insert_path_low_alpha"] = int((valid & low_alpha).sum())
@@ -672,6 +712,7 @@ def insert_gaussians_from_frame(
     xs_vi = xs[valid].astype(np.int32)
     ys_vi = ys[valid].astype(np.int32)
     z_vi = z_v[valid]
+    score_v = score_grid[valid].astype(np.float32)
     
     dzdx_v = (z[ys_vi, np.clip(xs_vi + s, 0, w - 1)] - z[ys_vi, np.clip(xs_vi - s, 0, w - 1)])
     dzdy_v = (z[np.clip(ys_vi + s, 0, h - 1), xs_vi] - z[np.clip(ys_vi - s, 0, h - 1), xs_vi])
@@ -695,6 +736,7 @@ def insert_gaussians_from_frame(
     ys_v = ys_vi[angle_ok].astype(np.float32)
     z_v = z_vi[angle_ok].astype(np.float32)
     nx = nx[angle_ok]; ny = ny[angle_ok]; nz = nz[angle_ok]
+    score_v = score_v[angle_ok]
 
     from utils.rgbd_frames import backproject_depth_pixels
     pts, cols = backproject_depth_pixels(
@@ -706,6 +748,7 @@ def insert_gaussians_from_frame(
     cols = cols[~occupied]
     nx = nx[~occupied]; ny = ny[~occupied]; nz = nz[~occupied]
     z_v = z_v[~occupied]
+    score_v = score_v[~occupied]
     if _debug:
         _stats["after_voxel_occupancy"] = pts.shape[0]
 
@@ -717,6 +760,7 @@ def insert_gaussians_from_frame(
     cols = cols[indices]
     nx = nx[indices]; ny = ny[indices]; nz = nz[indices]
     z_v = z_v[indices]
+    score_v = score_v[indices]
 
     # ---- KNN insertion dedup (Component E) ----------------------------------
     # Reject candidates whose nearest existing Gaussian is within depth*radius_factor.
@@ -749,15 +793,20 @@ def insert_gaussians_from_frame(
                 pts = pts[keep_np]; cols = cols[keep_np]
                 nx = nx[keep_np]; ny = ny[keep_np]; nz = nz[keep_np]
                 z_v = z_v[keep_np]
+                score_v = score_v[keep_np]
                 if _debug:
                     _stats["after_knn_dedup"] = pts.shape[0]
             else:
                 return ({} if _collect_only else 0), _stats
 
     if max_new > 0 and pts.shape[0] > max_new:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(pts.shape[0], size=max_new, replace=False)
+        if str(getattr(args, "streaming_insert_score_mode", "boolean_or")) == "weighted_topk":
+            idx = np.argpartition(-score_v, max_new - 1)[:max_new]
+        else:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(pts.shape[0], size=max_new, replace=False)
         pts, cols, nx, ny, nz, z_v = pts[idx], cols[idx], nx[idx], ny[idx], nz[idx], z_v[idx]
+        score_v = score_v[idx]
 
     # ---- Surface-aligned initialisation (Step 6) ----------------------------
     # Align Gaussians to surface normals
@@ -1106,12 +1155,26 @@ def _render_streaming_snapshot(
 def _update_provisional_support(gaussians, cam, render_pkg, args):
     """
     Check visible provisional Gaussians against sensor depth and increment support.
+    When enabled, also records conservative multi-view depth conflicts for
+    depth-locked candidates. Defaults remain unchanged when conflict tracking is off.
     """
-    if not hasattr(gaussians, "provisional") or not gaussians.provisional.any():
-        return
-    
     visible = render_pkg["visibility_filter"]
-    to_check = gaussians.provisional & visible
+    to_check = torch.zeros_like(visible, dtype=torch.bool)
+    has_provisional = (
+        hasattr(gaussians, "provisional")
+        and gaussians.provisional.shape[0] == visible.shape[0]
+    )
+    if has_provisional and gaussians.provisional.any():
+        to_check |= gaussians.provisional & visible
+
+    track_conflicts = depth_conflict_enabled(args)
+    candidate_mask = None
+    if track_conflicts:
+        ensure_depth_lock_buffers(gaussians)
+        candidate_mask = depth_lock_candidate_mask(gaussians, args)
+        if candidate_mask.shape[0] == visible.shape[0]:
+            to_check |= candidate_mask & visible
+
     if not to_check.any():
         return
         
@@ -1149,12 +1212,33 @@ def _update_provisional_support(gaussians, cam, render_pkg, args):
         
     # Consistency check
     z_lookup = sensor_d[0, vi[valid_px], ui[valid_px]]
-    consistent = (z_lookup > 0) & (torch.abs(z_p[valid_px] - z_lookup) < args.streaming_depth_consistency_thresh)
+    abs_depth_error = torch.abs(z_p[valid_px] - z_lookup)
+    sensor_valid = z_lookup > 0
+    consistent = sensor_valid & (
+        abs_depth_error < float(args.streaming_depth_consistency_thresh)
+    )
     
     # Increment support for consistent points
     # Need to map back from valid_px -> to_check -> global
-    indices = torch.where(to_check)[0][valid_px][consistent]
-    gaussians.support_count[indices] += 1
+    indices_all = torch.where(to_check)[0][valid_px]
+    if has_provisional:
+        support_indices = indices_all[consistent & gaussians.provisional[indices_all]]
+        if support_indices.numel() > 0:
+            gaussians.support_count[support_indices] += 1
+
+    if track_conflicts and candidate_mask is not None and candidate_mask.shape[0] == visible.shape[0]:
+        frame = getattr(cam, "_streaming_frame", None)
+        view_uid = int(getattr(frame, "index", getattr(cam, "uid", 0)))
+        candidate_checked = candidate_mask[indices_all]
+        conflict_thresh = depth_lock_conflict_threshold(args)
+        support_for_locked = consistent & candidate_checked
+        if support_for_locked.any():
+            record_depth_support_views(gaussians, indices_all[support_for_locked], view_uid)
+        # Conservative proof of wrong geometry: the Gaussian center is in front of
+        # the measured surface, i.e. valid depth says the intervening space is empty.
+        conflicts = sensor_valid & candidate_checked & (z_p[valid_px] < (z_lookup - conflict_thresh))
+        if conflicts.any():
+            record_depth_conflicts(gaussians, indices_all[conflicts], view_uid)
 
 
 
@@ -1972,6 +2056,26 @@ def streaming_training(
     _bootstrap_anchor_decay = max(1, int(getattr(args, "streaming_bootstrap_anchor_decay_steps", 2000)))
     _insertion_anchor_weight = float(getattr(args, "streaming_insertion_anchor_weight", 1.0))
     _insertion_anchor_decay  = max(1, int(getattr(args, "streaming_insertion_anchor_decay_steps", 200)))
+
+    _depth_lock_active = depth_lock_enabled(args)
+    _depth_conflict_active = depth_conflict_enabled(args)
+    _depth_lock_report_every = max(
+        0,
+        int(getattr(args, "streaming_depth_lock_report_interval", 100)),
+    )
+    if _depth_lock_active or _depth_conflict_active:
+        ensure_depth_lock_buffers(gaussians)
+        print(
+            "[streaming-depth-lock] "
+            f"centers={_depth_lock_active} "
+            f"bootstrap={bool(getattr(args, 'streaming_depth_lock_bootstrap', False))} "
+            f"insertions={bool(getattr(args, 'streaming_depth_lock_insertions', False))} "
+            f"multiview_conflict={_depth_conflict_active} "
+            f"prune_conflicts={bool(getattr(args, 'streaming_depth_lock_prune_conflicts', False))} "
+            f"conflict_views={int(getattr(args, 'streaming_depth_unlock_conflict_views', 2))} "
+            f"conflict_thresh={depth_lock_conflict_threshold(args):.4f}m",
+            flush=True,
+        )
     # Disable report, trajectory eval, and progress video for throughput profiling.
     _benchmark_mode = getattr(args, "streaming_benchmark_mode", False)
 
@@ -2295,6 +2399,8 @@ def streaming_training(
         image = render_pkg["render"]
         
         _sync_streaming_state_lengths(gaussians)
+        if _depth_lock_active or _depth_conflict_active:
+            ensure_depth_lock_buffers(gaussians)
 
         # Support update for provisional Gaussians (Step 8)
         _update_provisional_support(gaussians, viewpoint_cam, render_pkg, args)
@@ -2323,6 +2429,21 @@ def streaming_training(
                 if stale_mask.any():
                     _deferred_stale_mask = stale_mask
                     _deferred_stale_count = int(stale_mask.sum().item())
+
+                conflict_prune = depth_conflict_prune_mask(gaussians, args)
+                if conflict_prune.any():
+                    if _deferred_stale_mask is None:
+                        _deferred_stale_mask = conflict_prune
+                    elif _deferred_stale_mask.shape[0] == conflict_prune.shape[0]:
+                        _deferred_stale_mask = _deferred_stale_mask | conflict_prune
+                    else:
+                        print(
+                            f"[streaming-depth-lock] WARNING: conflict prune mask shape mismatch "
+                            f"({_deferred_stale_mask.shape[0]} vs {conflict_prune.shape[0]}), skipping conflicts",
+                            flush=True,
+                        )
+                    if _deferred_stale_mask is not None:
+                        _deferred_stale_count = int(_deferred_stale_mask.sum().item())
 
         # ---- Loss ---------------------------------------------------------
         gt_image = viewpoint_cam.original_image
@@ -2590,6 +2711,17 @@ def streaming_training(
                                     _p_means.grad = _p_means.grad.to_dense().contiguous()
                                 _p_means.grad[_zero_ins] = 0.0
 
+            _depth_locked_step_mask = None
+            if _depth_lock_active:
+                with torch.no_grad():
+                    _depth_locked_step_mask = depth_locked_mask(gaussians, args)
+                if _depth_locked_step_mask.any():
+                    zero_depth_locked_mean_grads(
+                        gaussians,
+                        args,
+                        mask=_depth_locked_step_mask,
+                    )
+
             if iteration < opt.iterations:
                 if optimizer_type == "selective_adam":
                     gaussians.prepare_selective_adam_step(
@@ -2601,6 +2733,12 @@ def streaming_training(
                 if pipe.gsplat_sparse_grad:
                     gaussians.normalize_rotation_params(
                         mask=_step_mask if sparse_active_set else None
+                    )
+                if _depth_lock_active:
+                    restore_depth_locked_centers(
+                        gaussians,
+                        args,
+                        mask=_depth_locked_step_mask,
                     )
                 if _debug_bootstrap_this_iter:
                     _log_bootstrap_motion(
@@ -2644,6 +2782,8 @@ def streaming_training(
                                     threshold=_debug_bootstrap_threshold,
                                 ),
                             )
+                        if _depth_lock_active:
+                            restore_depth_locked_centers(gaussians, args)
 
         # ---- Utility for energy MCMC --------------------------------------
         if use_energy_mcmc:
@@ -2765,6 +2905,8 @@ def streaming_training(
                         gaussians.params["means"].data[_anchor_mask] = _anchor_pos
                     else:
                         gaussians._xyz.data[_anchor_mask] = _anchor_pos
+            if _depth_lock_active:
+                restore_depth_locked_centers(gaussians, args)
             if _debug_bootstrap_this_iter:
                 _log_bootstrap_motion(
                     tb_writer,
@@ -2801,7 +2943,10 @@ def streaming_training(
                     pad = torch.zeros(current_n - mask_n, dtype=torch.bool, device=_deferred_stale_mask.device)
                     _deferred_stale_mask = torch.cat([_deferred_stale_mask, pad])
                 if _deferred_stale_mask.shape[0] == current_n:
-                    print(f"[streaming] iter={iteration} pruning {_deferred_stale_count} stale provisional points.", flush=True)
+                    print(
+                        f"[streaming] iter={iteration} pruning {_deferred_stale_count} deferred depth/lifecycle points.",
+                        flush=True,
+                    )
                     gaussians.prune_points(_deferred_stale_mask)
                     streaming_scene.maintain_occupancy_hash(getattr(args, "streaming_insert_voxel_size", 0.02))
                 else:
@@ -2894,6 +3039,25 @@ def streaming_training(
                     tb_writer.add_scalar("streaming/lifecycle/n_young", int((lc == 1).sum()), iteration)
                     tb_writer.add_scalar("streaming/lifecycle/n_mature", int((lc == 2).sum()), iteration)
                     tb_writer.add_scalar("streaming/lifecycle/n_frozen", int((lc == 3).sum()), iteration)
+
+            if (
+                (_depth_lock_active or _depth_conflict_active)
+                and _depth_lock_report_every > 0
+                and iteration % _depth_lock_report_every == 0
+            ):
+                _depth_stats = depth_lock_geometry_stats(gaussians, args)
+                if tb_writer is not None:
+                    for _key, _value in _depth_stats.items():
+                        tb_writer.add_scalar(f"streaming/depth_lock/{_key}", _value, iteration)
+                print(
+                    "[streaming-depth-lock] "
+                    f"iter={iteration} candidates={_depth_stats.get('candidate_count', 0)} "
+                    f"locked={_depth_stats.get('locked_count', 0)} "
+                    f"conflicts={_depth_stats.get('conflict_count_nonzero', 0)} "
+                    f"radius_p99={_depth_stats.get('radius_p99_m', 0.0):.3f}m "
+                    f"drift_gt_5cm={_depth_stats.get('candidate_drift_gt_5cm', 0)}",
+                    flush=True,
+                )
 
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -3051,9 +3215,16 @@ def streaming_training(
     if getattr(args, "streaming_trajectory_eval", True) and not _benchmark_mode:
         try:
             from utils.trajectory_eval import run_trajectory_eval
+            _gt_tum_path = getattr(args, "tum_gt_path", "") or ""
+            if not _gt_tum_path:
+                _candidate_gt = os.path.join(getattr(args, "source_path", ""), "groundtruth.txt")
+                if os.path.exists(_candidate_gt):
+                    _gt_tum_path = _candidate_gt
             run_trajectory_eval(
                 output_dir=os.path.join(args.model_path, "trajectory_eval"),
                 train_cams=list(streaming_scene.getTrainCameras()),
+                gt_tum_path=_gt_tum_path or None,
+                association_max_dt=float(getattr(args, "tum_association_max_dt", 0.03)),
                 method_label=getattr(args, "orbbec_open3d_odom_method", "estimated"),
             )
         except Exception as _te:

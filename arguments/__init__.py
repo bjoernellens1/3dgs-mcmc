@@ -79,6 +79,7 @@ class ModelParams(ParamGroup):
         self.tum_depth_scale = 5000.0
         self.tum_association_max_dt = 0.03
         self.tum_sequence = ""
+        self.tum_gt_path = ""
         self.tum_random_num_pts = 250000
         self.rgbd_eval_hold = 8
         self.rgbd_depth_stride = 4
@@ -127,6 +128,8 @@ class ModelParams(ParamGroup):
         self.orbbec_open3d_odom_downscale = 1
         self.orbbec_open3d_odom_async = True
         self.orbbec_open3d_odom_async_queue_size = 32
+        self.orbbec_open3d_odom_motion_prior = False
+        self.orbbec_open3d_odom_motion_gate = False
         self.orbbec_open3d_odom_max_trans_per_edge = 0.15
         self.orbbec_open3d_odom_max_rot_deg_per_edge = 8.0
         self.orbbec_open3d_odom_method = "hybrid"
@@ -134,6 +137,25 @@ class ModelParams(ParamGroup):
         self.orbbec_open3d_icp_max_distance = 0.07
         self.orbbec_open3d_icp_robust_kernel = "huber"
         self.orbbec_open3d_icp_sigma = 0.05
+        # Generic ROS1 RGB-D bag input. "auto" keeps the legacy RealSense
+        # defaults unless TUM-style topics are present in the bag.
+        self.rosbag_profile = "auto"  # auto | realsense | tum
+        self.rosbag_color_topic = ""
+        self.rosbag_depth_topic = ""
+        self.rosbag_color_info_topic = ""
+        self.rosbag_depth_info_topic = ""
+        self.rosbag_sync_threshold_ms = 33.0
+        self.rosbag_sync_estimate_offset = False
+        self.rosbag_sync_offset_ms = "0"
+        self.rosbag_sync_report_json = ""
+        self.rosbag_rgb_encoding_override = ""
+        self.rosbag_depth_scale = 0.0
+        # Backward-compatible aliases for older RealSense commands.
+        self.realsense_color_topic = "/device_0/sensor_1/Color_0/image/data"
+        self.realsense_depth_topic = "/device_0/sensor_0/Depth_0/image/data"
+        self.realsense_color_info_topic = "/device_0/sensor_1/Color_0/info/camera_info"
+        self.realsense_depth_info_topic = "/device_0/sensor_0/Depth_0/info/camera_info"
+        self.realsense_sync_threshold_ms = 33.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -357,6 +379,23 @@ class StreamingParams(ParamGroup):
         self.streaming_insert_knn_scale = True
         # Two-frame depth consistency threshold (metres; 0 = disabled)
         self.streaming_depth_consistency_thresh = 0.05
+        # Depth-insertion scoring over rendered alpha/depth vs sensor depth.
+        # boolean_or preserves the original gate:
+        # low alpha OR no rendered depth OR sensor closer than rendered depth.
+        self.streaming_insert_score_mode = "boolean_or"  # boolean_or | alpha_only | depth_gap_only | sensor_closer_only | weighted_topk
+        self.streaming_insert_alpha_threshold = 0.3
+        self.streaming_insert_score_alpha_weight = 1.0
+        self.streaming_insert_score_no_depth_weight = 1.0
+        self.streaming_insert_score_sensor_closer_weight = 2.0
+        # Depth-first center locking is experimental and opt-in until validated.
+        self.streaming_depth_lock_centers = False
+        self.streaming_depth_lock_bootstrap = False
+        self.streaming_depth_lock_insertions = False
+        self.streaming_depth_multiview_conflict_enabled = False
+        self.streaming_depth_lock_prune_conflicts = False
+        self.streaming_depth_unlock_conflict_views = 2
+        self.streaming_depth_lock_conflict_thresh = self.streaming_depth_consistency_thresh
+        self.streaming_depth_lock_report_interval = 100
         # Hold-out every Nth arriving frame for test evaluation (0 = disabled).
         # Default 8 ≈ 12.5% test split, evenly spread along the trajectory.
         # Test PSNR + comparison renders are produced post-training whenever

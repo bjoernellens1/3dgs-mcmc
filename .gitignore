@@ -16,6 +16,7 @@ output/
 !output/**/train.log
 !output/**/cfg_args
 !output/**/run_args
+!output/**/sync_report.json
 # Exclude everything else that might match via wildcard re-inclusion
 output/**/*.pth
 output/**/*.ply

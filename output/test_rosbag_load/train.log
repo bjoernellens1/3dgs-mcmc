@@ -1,0 +1,100 @@
+Optimizing output/test_rosbag_load
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2403, in __init__
+    from rosbags.serde import get_typestore, Stores
+ImportError: cannot import name 'get_typestore' from 'rosbags.serde' (/opt/venv/lib/python3.12/site-packages/rosbags/serde/__init__.py)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1759, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2803, in make_frame_source
+    return RealsenseRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2405, in __init__
+    raise ImportError(
+ImportError: rosbags is required for RealsenseRosBagFrameSource. Install it with: uv pip install rosbags
+Optimizing output/test_rosbag_load
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1759, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2803, in make_frame_source
+    return RealsenseRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2438, in __init__
+    msg = typestore.deserialize_cdr(data, conn.msgtype)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/rosbags/typesys/store.py", line 136, in deserialize_cdr
+    message, pos = func(rawdata[4:], 0, msgdef.cls, self)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 30, in deserialize_cdr
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 56: invalid start byte
+Optimizing output/test_rosbag_load
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1759, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2803, in make_frame_source
+    return RealsenseRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2416, in __init__
+    typestore = get_typestore(Stores.ROS1_MELODIC)
+                              ^^^^^^^^^^^^^^^^^^^
+AttributeError: type object 'Stores' has no attribute 'ROS1_MELODIC'
+Optimizing output/test_rosbag_load
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1759, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2803, in make_frame_source
+    return RealsenseRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2416, in __init__
+    typestore = get_typestore(Stores.ROS1_MELODIC)
+                              ^^^^^^^^^^^^^^^^^^^
+AttributeError: type object 'Stores' has no attribute 'ROS1_MELODIC'
+Optimizing output/test_rosbag_load
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1791, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2803, in make_frame_source
+    return RealsenseRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2438, in __init__
+    msg = typestore.deserialize_cdr(data, conn.msgtype)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/rosbags/typesys/store.py", line 136, in deserialize_cdr
+    message, pos = func(rawdata[4:], 0, msgdef.cls, self)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 20, in deserialize_cdr
+  File "<string>", line 26, in deserialize_cdr
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe0 in position 21: invalid continuation byte

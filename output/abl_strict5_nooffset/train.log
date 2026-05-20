@@ -1,0 +1,17 @@
+Optimizing output/abl_strict5_nooffset
+Traceback (most recent call last):
+  File "/workspace/3dgs-mcmc/train.py", line 1497, in <module>
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_degree_schedule, run_args=args)
+  File "/workspace/3dgs-mcmc/train.py", line 364, in training
+    return streaming_training(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/train_streaming.py", line 1759, in streaming_training
+    frame_source = make_frame_source(dataset.source_path, args)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2636, in make_frame_source
+    return RealsenseRosBagFrameSource(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/3dgs-mcmc/utils/streaming_frames.py", line 2356, in __init__
+    msg = reader.deserialize(data, conn.msgtype)
+          ^^^^^^^^^^^^^^^^^^
+AttributeError: 'Reader' object has no attribute 'deserialize'
