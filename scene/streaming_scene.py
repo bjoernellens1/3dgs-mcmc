@@ -57,6 +57,9 @@ class StreamingScene:
         self._global_reservoir: List = []
         self._n_train_frames_ingested: int = 0  # count of train frames (excl. holdout)
 
+        # Bootstrap frame count — set by initialize_from_frames; used by keyframe window logic
+        self._bootstrap_count: int = 0
+
         # Stratified sampling support (Component D)
         # Hard-frame heap: list of (loss, camera) — capped at streaming_hard_frame_history
         self._hard_frames: List = []
@@ -186,10 +189,12 @@ class StreamingScene:
 
         for frame in initial_frames:
             cam = self._frame_to_camera(frame)
+            cam._is_bootstrap = True
             self.train_cameras.append(cam)
             self._replay_buffer.append(cam)
             prepare_camera_for_render(cam, device="cuda")
 
+        self._bootstrap_count = n_frames
         self._source_idx = n_frames
         self.current_camera = self.train_cameras[-1]
 
@@ -584,10 +589,17 @@ class StreamingScene:
                 cam._streaming_admission_render_pkg = admission_render_pkg
             self._keyframes_admitted += 1
             self.train_cameras.append(cam)
-            replay_size = getattr(self.args, "streaming_replay_buffer", 32)
+            replay_size = getattr(self.args, "streaming_replay_buffer", 512)
             self._replay_buffer.append(cam)
             if len(self._replay_buffer) > replay_size:
-                self._replay_buffer.pop(0)
+                # Protect bootstrap frames: evict the oldest non-bootstrap frame first.
+                # Only fall back to evicting bootstrap frames when the buffer contains
+                # nothing but bootstrap frames.
+                evict_idx = next(
+                    (i for i, c in enumerate(self._replay_buffer) if not getattr(c, "_is_bootstrap", False)),
+                    0,
+                )
+                self._replay_buffer.pop(evict_idx)
 
             # H10: update global reservoir (every Nth train frame kept permanently)
             self._n_train_frames_ingested += 1
@@ -613,13 +625,28 @@ class StreamingScene:
         When streaming_keyframe_coverage > 0, the window grows to keep at least
         that fraction of all ingested train frames in the active window.  The
         fixed streaming_keyframe_window acts as a minimum floor.
+
+        While the number of streamed frames is still less than the bootstrap
+        span, the entire bootstrap is kept inside the local window so seed
+        Gaussians receive recent-stratum gradient pressure.
         """
         k_floor = getattr(self.args, "streaming_keyframe_window", 8)
         coverage = float(getattr(self.args, "streaming_keyframe_coverage", 0.0))
-        if coverage > 0 and self.train_cameras:
-            k_adaptive = int(coverage * len(self.train_cameras))
-            return max(k_floor, k_adaptive)
-        return k_floor
+        n_boot = self._bootstrap_count
+        n_total = len(self.train_cameras)
+
+        if coverage > 0 and n_total:
+            k_adaptive = int(coverage * n_total)
+        else:
+            k_adaptive = 0
+
+        bootstrap_in_window = getattr(self.args, "streaming_bootstrap_in_window", True)
+        if bootstrap_in_window and n_boot > 0:
+            n_streamed = max(0, n_total - n_boot)
+            if n_streamed < n_boot:
+                return max(k_floor, k_adaptive, n_boot)
+
+        return max(k_floor, k_adaptive)
 
     def get_local_cameras(self) -> List:
         k = self._effective_keyframe_window()
@@ -639,18 +666,34 @@ class StreamingScene:
             return self._sample_stratified()
         return self._sample_legacy()
 
+    @staticmethod
+    def _weighted_choice(cameras, keyframe_weight: float):
+        """Random choice from cameras, over-sampling bootstrap/keyframe entries."""
+        if keyframe_weight <= 1.0 or not cameras:
+            return random.choice(cameras)
+        weights = [keyframe_weight if getattr(c, "_is_bootstrap", False) else 1.0 for c in cameras]
+        total = sum(weights)
+        r = random.random() * total
+        cumulative = 0.0
+        for cam, w in zip(cameras, weights):
+            cumulative += w
+            if r < cumulative:
+                return cam
+        return cameras[-1]
+
     def _sample_legacy(self):
         """Original ring-buffer + reservoir sampling."""
+        kw = float(getattr(self.args, "streaming_keyframe_sampling_weight", 2.0))
         replay_ratio = getattr(self.args, "streaming_global_replay_ratio", 0.1)
         r = random.random()
         if replay_ratio > 0 and r < replay_ratio:
             reservoir_stride = getattr(self.args, "streaming_global_reservoir_stride", 0)
             if reservoir_stride > 0 and self._global_reservoir:
-                return random.choice(self._global_reservoir)
+                return self._weighted_choice(self._global_reservoir, kw)
             if self._replay_buffer:
-                return random.choice(self._replay_buffer)
+                return self._weighted_choice(self._replay_buffer, kw)
         local = self.get_local_cameras()
-        return random.choice(local) if local else self.current_camera
+        return self._weighted_choice(local, kw) if local else self.current_camera
 
     def _sample_stratified(self):
         """Four-strata sampling: recent / covisible / global-reservoir / hard-frames."""
@@ -663,29 +706,30 @@ class StreamingScene:
             ratios = [0.70, 0.15, 0.10, 0.05]
         r_recent, r_covis, r_reservoir, r_hard = ratios
 
+        kw = float(getattr(self.args, "streaming_keyframe_sampling_weight", 2.0))
         r = random.random()
         local = self.get_local_cameras()
 
         if r < r_recent:
-            return random.choice(local) if local else self.current_camera
+            return self._weighted_choice(local, kw) if local else self.current_camera
 
         if r < r_recent + r_covis:
             if self._covisible_cache:
-                return random.choice(self._covisible_cache)
-            return random.choice(local) if local else self.current_camera
+                return self._weighted_choice(self._covisible_cache, kw)
+            return self._weighted_choice(local, kw) if local else self.current_camera
 
         if r < r_recent + r_covis + r_reservoir:
             reservoir_stride = getattr(self.args, "streaming_global_reservoir_stride", 0)
             if reservoir_stride > 0 and self._global_reservoir:
-                return random.choice(self._global_reservoir)
+                return self._weighted_choice(self._global_reservoir, kw)
             if self._replay_buffer:
-                return random.choice(self._replay_buffer)
-            return random.choice(local) if local else self.current_camera
+                return self._weighted_choice(self._replay_buffer, kw)
+            return self._weighted_choice(local, kw) if local else self.current_camera
 
         # Hard frames stratum
         if self._hard_frames:
             return random.choice(self._hard_frames)[1]
-        return random.choice(local) if local else self.current_camera
+        return self._weighted_choice(local, kw) if local else self.current_camera
 
     def update_stratified_state(self, cam, loss_val: float, gaussian_ids=None):
         """Update hard-frame list and covisibility cache. Call once per training step."""

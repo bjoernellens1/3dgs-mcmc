@@ -150,6 +150,9 @@ class ModelParams(ParamGroup):
         self.rosbag_sync_report_json = ""
         self.rosbag_rgb_encoding_override = ""
         self.rosbag_depth_scale = 0.0
+        self.rosbag_alignment_debug_dir = ""
+        self.rosbag_alignment_debug_frames = 3
+        self.rosbag_realsense_depth_filters = True
         # Backward-compatible aliases for older RealSense commands.
         self.realsense_color_topic = "/device_0/sensor_1/Color_0/image/data"
         self.realsense_depth_topic = "/device_0/sensor_0/Depth_0/image/data"
@@ -338,7 +341,9 @@ class StreamingParams(ParamGroup):
         self.streaming_initial_frames = 5         # frames used for bootstrap point cloud + init
         self.streaming_keyframe_window = 120       # minimum keyframe window (floor)
         self.streaming_keyframe_coverage = 0.6    # adaptive: keep >= this fraction of ingested frames in window (0 = disabled)
-        self.streaming_replay_buffer = 32         # size of older-frame replay ring buffer
+        self.streaming_replay_buffer = 512        # size of older-frame replay ring buffer
+        self.streaming_keyframe_sampling_weight = 2.0  # bootstrap/keyframe frames over-sampled by this factor
+        self.streaming_bootstrap_in_window = True  # keep bootstrap frames in local window until streaming catches up
         self.streaming_global_replay_ratio = 0.3  # fraction of steps drawn from replay buffer
         # Depth-based incremental Gaussian insertion (Phase 2)
         self.streaming_insert_from_depth = True

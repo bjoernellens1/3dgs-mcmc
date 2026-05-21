@@ -2283,153 +2283,158 @@ def streaming_training(
         _iter_wall_start = _now
 
         # ---- Frame ingestion -----------------------------------------------
-        if streaming_scene.has_next_frame() and scheduler.should_release(iteration, dt=_iter_dt):
+        # Drain loop: ingest every frame whose pose is ready and whose release
+        # time has been reached. dt is passed only on the first call to avoid
+        # double-advancing the simulated clock within the same training iteration.
+        _drain_dt = _iter_dt
+        while streaming_scene.has_next_frame() and scheduler.should_release(iteration, dt=_drain_dt):
+            _drain_dt = 0.0  # subsequent calls in the same iter consume no virtual time
             admission_fn = None
             if getattr(args, "streaming_frame_admission", "all") == "hybrid_keyframe":
                 admission_fn = _hybrid_keyframe_admission
             result = streaming_scene.ingest_next_frame(admission_fn=admission_fn)
-            if result is not None:
-                new_cam, new_frame, is_train = result
-                scheduler.mark_released()
-                n_frames_ingested += 1
-                if is_train:
-                    _n_frames_trained += 1
-                _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
-                # Log per-frame odometry diagnostics when available
-                _odom_stats = getattr(new_frame, "_odom_stats", None)
-                if _odom_stats is not None:
-                    from streaming.odometry.async_worker import log_odom_stats, OdometryStats
-                    if not isinstance(_odom_stats, OdometryStats):
-                        # Convert raw dict emitted by OrbbecRosBag into OdometryStats
-                        _odom_stats = OdometryStats(
-                            translation_m=float(_odom_stats.get("translation_m", 0.0)),
-                            rotation_deg=float(_odom_stats.get("rotation_deg", 0.0)),
-                            fitness=_odom_stats.get("fitness"),
-                            inlier_rmse=_odom_stats.get("inlier_rmse"),
-                            info_trace=_odom_stats.get("info_trace"),
-                            method=str(_odom_stats.get("method", "")),
-                            valid=bool(_odom_stats.get("valid", True)),
-                        )
-                    log_odom_stats(tb_writer, _odom_stats, iteration)
-                _admission_stats = getattr(new_frame, "_streaming_admission_stats", None)
-                if _admission_stats and _admission_stats.get("mode") == "hybrid_keyframe":
-                    _admit_cnt["total"] += 1
-                    _reason = _admission_stats.get("reason", "")
-                    if _admission_stats.get("admitted"):
-                        if _admission_stats.get("forced"):
-                            _admit_cnt["forced"] += 1
-                        elif _admission_stats.get("moved"):
-                            _admit_cnt["moved"] += 1
-                        else:
-                            _admit_cnt["novel"] += 1
+            if result is None:
+                break  # source exhausted
+            new_cam, new_frame, is_train = result
+            n_frames_ingested += 1
+            if is_train:
+                _n_frames_trained += 1
+            _iter_since_new_frame = 0  # H7: reset freeze counter on new frame
+            # Log per-frame odometry diagnostics when available
+            _odom_stats = getattr(new_frame, "_odom_stats", None)
+            if _odom_stats is not None:
+                from streaming.odometry.async_worker import log_odom_stats, OdometryStats
+                if not isinstance(_odom_stats, OdometryStats):
+                    # Convert raw dict emitted by OrbbecRosBag into OdometryStats
+                    _odom_stats = OdometryStats(
+                        translation_m=float(_odom_stats.get("translation_m", 0.0)),
+                        rotation_deg=float(_odom_stats.get("rotation_deg", 0.0)),
+                        fitness=_odom_stats.get("fitness"),
+                        inlier_rmse=_odom_stats.get("inlier_rmse"),
+                        info_trace=_odom_stats.get("info_trace"),
+                        method=str(_odom_stats.get("method", "")),
+                        valid=bool(_odom_stats.get("valid", True)),
+                    )
+                log_odom_stats(tb_writer, _odom_stats, iteration)
+            _admission_stats = getattr(new_frame, "_streaming_admission_stats", None)
+            if _admission_stats and _admission_stats.get("mode") == "hybrid_keyframe":
+                _admit_cnt["total"] += 1
+                _reason = _admission_stats.get("reason", "")
+                if _admission_stats.get("admitted"):
+                    if _admission_stats.get("forced"):
+                        _admit_cnt["forced"] += 1
+                    elif _admission_stats.get("moved"):
+                        _admit_cnt["moved"] += 1
                     else:
-                        if _reason == "low_overlap":
-                            _admit_cnt["rejected_overlap"] += 1
-                        else:
-                            _admit_cnt["rejected_motion"] += 1
-                if tb_writer and _admission_stats:
-                    tb_writer.add_scalar(
-                        "streaming/keyframes_admitted",
-                        int(getattr(streaming_scene, "_keyframes_admitted", 0)),
-                        iteration,
+                        _admit_cnt["novel"] += 1
+                else:
+                    if _reason == "low_overlap":
+                        _admit_cnt["rejected_overlap"] += 1
+                    else:
+                        _admit_cnt["rejected_motion"] += 1
+            if tb_writer and _admission_stats:
+                tb_writer.add_scalar(
+                    "streaming/keyframes_admitted",
+                    int(getattr(streaming_scene, "_keyframes_admitted", 0)),
+                    iteration,
+                )
+                tb_writer.add_scalar(
+                    "streaming/keyframes_rejected",
+                    int(getattr(streaming_scene, "_keyframes_rejected", 0)),
+                    iteration,
+                )
+                for _k in ("overlap", "pose_delta_m", "pose_delta_deg", "gap", "admitted"):
+                    if _k in _admission_stats:
+                        tb_writer.add_scalar(f"streaming/keyframe/{_k}", float(_admission_stats[_k]), iteration)
+            if new_cam is None:
+                if iteration % 100 == 0 or (
+                    _admission_stats and _admission_stats.get("reason") == "max_gap"
+                ):
+                    print(
+                        f"[streaming] iter={iteration} frame={n_frames_ingested} "
+                        f"pose-only skip reason={_admission_stats.get('reason') if _admission_stats else 'unknown'}",
+                        flush=True,
                     )
-                    tb_writer.add_scalar(
-                        "streaming/keyframes_rejected",
-                        int(getattr(streaming_scene, "_keyframes_rejected", 0)),
-                        iteration,
-                    )
-                    for _k in ("overlap", "pose_delta_m", "pose_delta_deg", "gap", "admitted"):
-                        if _k in _admission_stats:
-                            tb_writer.add_scalar(f"streaming/keyframe/{_k}", float(_admission_stats[_k]), iteration)
-                if new_cam is None:
-                    if iteration % 100 == 0 or (
-                        _admission_stats and _admission_stats.get("reason") == "max_gap"
-                    ):
-                        print(
-                            f"[streaming] iter={iteration} frame={n_frames_ingested} "
-                            f"pose-only skip reason={_admission_stats.get('reason') if _admission_stats else 'unknown'}",
-                            flush=True,
-                        )
-                    is_train = False
+                is_train = False
 
-                # Phase 2: insert new Gaussians from depth
-                if is_train and getattr(args, "streaming_insert_from_depth", True):
-                    cap = getattr(args, "cap_max", -1)
-                    current_n = gaussians.get_xyz.shape[0]
-                    depth_respects_cap = getattr(args, "streaming_depth_respects_cap", False)
-                    if (not depth_respects_cap) or cap <= 0 or current_n < cap:
-                        # Step 4: render new_cam to get alpha/depth mask
-                        with torch.no_grad():
-                            pkg_new = getattr(new_cam, "_streaming_admission_render_pkg", None)
-                            if pkg_new is None:
-                                pkg_new = render(new_cam, gaussians, pipe, background, render_depth=True)
-                            alpha_new = pkg_new["alpha"]
-                            depth_new = pkg_new.get("rendered_depth", None)
+            # Phase 2: insert new Gaussians from depth
+            if is_train and getattr(args, "streaming_insert_from_depth", True):
+                cap = getattr(args, "cap_max", -1)
+                current_n = gaussians.get_xyz.shape[0]
+                depth_respects_cap = getattr(args, "streaming_depth_respects_cap", False)
+                if (not depth_respects_cap) or cap <= 0 or current_n < cap:
+                    # Step 4: render new_cam to get alpha/depth mask
+                    with torch.no_grad():
+                        pkg_new = getattr(new_cam, "_streaming_admission_render_pkg", None)
+                        if pkg_new is None:
+                            pkg_new = render(new_cam, gaussians, pipe, background, render_depth=True)
+                        alpha_new = pkg_new["alpha"]
+                        depth_new = pkg_new.get("rendered_depth", None)
 
-                        # Depth comparison export
-                        if getattr(args, "streaming_export_depth_comparison", False) and depth_new is not None:
-                            _sensor_d = _get_sensor_depth(new_cam, new_cam.image_height, new_cam.image_width)
-                            if _sensor_d is not None:
-                                _dc_dir = os.path.join(args.model_path, "depth_comparison")
-                                _save_depth_comparison(
-                                    _dc_dir,
-                                    n_frames_ingested,
-                                    pkg_new["render"],
-                                    depth_new,
-                                    _sensor_d,
-                                )
-
-                        _use_batch = _batch_frames > 1
-                        cands_or_n, _insert_stats = insert_gaussians_from_frame(
-                            gaussians, new_frame, args,
-                            streaming_scene=streaming_scene,
-                            prev_frame=_prev_insert_frame,
-                            prev_depth_meters=_prev_insert_depth_m,
-                            render_alpha=alpha_new,
-                            render_depth=depth_new,
-                            current_frame_idx=n_frames_ingested,
-                            _collect_only=_use_batch,
-                        )
-                        if _use_batch:
-                            # Accumulate; flush when batch is full
-                            if isinstance(cands_or_n, dict) and cands_or_n.get("pts") is not None and cands_or_n["pts"].shape[0] > 0:
-                                _insertion_batch.append(cands_or_n)
-                            _insertion_batch_frames += 1
-                            _pending_pts = sum(c["pts"].shape[0] for c in _insertion_batch)
-                            _early_by_points = _batch_max_pts > 0 and _pending_pts >= _batch_max_pts
-                            if _insertion_batch_frames >= _batch_frames or _early_by_points:
-                                added = _flush_insertion_batch(
-                                    _insertion_batch, gaussians, streaming_scene, iteration, args)
-                                _insertion_batch = []
-                                _insertion_batch_frames = 0
-                            else:
-                                added = 0
-                        else:
-                            added = cands_or_n
-                            # H9: record insertion iteration for anchor-loss decay (non-batch path)
-                            if added > 0 and hasattr(gaussians, "anchor_iter"):
-                                gaussians.anchor_iter[-added:] = iteration
-                        total_inserted += added
-                        if added > 0 and (iteration % 100 == 0 or added > 1000):
-                            print(
-                                f"[streaming] iter={iteration} frame={n_frames_ingested} "
-                                f"inserted={added} total_inserted={total_inserted} N={gaussians.get_xyz.shape[0]}",
-                                flush=True,
+                    # Depth comparison export
+                    if getattr(args, "streaming_export_depth_comparison", False) and depth_new is not None:
+                        _sensor_d = _get_sensor_depth(new_cam, new_cam.image_height, new_cam.image_width)
+                        if _sensor_d is not None:
+                            _dc_dir = os.path.join(args.model_path, "depth_comparison")
+                            _save_depth_comparison(
+                                _dc_dir,
+                                n_frames_ingested,
+                                pkg_new["render"],
+                                depth_new,
+                                _sensor_d,
                             )
-                        # Log per-filter insertion telemetry
-                        if tb_writer and _insert_stats:
-                            for _k, _v in _insert_stats.items():
-                                tb_writer.add_scalar(f"streaming/insertion/{_k}", _v, iteration)
-                    elif iteration % 500 == 0:
+
+                    _use_batch = _batch_frames > 1
+                    cands_or_n, _insert_stats = insert_gaussians_from_frame(
+                        gaussians, new_frame, args,
+                        streaming_scene=streaming_scene,
+                        prev_frame=_prev_insert_frame,
+                        prev_depth_meters=_prev_insert_depth_m,
+                        render_alpha=alpha_new,
+                        render_depth=depth_new,
+                        current_frame_idx=n_frames_ingested,
+                        _collect_only=_use_batch,
+                    )
+                    if _use_batch:
+                        # Accumulate; flush when batch is full
+                        if isinstance(cands_or_n, dict) and cands_or_n.get("pts") is not None and cands_or_n["pts"].shape[0] > 0:
+                            _insertion_batch.append(cands_or_n)
+                        _insertion_batch_frames += 1
+                        _pending_pts = sum(c["pts"].shape[0] for c in _insertion_batch)
+                        _early_by_points = _batch_max_pts > 0 and _pending_pts >= _batch_max_pts
+                        if _insertion_batch_frames >= _batch_frames or _early_by_points:
+                            added = _flush_insertion_batch(
+                                _insertion_batch, gaussians, streaming_scene, iteration, args)
+                            _insertion_batch = []
+                            _insertion_batch_frames = 0
+                        else:
+                            added = 0
+                    else:
+                        added = cands_or_n
+                        # H9: record insertion iteration for anchor-loss decay (non-batch path)
+                        if added > 0 and hasattr(gaussians, "anchor_iter"):
+                            gaussians.anchor_iter[-added:] = iteration
+                    total_inserted += added
+                    if added > 0 and (iteration % 100 == 0 or added > 1000):
                         print(
                             f"[streaming] iter={iteration} frame={n_frames_ingested} "
-                            f"skipped depth insertion because N={current_n} >= cap_max={cap} "
-                            "and streaming_depth_respects_cap=True",
+                            f"inserted={added} total_inserted={total_inserted} N={gaussians.get_xyz.shape[0]}",
                             flush=True,
                         )
-                    # Cache this frame as the previous frame for next insertion
-                    _prev_insert_frame = new_frame
-                    _prev_insert_depth_m = _load_depth_meters(new_frame)
+                    # Log per-filter insertion telemetry
+                    if tb_writer and _insert_stats:
+                        for _k, _v in _insert_stats.items():
+                            tb_writer.add_scalar(f"streaming/insertion/{_k}", _v, iteration)
+                elif iteration % 500 == 0:
+                    print(
+                        f"[streaming] iter={iteration} frame={n_frames_ingested} "
+                        f"skipped depth insertion because N={current_n} >= cap_max={cap} "
+                        "and streaming_depth_respects_cap=True",
+                        flush=True,
+                    )
+                # Cache this frame as the previous frame for next insertion
+                _prev_insert_frame = new_frame
+                _prev_insert_depth_m = _load_depth_meters(new_frame)
 
         # ---- Learning rate update -----------------------------------------
         xyz_lr = gaussians.update_learning_rate(iteration)

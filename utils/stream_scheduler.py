@@ -67,7 +67,10 @@ class FrameScheduler:
                        dataset_fps mode to advance the simulated clock).
         """
         if self._mode == "iter_based":
-            return iteration == 1 or (iteration % self.steps_per_frame) == 0
+            # How many frames should have been released by this iteration?
+            # iter=1 always releases the first frame; after that, one per steps_per_frame.
+            expected = 1 + max(0, iteration // self.steps_per_frame)
+            return self._next_frame_idx < expected
 
         if self._mode == "dataset_fps":
             if dt is not None:
