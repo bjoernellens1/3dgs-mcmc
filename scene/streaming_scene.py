@@ -418,20 +418,16 @@ class StreamingScene:
             print("[streaming] Bootstrap: depth disabled, using random init.", flush=True)
             return BasicPointCloud(points=pts, colors=cols, normals=np.zeros_like(pts))
 
-        loaded = []
-        for frame in frames:
+        def _load_one(frame):
             if frame.depth_path is None and frame._depth_bytes is None:
-                loaded.append(None)
-                continue
+                return None
             if frame.depth_path is not None and not os.path.exists(frame.depth_path) and frame._depth_bytes is None:
-                loaded.append(None)
-                continue
+                return None
             try:
                 from utils.streaming_frames import load_frame_rgb, load_frame_depth_np
                 depth_raw = load_frame_depth_np(frame)
                 if depth_raw is None:
-                    loaded.append(None)
-                    continue
+                    return None
                 depth = np.asarray(depth_raw)
                 _depth_native_h, _depth_native_w = depth.shape[:2]
                 _target = (int(frame.height), int(frame.width))
@@ -442,10 +438,25 @@ class StreamingScene:
                 if rgb_pil.size != (_target[1], _target[0]):
                     rgb_pil = rgb_pil.resize((_target[1], _target[0]), _Image.BILINEAR)
                 rgb = np.array(rgb_pil).astype(np.float32) / 255.0
-                loaded.append((frame, depth, rgb, depth_to_meters(depth, frame.depth_scale)))
+                return (frame, depth, rgb, depth_to_meters(depth, frame.depth_scale))
             except Exception:
-                loaded.append(None)
-                continue
+                return None
+
+        import os as _os
+        import time as _time
+        n_workers = min(len(frames), max(1, _os.cpu_count() or 1))
+        _t0 = _time.perf_counter()
+        if n_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                loaded = list(ex.map(_load_one, frames))
+        else:
+            loaded = [_load_one(f) for f in frames]
+        print(
+            f"[streaming] PCD load: {sum(x is not None for x in loaded)}/{len(frames)} frames "
+            f"in {_time.perf_counter() - _t0:.2f}s ({n_workers} workers)",
+            flush=True,
+        )
 
         points_all, colors_all = [], []
         seed_temporal = bool(getattr(self.args, "streaming_depth_temporal_require_for_seed", True))

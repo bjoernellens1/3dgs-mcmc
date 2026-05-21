@@ -68,6 +68,71 @@ except ImportError:
     _TB = False
 
 
+class PhaseTimer:
+    """Records wall-clock durations for named phases and writes a JSON summary."""
+
+    def __init__(self, model_path: str, tb_writer=None):
+        self._model_path = model_path
+        self._tb = tb_writer
+        self._phases: dict[str, float] = {}
+        self._t0: float | None = None
+        self._current: str | None = None
+        self._iter_times: list[float] = []
+        self._insert_times: list[float] = []
+        self._process_start = time.perf_counter()
+
+    def start(self, phase: str) -> None:
+        self._end_current()
+        self._current = phase
+        self._t0 = time.perf_counter()
+        print(f"[timing] {phase} started", flush=True)
+
+    def _end_current(self) -> float:
+        if self._current is None or self._t0 is None:
+            return 0.0
+        elapsed = time.perf_counter() - self._t0
+        self._phases[self._current] = self._phases.get(self._current, 0.0) + elapsed
+        print(f"[timing] {self._current} done: {elapsed:.2f}s", flush=True)
+        if self._tb:
+            self._tb.add_scalar(f"timing/{self._current}_s", elapsed, 0)
+        self._current = None
+        self._t0 = None
+        return elapsed
+
+    def end(self, phase: str | None = None) -> float:
+        if phase and self._current != phase:
+            return 0.0
+        return self._end_current()
+
+    def record_iter(self, dt: float) -> None:
+        self._iter_times.append(dt)
+
+    def record_insert(self, dt: float) -> None:
+        self._insert_times.append(dt)
+
+    def write_summary(self) -> None:
+        self._end_current()
+        total = time.perf_counter() - self._process_start
+        summary = {
+            "total_s": round(total, 2),
+            "phases": {k: round(v, 3) for k, v in self._phases.items()},
+        }
+        if self._iter_times:
+            its = self._iter_times
+            summary["iter_ms_mean"] = round(1000 * sum(its) / len(its), 1)
+            summary["iter_ms_p95"] = round(1000 * sorted(its)[int(len(its) * 0.95)], 1)
+        if self._insert_times:
+            ins = self._insert_times
+            summary["insert_ms_mean"] = round(1000 * sum(ins) / len(ins), 1)
+        out = os.path.join(self._model_path, "timing_summary.json")
+        with open(out, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[timing] summary written to {out}", flush=True)
+        if self._tb:
+            for k, v in summary["phases"].items():
+                self._tb.add_scalar(f"timing/{k}_s", v, 1)
+
+
 _STREAMING_PARAM_DEFAULTS = {
     "streaming_min_depth": 0.1,
     "streaming_max_depth": 8.0,
@@ -1854,10 +1919,16 @@ def streaming_training(
 
     streaming_scene = StreamingScene(args, gaussians, frame_source)
 
+    phase_timer = PhaseTimer(args.model_path, tb_writer)
+    phase_timer.start("bootstrap")
+
     # Initialise Gaussians from first K frames BEFORE training_setup() so
     # the optimizer is built on the correct initial parameter tensors.
     n_init = max(1, getattr(args, "streaming_initial_frames", 5))
     streaming_scene.initialize_from_frames(n_init)
+    phase_timer.end("bootstrap")
+
+    phase_timer.start("training_setup")
     gaussians.training_setup(opt)
 
     # Ensure SLAM lifecycle attributes exist for bootstrap Gaussians (birth_frame=0).
@@ -2201,6 +2272,9 @@ def streaming_training(
         "mcmc", "hybrid", "gsplat_energy_mcmc"
     }
 
+    phase_timer.end("training_setup")
+    phase_timer.start("training")
+
     _n_total_frames = streaming_scene._frame_count
     _spf = scheduler.steps_per_frame
     _min_iters_all = (getattr(args, "streaming_initial_frames", 5) * _spf) + _n_total_frames * _spf
@@ -2281,6 +2355,8 @@ def streaming_training(
         _now = time.perf_counter()
         _iter_dt = _now - _iter_wall_start
         _iter_wall_start = _now
+        if iteration > 1:  # skip first iter which includes drain-loop startup
+            phase_timer.record_iter(_iter_dt)
 
         # ---- Frame ingestion -----------------------------------------------
         # Drain loop: ingest every frame whose pose is ready and whose release
@@ -2296,6 +2372,7 @@ def streaming_training(
             if result is None:
                 break  # source exhausted
             new_cam, new_frame, is_train = result
+            scheduler.mark_released()
             n_frames_ingested += 1
             if is_train:
                 _n_frames_trained += 1
@@ -2384,6 +2461,7 @@ def streaming_training(
                                 _sensor_d,
                             )
 
+                    _t_insert_start = time.perf_counter()
                     _use_batch = _batch_frames > 1
                     cands_or_n, _insert_stats = insert_gaussians_from_frame(
                         gaussians, new_frame, args,
@@ -2415,6 +2493,7 @@ def streaming_training(
                         if added > 0 and hasattr(gaussians, "anchor_iter"):
                             gaussians.anchor_iter[-added:] = iteration
                     total_inserted += added
+                    phase_timer.record_insert(time.perf_counter() - _t_insert_start)
                     if added > 0 and (iteration % 100 == 0 or added > 1000):
                         print(
                             f"[streaming] iter={iteration} frame={n_frames_ingested} "
@@ -3360,6 +3439,7 @@ def streaming_training(
 
     _signal.signal(_signal.SIGINT, _orig_sigint)
     save_worker.shutdown()
+    phase_timer.write_summary()
     print("\n[streaming] Training complete.", flush=True)
 
 
