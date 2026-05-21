@@ -14,7 +14,7 @@ import io
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from utils.rosbag_sync import (
     StampedMsg,
@@ -182,6 +182,160 @@ def _slerp(q0, q1, t):
     return (
         np.sin(theta_0 - theta) * q0 + np.sin(theta) * q1
     ) / np.sin(theta_0)
+
+
+def _depth_to_vis_rgb(depth_meters):
+    import numpy as np
+
+    z = np.asarray(depth_meters, dtype=np.float32)
+    valid = np.isfinite(z) & (z > 0)
+    out = np.zeros((*z.shape[:2], 3), dtype=np.uint8)
+    if not valid.any():
+        return out
+    vals = z[valid]
+    lo = float(np.percentile(vals, 2))
+    hi = float(np.percentile(vals, 98))
+    if hi <= lo:
+        hi = lo + 1e-3
+    n = np.clip((z - lo) / (hi - lo), 0.0, 1.0)
+    out[..., 0] = np.where(valid, np.clip(255.0 * n, 0, 255), 0).astype(np.uint8)
+    out[..., 1] = np.where(valid, np.clip(255.0 * (1.0 - np.abs(n - 0.5) * 2.0), 0, 255), 0).astype(np.uint8)
+    out[..., 2] = np.where(valid, np.clip(255.0 * (1.0 - n), 0, 255), 0).astype(np.uint8)
+    return out
+
+
+def _depth_edge_mask(depth_meters):
+    import numpy as np
+
+    z = np.asarray(depth_meters, dtype=np.float32)
+    valid = np.isfinite(z) & (z > 0)
+    if not valid.any():
+        return np.zeros(z.shape[:2], dtype=bool)
+    dzx = np.zeros_like(z, dtype=np.float32)
+    dzy = np.zeros_like(z, dtype=np.float32)
+    pair_x = valid[:, 1:] & valid[:, :-1]
+    pair_y = valid[1:, :] & valid[:-1, :]
+    dzx[:, 1:][pair_x] = np.abs(z[:, 1:][pair_x] - z[:, :-1][pair_x])
+    dzy[1:, :][pair_y] = np.abs(z[1:, :][pair_y] - z[:-1, :][pair_y])
+    vals = z[valid]
+    thresh = max(0.025, float(np.percentile(vals, 95) - np.percentile(vals, 5)) * 0.015)
+    boundary = np.zeros_like(valid, dtype=bool)
+    boundary[:, 1:] |= valid[:, 1:] & ~valid[:, :-1]
+    boundary[:, :-1] |= valid[:, :-1] & ~valid[:, 1:]
+    boundary[1:, :] |= valid[1:, :] & ~valid[:-1, :]
+    boundary[:-1, :] |= valid[:-1, :] & ~valid[1:, :]
+    return (valid & ((dzx > thresh) | (dzy > thresh))) | boundary
+
+
+def _resize_mask_nearest(mask, size_wh):
+    from PIL import Image as _Img
+    import numpy as np
+
+    im = _Img.fromarray(np.asarray(mask, dtype=np.uint8) * 255, mode="L")
+    im = im.resize(size_wh, _Img.Resampling.NEAREST)
+    return np.asarray(im) > 0
+
+
+def _overlay_depth_edges(rgb, depth_meters, edge_color=(255, 32, 32), resize_depth: bool = False):
+    import numpy as np
+
+    out = np.asarray(rgb, dtype=np.uint8).copy()
+    mask = _depth_edge_mask(depth_meters)
+    if resize_depth and mask.shape[:2] != out.shape[:2]:
+        mask = _resize_mask_nearest(mask, (out.shape[1], out.shape[0]))
+    elif mask.shape[:2] != out.shape[:2]:
+        return out
+    out[mask] = np.asarray(edge_color, dtype=np.uint8)
+    return out
+
+
+def _add_label_bar(image, label: str):
+    from PIL import Image as _Img, ImageDraw
+
+    im = _Img.fromarray(image)
+    bar_h = 24
+    out = _Img.new("RGB", (im.width, im.height + bar_h), (20, 20, 20))
+    out.paste(im, (0, bar_h))
+    draw = ImageDraw.Draw(out)
+    draw.text((8, 5), label, fill=(235, 235, 235))
+    return out
+
+
+def _write_depth_color_alignment_debug(
+    debug_dir: str,
+    frame_index: int,
+    rgb,
+    raw_depth_m,
+    saved_depth_m,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    import json
+    import numpy as np
+    from PIL import Image as _Img
+
+    root = Path(debug_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    stem = f"frame_{frame_index:06d}"
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    raw_vis = _depth_to_vis_rgb(raw_depth_m)
+    saved_vis = _depth_to_vis_rgb(saved_depth_m)
+    if raw_vis.shape[:2] != rgb.shape[:2]:
+        raw_vis_contact = np.asarray(_Img.fromarray(raw_vis).resize((rgb.shape[1], rgb.shape[0]), _Img.Resampling.NEAREST))
+    else:
+        raw_vis_contact = raw_vis
+    if saved_vis.shape[:2] != rgb.shape[:2]:
+        saved_vis_contact = np.asarray(_Img.fromarray(saved_vis).resize((rgb.shape[1], rgb.shape[0]), _Img.Resampling.NEAREST))
+    else:
+        saved_vis_contact = saved_vis
+
+    rgb_path = root / f"{stem}_color.png"
+    raw_path = root / f"{stem}_raw_depth_vis.png"
+    aligned_path = root / f"{stem}_aligned_depth_vis.png"
+    raw_overlay_path = root / f"{stem}_raw_depth_edges_on_color.png"
+    aligned_overlay_path = root / f"{stem}_aligned_depth_edges_on_color.png"
+    contact_path = root / f"{stem}_depth_color_contact.png"
+
+    raw_overlay = _overlay_depth_edges(rgb, raw_depth_m, edge_color=(255, 160, 0), resize_depth=True)
+    aligned_overlay = _overlay_depth_edges(rgb, saved_depth_m, edge_color=(255, 32, 32), resize_depth=True)
+    _Img.fromarray(rgb, mode="RGB").save(rgb_path)
+    _Img.fromarray(raw_vis, mode="RGB").save(raw_path)
+    _Img.fromarray(saved_vis, mode="RGB").save(aligned_path)
+    _Img.fromarray(raw_overlay, mode="RGB").save(raw_overlay_path)
+    _Img.fromarray(aligned_overlay, mode="RGB").save(aligned_overlay_path)
+
+    panels = [
+        _add_label_bar(rgb, "color"),
+        _add_label_bar(raw_vis_contact, "raw depth (resized for view)"),
+        _add_label_bar(raw_overlay, "raw depth edges on color"),
+        _add_label_bar(aligned_overlay, "aligned depth edges on color"),
+    ]
+    contact = _Img.new("RGB", (rgb.shape[1] * 2, panels[0].height * 2), (0, 0, 0))
+    contact.paste(panels[0], (0, 0))
+    contact.paste(panels[1], (rgb.shape[1], 0))
+    contact.paste(panels[2], (0, panels[0].height))
+    contact.paste(panels[3], (rgb.shape[1], panels[0].height))
+    contact.save(contact_path)
+
+    record = dict(metadata)
+    record.update({
+        "frame_index": int(frame_index),
+        "raw_depth_shape": [int(raw_depth_m.shape[0]), int(raw_depth_m.shape[1])],
+        "saved_depth_shape": [int(saved_depth_m.shape[0]), int(saved_depth_m.shape[1])],
+        "raw_depth_valid": int((np.asarray(raw_depth_m) > 0).sum()),
+        "saved_depth_valid": int((np.asarray(saved_depth_m) > 0).sum()),
+        "files": {
+            "color": str(rgb_path),
+            "raw_depth_vis": str(raw_path),
+            "aligned_depth_vis": str(aligned_path),
+            "raw_depth_edges_on_color": str(raw_overlay_path),
+            "aligned_depth_edges_on_color": str(aligned_overlay_path),
+            "contact_sheet": str(contact_path),
+        },
+    })
+    meta_path = root / f"{stem}_metadata.json"
+    meta_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    record["metadata_file"] = str(meta_path)
+    return record
 
 class RGBDSequenceFrameSource:
     """
@@ -1479,6 +1633,7 @@ class OrbbecRosBagFrameSource:
         depth_info_topic: str = "",
         sync_offset_ns: int = 0,
         profile: str = "",
+        depth_alignment: dict[str, Any] | None = None,
     ) -> str:
         import hashlib
         import json
@@ -1528,6 +1683,8 @@ class OrbbecRosBagFrameSource:
             "last_ts": timestamps[-1] if timestamps else None,
             "timestamps_digest": timestamps_digest,
         }
+        if depth_alignment is not None:
+            payload["depth_alignment"] = depth_alignment
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         return digest[:24]
 
@@ -1536,7 +1693,9 @@ class OrbbecRosBagFrameSource:
         if cache_dir:
             root = Path(cache_dir).expanduser()
         else:
-            root = Path(bag_path) / ".open3d_odometry_cache"
+            # bag_path may be a file or a directory; store cache beside the bag
+            p = Path(bag_path)
+            root = (p if p.is_dir() else p.parent) / ".open3d_odometry_cache"
         return root / f"{cache_key}.npz"
 
     @staticmethod
@@ -1693,25 +1852,58 @@ class OrbbecRosBagFrameSource:
         )
         jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
 
-        def to_rgbd(rgb_bytes, depth_bytes):
-            from PIL import Image
+        # Prefer Tensor API (multi-threaded CPU, 2-4× faster than legacy single-threaded API)
+        _use_tensor = hasattr(o3d, "t") and hasattr(o3d.t.pipelines, "odometry") and \
+            hasattr(o3d.t.pipelines.odometry, "rgbd_odometry_multi_scale") and odom_method != "icp"
+        _t_intrinsic = None
+        _t_criteria = None
+        if _use_tensor:
+            _t_intrinsic = o3d.core.Tensor(np.array([
+                [odom_fx, 0, odom_cx], [0, odom_fy, odom_cy], [0, 0, 1],
+            ], dtype=np.float64))
+            _t_criteria = [
+                o3d.t.pipelines.odometry.OdometryCriteria(20, 1e-6, 1e-6),
+                o3d.t.pipelines.odometry.OdometryCriteria(10, 1e-5, 1e-5),
+                o3d.t.pipelines.odometry.OdometryCriteria(5, 1e-4, 1e-4),
+            ]
 
+        def _decode_raw_np(rgb_bytes, depth_bytes):
+            from PIL import Image
             color_img = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
             depth_img = Image.open(io.BytesIO(depth_bytes))
             if color_img.size != (odom_width, odom_height):
                 color_img = color_img.resize((odom_width, odom_height), Image.Resampling.BILINEAR)
             if depth_img.size != (odom_width, odom_height):
                 depth_img = depth_img.resize((odom_width, odom_height), Image.Resampling.NEAREST)
-            color_np = np.asarray(color_img)
-            depth_np = np.asarray(depth_img)
-            color = o3d.geometry.Image(np.ascontiguousarray(color_np))
-            depth = o3d.geometry.Image(np.ascontiguousarray(depth_np))
+            return np.ascontiguousarray(np.asarray(color_img)), np.ascontiguousarray(np.asarray(depth_img))
+
+        def to_rgbd(rgb_bytes, depth_bytes):
+            color_np, depth_np = _decode_raw_np(rgb_bytes, depth_bytes)
+            if _use_tensor:
+                c = o3d.t.geometry.Image(color_np)
+                d = o3d.t.geometry.Image(depth_np.astype(np.uint16))
+                return o3d.t.geometry.RGBDImage(c, d)
+            color = o3d.geometry.Image(color_np)
+            depth = o3d.geometry.Image(depth_np)
             return o3d.geometry.RGBDImage.create_from_color_and_depth(
-                color,
-                depth,
-                depth_scale=float(depth_scale),
-                depth_trunc=odom_depth_max,
-                convert_rgb_to_intensity=True,
+                color, depth, depth_scale=float(depth_scale),
+                depth_trunc=odom_depth_max, convert_rgb_to_intensity=True,
+            )
+
+        def _run_hybrid_odom(prev_rgbd, curr_rgbd, init_guess):
+            if _use_tensor:
+                result = o3d.t.pipelines.odometry.rgbd_odometry_multi_scale(
+                    prev_rgbd, curr_rgbd, _t_intrinsic,
+                    o3d.core.Tensor(init_guess.astype(np.float64)),
+                    depth_scale=float(depth_scale), depth_max=odom_depth_max,
+                    criteria_list=_t_criteria,
+                    method=o3d.t.pipelines.odometry.Method.Hybrid,
+                )
+                return (result.is_converged,
+                        result.transformation.numpy().astype(np.float64),
+                        {"fitness": float(result.fitness), "inlier_rmse": float(result.inlier_rmse)})
+            return o3d.pipelines.odometry.compute_rgbd_odometry(
+                prev_rgbd, curr_rgbd, intrinsic, init_guess, jacobian, option,
             )
 
         def rot_to_quat(R):
@@ -1742,13 +1934,8 @@ class OrbbecRosBagFrameSource:
                     sigma=icp_sigma,
                 )
             else:
-                success, trans_prev_to_curr, odom_info = o3d.pipelines.odometry.compute_rgbd_odometry(
-                    prev_rgbd,
-                    curr_rgbd,
-                    intrinsic,
-                    np.eye(4, dtype=np.float64),
-                    jacobian,
-                    option,
+                success, trans_prev_to_curr, odom_info = _run_hybrid_odom(
+                    prev_rgbd, curr_rgbd, np.eye(4, dtype=np.float64),
                 )
             delta = np.linalg.inv(trans_prev_to_curr)
             edge_t = float(np.linalg.norm(delta[:3, 3]))
@@ -1833,7 +2020,7 @@ class OrbbecRosBagFrameSource:
         }
         return poses, stats
 
-    def _live_odom_to_rgbd(self, frame: StreamingRGBDFrame):
+    def _live_odom_to_rgbd(self, frame: StreamingRGBDFrame, tensor_api: bool = False):
         try:
             import sys as _sys
             if not hasattr(_sys.stdout, "isatty"):
@@ -1856,14 +2043,17 @@ class OrbbecRosBagFrameSource:
             color_img = color_img.resize((odom_width, odom_height), Image.Resampling.BILINEAR)
         if depth_img.size != (odom_width, odom_height):
             depth_img = depth_img.resize((odom_width, odom_height), Image.Resampling.NEAREST)
-        color = o3d.geometry.Image(np.ascontiguousarray(np.asarray(color_img)))
-        depth = o3d.geometry.Image(np.ascontiguousarray(np.asarray(depth_img)))
+        color_np = np.ascontiguousarray(np.asarray(color_img))
+        depth_np = np.ascontiguousarray(np.asarray(depth_img))
+        if tensor_api:
+            c = o3d.t.geometry.Image(color_np)
+            d = o3d.t.geometry.Image(depth_np.astype(np.uint16))
+            return o3d.t.geometry.RGBDImage(c, d)
+        color = o3d.geometry.Image(color_np)
+        depth = o3d.geometry.Image(depth_np)
         return o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color,
-            depth,
-            depth_scale=float(self._depth_scale),
-            depth_trunc=self._odom_depth_max,
-            convert_rgb_to_intensity=True,
+            color, depth, depth_scale=float(self._depth_scale),
+            depth_trunc=self._odom_depth_max, convert_rgb_to_intensity=True,
         )
 
     def _save_live_odom_cache(self) -> None:
@@ -2053,10 +2243,17 @@ class OrbbecRosBagFrameSource:
 
         if not self._frames:
             return
+
+        _use_tensor = (
+            hasattr(o3d, "t") and hasattr(o3d.t.pipelines, "odometry")
+            and hasattr(o3d.t.pipelines.odometry, "rgbd_odometry_multi_scale")
+            and self._live_odom_method != "icp"
+        )
+
         if self._live_odom_computed_idx < 0:
             self._frames[0].c2w = np.eye(4, dtype=np.float32)
             self._live_odom_prev_key_idx = 0
-            self._live_odom_prev_key_rgbd = self._live_odom_to_rgbd(self._frames[0])
+            self._live_odom_prev_key_rgbd = self._live_odom_to_rgbd(self._frames[0], tensor_api=_use_tensor)
             self._live_odom_computed_idx = 0
 
         odom_width = max(1, int(self._width) // self._live_odom_downscale)
@@ -2075,6 +2272,35 @@ class OrbbecRosBagFrameSource:
             depth_diff_max=self._odom_depth_diff_max,
         )
         jacobian = o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
+        _t_intrinsic = None
+        _t_criteria = None
+        if _use_tensor:
+            _t_intrinsic = o3d.core.Tensor(np.array([
+                [float(self._fx) / self._live_odom_downscale, 0, float(self._cx) / self._live_odom_downscale],
+                [0, float(self._fy) / self._live_odom_downscale, float(self._cy) / self._live_odom_downscale],
+                [0, 0, 1],
+            ], dtype=np.float64))
+            _t_criteria = [
+                o3d.t.pipelines.odometry.OdometryCriteria(20, 1e-6, 1e-6),
+                o3d.t.pipelines.odometry.OdometryCriteria(10, 1e-5, 1e-5),
+                o3d.t.pipelines.odometry.OdometryCriteria(5, 1e-4, 1e-4),
+            ]
+
+        def _live_run_hybrid(prev_rgbd, curr_rgbd, init_guess):
+            if _use_tensor:
+                result = o3d.t.pipelines.odometry.rgbd_odometry_multi_scale(
+                    prev_rgbd, curr_rgbd, _t_intrinsic,
+                    o3d.core.Tensor(init_guess.astype(np.float64)),
+                    depth_scale=float(self._depth_scale), depth_max=self._odom_depth_max,
+                    criteria_list=_t_criteria,
+                    method=o3d.t.pipelines.odometry.Method.Hybrid,
+                )
+                return (result.is_converged,
+                        result.transformation.numpy().astype(np.float64),
+                        {"fitness": float(result.fitness), "inlier_rmse": float(result.inlier_rmse)})
+            return o3d.pipelines.odometry.compute_rgbd_odometry(
+                prev_rgbd, curr_rgbd, intrinsic, init_guess, jacobian, option,
+            )
 
         target = index
         if target > self._live_odom_stride and target % self._live_odom_stride != 0:
@@ -2090,7 +2316,7 @@ class OrbbecRosBagFrameSource:
             if not should_estimate:
                 continue
 
-            curr_rgbd = self._live_odom_to_rgbd(self._frames[idx])
+            curr_rgbd = self._live_odom_to_rgbd(self._frames[idx], tensor_api=_use_tensor)
             init_guess = self._live_odom_initial_guess(idx)
 
             if self._live_odom_method == "icp":
@@ -2104,13 +2330,8 @@ class OrbbecRosBagFrameSource:
                     init_guess=init_guess,
                 )
             else:
-                success, trans_prev_to_curr, odom_info = o3d.pipelines.odometry.compute_rgbd_odometry(
-                    self._live_odom_prev_key_rgbd,
-                    curr_rgbd,
-                    intrinsic,
-                    init_guess,
-                    jacobian,
-                    option,
+                success, trans_prev_to_curr, odom_info = _live_run_hybrid(
+                    self._live_odom_prev_key_rgbd, curr_rgbd, init_guess,
                 )
             self._live_odom_pairs += 1
             key_pose = self._frames[self._live_odom_prev_key_idx].c2w
@@ -2345,19 +2566,15 @@ def _parse_ms_offset(value, default: float = 0.0) -> float:
 
 
 class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
-    """Frames from a ROS1 RGB-D bag with Open3D live odometry.
+    """Frames from a RealSense .bag file via pyrealsense2 SDK with Open3D live odometry.
 
-    Reads a ROS1 ``.bag`` file using ``rosbags.rosbag1.Reader``.
+    Uses librealsense2's native playback + ``rs.align()`` for hardware-accelerated
+    depth-to-color alignment.
     Only ``open3d_odometry_live`` is supported as pose source (no camera_pose
     topic in RealSense Viewer or TUM public bags).
 
-    Topic conventions (RealSense Viewer default export)::
-        /device_0/sensor_0/Depth_0/image/data       — raw uint16 depth (mm)
-        /device_0/sensor_0/Depth_0/info/camera_info
-        /device_0/sensor_1/Color_0/image/data       — raw BGR8 color
-        /device_0/sensor_1/Color_0/info/camera_info
-
-    TUM public RGB-D bags use ``--rosbag_profile tum`` or auto-detection.
+    Parameters marked "rosbags-based" in the constructor are ignored — the SDK
+    auto-discovers streams and handles synchronization natively.
     """
 
     def __init__(
@@ -2394,201 +2611,232 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         sync_offset_ms: str | float = "0",
         sync_report_json: str = "",
         rgb_encoding_override: str = "",
+        alignment_debug_dir: str = "",
+        alignment_debug_frames: int = 0,
         source_label: str = "RealsenseBag",
         profile: str = "realsense",
+        realsense_depth_filters: bool = True,
     ):
-        # Intentionally bypass OrbbecRosBagFrameSource.__init__ — we read a
-        # different bag format and set up the same instance state directly.
+        # Intentionally bypass OrbbecRosBagFrameSource.__init__ — we use
+        # pyrealsense2 native playback instead of rosbags-based reading.
         try:
-            from rosbags.rosbag1 import Reader
-            from rosbags.typesys import Stores, get_typestore
+            import pyrealsense2 as rs
         except ImportError:
             raise ImportError(
-                "rosbags is required for RealsenseRosBagFrameSource. "
-                "Install it with: uv pip install rosbags"
+                "pyrealsense2 is required for RealsenseRosBagFrameSource. "
+                "Install it with: uv pip install pyrealsense2"
             )
         import io as _io
         import numpy as np
         from PIL import Image as _Img
-        from utils.rgbd_frames import decode_color_image, decode_depth_image, depth_to_uint16_png
-        from utils.rosbag_rgbd_source import _image_msg_to_array
 
-        # RealSense Viewer bags are ROS1 bags with standard ROS1 serialization, but the
-        # Viewer appends a 4-byte metadata block after each Image message payload.
-        # deserialize_ros1 parses the message correctly but raises AssertionError because
-        # pos != len(rawdata) (4 trailing bytes remain). Retry with data[:-4] in that case.
-        # CameraInfo messages are unaffected (no trailing bytes).
-        typestore = get_typestore(Stores.ROS1_NOETIC)
+        # ── Start pyrealsense2 playback ────────────────────────────────────────
+        pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_device_from_file(str(path), repeat_playback=False)
+        cfg.enable_all_streams()
+        profile = pipeline.start(cfg)
 
-        def _deser(data: bytes, msgtype: str):
-            try:
-                return typestore.deserialize_ros1(data, msgtype)
-            except AssertionError:
-                return typestore.deserialize_ros1(data[:-4], msgtype)
+        playback = profile.get_device().as_playback()
+        playback.set_real_time(False)
 
-        sync_ns = int(sync_threshold_ms * 1e6)
+        # ── Stream profiles ────────────────────────────────────────────────────
+        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        depth_stream = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        _ci = color_stream.get_intrinsics()
+        _di = depth_stream.get_intrinsics()
+        # pyrealsense2 may provide RGB8 or BGR8; check at init time
+        _need_bgr_to_rgb = (color_stream.format() == rs.format.bgr8)
 
-        color_msgs: list[StampedMsg] = []
-        depth_msgs: list[StampedMsg] = []
-        color_intrinsics: Optional[tuple] = None  # (fx,fy,cx,cy,W,H)
-        depth_intrinsics: Optional[tuple] = None
+        fx, fy, cx, cy = _ci.fx, _ci.fy, _ci.ppx, _ci.ppy
+        width, height = _ci.width, _ci.height
+        depth_fx, depth_fy, depth_cx, depth_cy = _di.fx, _di.fy, _di.ppx, _di.ppy
+        depth_width, depth_height = _di.width, _di.height
 
-        def _msg_stamp_ns(msg, fallback_ns: int) -> int:
-            header = getattr(msg, "header", None)
-            stamp = getattr(header, "stamp", None)
-            if stamp is not None:
-                sec = int(getattr(stamp, "secs", getattr(stamp, "sec", 0)))
-                nsec = int(getattr(stamp, "nsecs", getattr(stamp, "nanosec", 0)))
-                if sec or nsec:
-                    return sec * 1_000_000_000 + nsec
-            return int(fallback_ns)
+        # ── Extrinsics: depth sensor → color sensor ────────────────────────────
+        _ext = depth_stream.get_extrinsics_to(color_stream)
+        T_color_from_depth = np.eye(4, dtype=np.float32)
+        T_color_from_depth[:3, :3] = np.array(_ext.rotation, dtype=np.float32).reshape(3, 3)
+        T_color_from_depth[:3, 3] = np.array(_ext.translation, dtype=np.float32)
 
-        with Reader(path) as reader:
-            conns = [c for c in reader.connections
-                     if c.topic in {color_topic, depth_topic, color_info_topic, depth_info_topic}]
-            for conn, ts, data in reader.messages(connections=conns):
-                topic = conn.topic
-                msg = _deser(data, conn.msgtype)
-                msg_ts = _msg_stamp_ns(msg, ts)
-                frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))
+        self._T_color_from_depth = T_color_from_depth
+        self._extrinsic_source = "pyrealsense2"
+        self._depth_alignment_enabled = True
 
-                if topic == color_topic:
-                    arr, enc = _image_msg_to_array(msg)
-                    color_msgs.append(StampedMsg(
-                        topic=topic,
-                        header_ns=msg_ts,
-                        bag_ns=int(ts),
-                        payload=arr,
-                        frame_id=frame_id,
-                        encoding=str(enc),
-                    ))
-                elif topic == depth_topic:
-                    arr, enc = _image_msg_to_array(msg)
-                    depth_msgs.append(StampedMsg(
-                        topic=topic,
-                        header_ns=msg_ts,
-                        bag_ns=int(ts),
-                        payload=arr,
-                        frame_id=frame_id,
-                        encoding=str(enc),
-                    ))
-                elif topic == color_info_topic and color_intrinsics is None:
-                    K = getattr(msg, "k", getattr(msg, "K"))
-                    color_intrinsics = (
-                        float(K[0]), float(K[4]), float(K[2]), float(K[5]),
-                        int(msg.width), int(msg.height),
-                    )
-                elif topic == depth_info_topic and depth_intrinsics is None:
-                    K = getattr(msg, "k", getattr(msg, "K"))
-                    depth_intrinsics = (
-                        float(K[0]), float(K[4]), float(K[2]), float(K[5]),
-                        int(msg.width), int(msg.height),
-                    )
+        align = rs.align(rs.stream.color)
 
-        if color_intrinsics is None:
-            raise RuntimeError(f"No '{color_info_topic}' messages found in {path}")
-        fx, fy, cx, cy, width, height = color_intrinsics
+        # ── Optional depth post-processing filters (D400 stereo cameras) ──────
+        _use_filters = bool(realsense_depth_filters)
+        if _use_filters:
+            # Recommended filter chain: disparity → spatial → temporal → depth → hole-fill
+            _d2d = rs.disparity_transform(True)
+            _spatial = rs.spatial_filter()
+            _spatial.set_option(rs.option.filter_smooth_alpha, 0.55)
+            _spatial.set_option(rs.option.filter_smooth_delta, 20)
+            _temporal = rs.temporal_filter()
+            _temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
+            _temporal.set_option(rs.option.filter_smooth_delta, 20)
+            _temporal.set_option(rs.option.holes_fill, 3)
+            _d2d_inv = rs.disparity_transform(False)
+            _hole_fill = rs.hole_filling_filter()
+            _hole_fill.set_option(rs.option.holes_fill, 1)
 
-        color_for_sync = color_msgs[::max(1, int(frame_stride))]
-        estimated_offset_ns = estimate_stream_offset_ns(
-            [m.header_ns for m in color_for_sync],
-            [m.header_ns for m in depth_msgs],
-        )
-        offset_ns = estimated_offset_ns if sync_estimate_offset else int(round(_parse_ms_offset(sync_offset_ms) * 1e6))
-        pairs, pair_stats = sync_color_depth_unique(
-            color_for_sync,
-            depth_msgs,
-            max_dt_ns=sync_ns,
-            offset_ns=offset_ns,
-        )
-        if max_frames > 0:
-            pairs = pairs[:max_frames]
-        synced = [(color_for_sync[ci], depth_msgs[di], dt) for ci, di, dt in pairs]
-
-        rgb_depth_stats = dict(pair_stats.rgb_depth_dt_ns)
-        raw_dts = rgb_depth_stats.pop("_raw", None)
-        sync_stats = SyncStats(
-            accepted=len(synced),
-            rejected_no_depth=pair_stats.rejected_no_depth,
-            reused_depth=0,
-            rgb_depth_dt_ns=rgb_depth_stats,
-            estimated_offset_ns=int(estimated_offset_ns),
-            compensated_dt_ns=(
-                None if not offset_ns or not raw_dts
-                else {
-                    "count": len(raw_dts),
-                    "median_ns": float(np.median(np.asarray(raw_dts, dtype=np.int64) - offset_ns)),
-                    "abs_p95_ns": float(np.percentile(np.abs(np.asarray(raw_dts, dtype=np.int64) - offset_ns), 95)),
-                }
-            ),
-            p95_violation=not check_p95_within_threshold(pair_stats, sync_ns),
-        )
-        report_path = sync_report_json
-        if not report_path:
-            report_path = str(Path(path).parent / "ros1_rgbd_sync_report.json")
-        write_sync_report(report_path, sync_stats, extras={
-            "source": source_label,
-            "profile": profile,
-            "bag": str(path),
-            "color_topic": color_topic,
-            "depth_topic": depth_topic,
-            "color_info_topic": color_info_topic,
-            "depth_info_topic": depth_info_topic,
-            "sync_threshold_ms": float(sync_threshold_ms),
-            "estimated_offset_ms": float(estimated_offset_ns) / 1e6,
-            "applied_offset_ms": float(offset_ns) / 1e6,
-            "frame_stride": int(frame_stride),
-            "max_frames": int(max_frames),
-            "color_count": len(color_msgs),
-            "depth_count": len(depth_msgs),
-        })
-
-        def _encode_rgb_png(msg: StampedMsg) -> bytes:
-            rgb = decode_color_image(msg.payload, msg.encoding, encoding_override=rgb_encoding_override)
+        # ── Local PNG helpers ──────────────────────────────────────────────────
+        def _encode_rgb_png(rgb: np.ndarray) -> bytes:
             buf = _io.BytesIO()
             _Img.fromarray(rgb, mode="RGB").save(buf, format="PNG")
             return buf.getvalue()
 
-        def _encode_depth_png(msg: StampedMsg) -> bytes:
-            depth = decode_depth_image(msg.payload, msg.encoding)
-            depth_u16 = depth_to_uint16_png(depth, depth_scale)
+        def _encode_depth_png(depth_u16: np.ndarray) -> bytes:
             buf = _io.BytesIO()
             _Img.fromarray(depth_u16, mode="I;16").save(buf, format="PNG")
             return buf.getvalue()
 
+        # ── Read all frames ────────────────────────────────────────────────────
+        _frame_stride = max(1, int(frame_stride))
+        _max_frames = max(0, int(max_frames))
+        need_debug = bool(alignment_debug_dir) and int(alignment_debug_frames) > 0
+        debug_frames = max(0, int(alignment_debug_frames))
+
         self._frames: List[StreamingRGBDFrame] = []
-        for color_msg, depth_msg, raw_dt_ns in synced:
-            rgb_png = _encode_rgb_png(color_msg)
-            depth_png = _encode_depth_png(depth_msg)
-            depth_kwargs = {}
-            if depth_intrinsics is not None:
-                dfx, dfy, dcx, dcy, dw, dh = depth_intrinsics
+        debug_records: list[dict[str, Any]] = []
+        total_count = 0
+
+        try:
+            while True:
+                frames = pipeline.wait_for_frames(timeout_ms=5000)
+                total_count += 1
+
+                # Apply frame_stride — only process every Nth frameset
+                if (total_count - 1) % _frame_stride != 0:
+                    continue
+
+                # Capture unaligned depth for debug before alignment
+                orig_depth_frame = frames.get_depth_frame()
+                if not orig_depth_frame:
+                    continue
+                orig_depth_m = np.asanyarray(
+                    orig_depth_frame.get_data()
+                ).astype(np.float32) * 0.001  # mm → m
+
+                # Align depth to color
+                aligned_frames = align.process(frames)
+                color_frame = aligned_frames.get_color_frame()
+                aligned_depth_frame = aligned_frames.get_depth_frame()
+
+                if not color_frame or not aligned_depth_frame:
+                    continue
+
+                # Numpy arrays (color may be RGB8 or BGR8; check _need_bgr_to_rgb)
+                color_img = np.asanyarray(color_frame.get_data())
+
+                # Apply depth post-processing filters if enabled
+                if _use_filters:
+                    filtered = _d2d.process(aligned_depth_frame)
+                    filtered = _spatial.process(filtered)
+                    filtered = _temporal.process(filtered)
+                    filtered = _d2d_inv.process(filtered)
+                    filtered = _hole_fill.process(filtered)
+                    depth_for_np = filtered
+                else:
+                    depth_for_np = aligned_depth_frame
+                depth_u16 = np.asanyarray(depth_for_np.get_data())  # uint16
+
+                # Convert BGR→RGB if needed, otherwise data is already RGB
+                rgb = color_img[..., ::-1] if _need_bgr_to_rgb else color_img
+
+                # Timestamps (ms → ns)
+                color_ts_ns = int(color_frame.get_timestamp() * 1e6)
+                depth_ts_ns = int(aligned_depth_frame.get_timestamp() * 1e6)
+
+                # Encode to PNG
+                rgb_png = _encode_rgb_png(rgb)
+                depth_png = _encode_depth_png(depth_u16)
+
+                # Aligned depth in meters for debug
+                aligned_depth_m = depth_u16.astype(np.float32) * 0.001
+
+                # Depth aligned to color → use color intrinsics
                 depth_kwargs = {
-                    "depth_fx": dfx,
-                    "depth_fy": dfy,
-                    "depth_cx": dcx,
-                    "depth_cy": dcy,
-                    "depth_width": dw,
-                    "depth_height": dh,
+                    "depth_fx": fx,
+                    "depth_fy": fy,
+                    "depth_cx": cx,
+                    "depth_cy": cy,
+                    "depth_width": int(width),
+                    "depth_height": int(height),
                 }
-            self._frames.append(StreamingRGBDFrame(
-                index=len(self._frames),
-                timestamp=float(color_msg.header_ns) * 1e-9,
-                rgb_path="",
-                depth_path=None,
-                c2w=None,
-                fx=fx, fy=fy, cx=cx, cy=cy,
-                width=width, height=height,
-                depth_scale=float(depth_scale),
-                _rgb_bytes=rgb_png,
-                _depth_bytes=depth_png,
-                color_ts_ns=color_msg.header_ns,
-                depth_ts_ns=depth_msg.header_ns,
-                rgb_depth_dt_ns=int(raw_dt_ns),
-                color_bag_ns=color_msg.bag_ns,
-                depth_bag_ns=depth_msg.bag_ns,
-                **depth_kwargs,
-            ))
+
+                # Debug record
+                if need_debug and len(debug_records) < debug_frames:
+                    debug_records.append(_write_depth_color_alignment_debug(
+                        alignment_debug_dir,
+                        len(self._frames),
+                        rgb,
+                        orig_depth_m,
+                        aligned_depth_m,
+                        {
+                            "bag": str(path),
+                            "profile": str(profile),
+                            "depth_alignment_enabled": True,
+                            "depth_topic_aligned": False,
+                            "extrinsic_source": "pyrealsense2",
+                            "depth_tf_topic": "",
+                            "color_tf_topic": "",
+                            "T_color_from_depth": T_color_from_depth.astype(float).tolist(),
+                            "color_intrinsics": {
+                                "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                                "width": width, "height": height,
+                            },
+                            "depth_intrinsics": {
+                                "fx": depth_fx, "fy": depth_fy, "cx": depth_cx, "cy": depth_cy,
+                                "width": depth_width, "height": depth_height,
+                            },
+                            "color_ts_ns": color_ts_ns,
+                            "depth_ts_ns": depth_ts_ns,
+                            "rgb_depth_dt_ns": int(depth_ts_ns - color_ts_ns),
+                        },
+                    ))
+
+                self._frames.append(StreamingRGBDFrame(
+                    index=len(self._frames),
+                    timestamp=float(color_ts_ns) * 1e-9,
+                    rgb_path="",
+                    depth_path=None,
+                    c2w=None,
+                    fx=fx, fy=fy, cx=cx, cy=cy,
+                    width=width, height=height,
+                    depth_scale=1000.0,
+                    _rgb_bytes=rgb_png,
+                    _depth_bytes=depth_png,
+                    color_ts_ns=color_ts_ns,
+                    depth_ts_ns=depth_ts_ns,
+                    rgb_depth_dt_ns=int(depth_ts_ns - color_ts_ns),
+                    color_bag_ns=color_ts_ns,
+                    depth_bag_ns=depth_ts_ns,
+                    **depth_kwargs,
+                ))
+
+                if _max_frames > 0 and len(self._frames) >= _max_frames:
+                    break
+
+        except RuntimeError:
+            pass  # end of playback
+
+        pipeline.stop()
+
+        if need_debug and debug_records:
+            import json
+            manifest = {
+                "bag": str(path),
+                "profile": str(profile),
+                "depth_alignment_enabled": True,
+                "depth_topic_aligned": False,
+                "extrinsic_source": "pyrealsense2",
+                "T_color_from_depth": T_color_from_depth.astype(float).tolist(),
+                "frames": debug_records,
+            }
+            manifest_path = Path(alignment_debug_dir) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         self._fx = fx
         self._fy = fy
@@ -2596,21 +2844,26 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         self._cy = cy
         self._width = width
         self._height = height
-        self._depth_scale = float(depth_scale)
+        self._depth_scale = 1000.0
 
+        # ── Resolution downscaling ──────────────────────────────────────────────
         _R = int(streaming_resolution)
         if _R > 1:
             self._width  = self._width  // _R
             self._height = self._height // _R
-            self._fx /= _R;  self._fy /= _R
-            self._cx /= _R;  self._cy /= _R
+            self._fx /= _R
+            self._fy /= _R
+            self._cx /= _R
+            self._cy /= _R
             for _fr in self._frames:
                 _fr.width  = _fr.width  // _R
                 _fr.height = _fr.height // _R
-                _fr.fx = _fr.fx / _R;  _fr.fy = _fr.fy / _R
-                _fr.cx = _fr.cx / _R;  _fr.cy = _fr.cy / _R
+                _fr.fx = _fr.fx / _R
+                _fr.fy = _fr.fy / _R
+                _fr.cx = _fr.cx / _R
+                _fr.cy = _fr.cy / _R
 
-        # Live odometry state (mirrors OrbbecRosBagFrameSource)
+        # ── Live odometry state (mirrors OrbbecRosBagFrameSource) ──────────────
         self._pose_source = "open3d_odometry_live"
         self._live_odom_enabled = True
         self._live_odom_stride = max(1, int(open3d_odom_stride))
@@ -2654,15 +2907,15 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
 
         live_cache_key = self._open3d_odom_cache_key(
             path=path,
-            color_topic=color_topic,
-            depth_topic=depth_topic,
-            camera_info_topic=color_info_topic,
-            sync_threshold_ms=sync_threshold_ms,
+            color_topic="pyrealsense2",
+            depth_topic="pyrealsense2",
+            camera_info_topic="pyrealsense2",
+            sync_threshold_ms=0.0,
             frame_stride=frame_stride,
             max_frames=max_frames,
             fx=fx, fy=fy, cx=cx, cy=cy,
             width=width, height=height,
-            synced=[(color_msg.header_ns,) for color_msg, *_ in synced],
+            synced=[(fr.color_ts_ns,) for fr in self._frames],
             odom_stride=open3d_odom_stride,
             odom_downscale=open3d_odom_downscale,
             odom_method=open3d_odom_method,
@@ -2672,13 +2925,21 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
             motion_prior=open3d_odom_motion_prior,
             motion_gate=open3d_odom_motion_gate,
             mode="live",
-            depth_scale=depth_scale,
-            depth_info_topic=depth_info_topic,
-            sync_offset_ns=offset_ns,
+            depth_scale=1000.0,
+            depth_info_topic="pyrealsense2",
+            sync_offset_ns=0,
             profile=profile,
+            depth_alignment={
+                "enabled": True,
+                "topic_aligned": False,
+                "extrinsic_source": "pyrealsense2",
+                "T_color_from_depth": [
+                    round(float(v), 8) for v in T_color_from_depth.reshape(-1)
+                ],
+            },
         )
         live_cache_path = self._open3d_odom_cache_path(
-            bag_path=str(Path(path).parent),  # .bag is a file; put cache beside it
+            bag_path=str(Path(path).parent),
             cache_dir=open3d_odom_cache_dir,
             cache_key=live_cache_key,
         )
@@ -2699,12 +2960,17 @@ class RealsenseRosBagFrameSource(OrbbecRosBagFrameSource):
         if self._live_odom_enabled and not self._live_odom_cached_full and self._frames and self._live_odom_async_enabled:
             self._start_live_odom_worker()
 
+        _t = T_color_from_depth[:3, 3]
+        debug_msg = f", alignment_debug={alignment_debug_dir}" if debug_records else ""
+        filters_msg = f", depth_filters=enabled" if _use_filters else ", depth_filters=off"
         print(
-            f"[streaming] {source_label}: {len(self._frames)} synced frames from {path} "
-            f"(color={len(color_msgs)}, depth={len(depth_msgs)}, sync={format_stats_oneline(sync_stats)}, "
-            f"pose_source=open3d_odometry_live, "
+            f"[streaming] {source_label}: {len(self._frames)} frames from {path} "
+            f"(pyrealsense2 playback, pose_source=open3d_odometry_live, "
             f"motion_prior={self._live_odom_motion_prior}, "
-            f"motion_gate={self._live_odom_motion_gate}, sync_report={report_path})"
+            f"motion_gate={self._live_odom_motion_gate}, "
+            f"depth_align=enabled "
+            f"extrinsic_source=pyrealsense2 t_cd=({_t[0]:.5f},{_t[1]:.5f},{_t[2]:.5f}) "
+            f"color={width}x{height}{filters_msg}{debug_msg})"
         )
 
 
@@ -2813,6 +3079,15 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
         if not _sync_report_json and getattr(args, "model_path", ""):
             _sync_report_json = os.path.join(args.model_path, "rosbag_sync_report.json")
         _depth_scale = float(getattr(args, "rosbag_depth_scale", 0.0) or _defaults["depth_scale"])
+        _alignment_debug_frames = max(0, int(getattr(args, "rosbag_alignment_debug_frames", 0)))
+        _alignment_debug_dir = getattr(args, "rosbag_alignment_debug_dir", "")
+        if (
+            not _alignment_debug_dir
+            and _profile == "realsense"
+            and _alignment_debug_frames > 0
+            and getattr(args, "model_path", "")
+        ):
+            _alignment_debug_dir = os.path.join(args.model_path, "depth_alignment_debug")
         return RealsenseRosBagFrameSource(
             _bag_file,
             color_topic=_color_topic,
@@ -2846,8 +3121,11 @@ def make_frame_source(source_path: str, args) -> "RGBDSequenceFrameSource | TUMF
             sync_offset_ms=getattr(args, "rosbag_sync_offset_ms", "0"),
             sync_report_json=_sync_report_json,
             rgb_encoding_override=getattr(args, "rosbag_rgb_encoding_override", ""),
+            alignment_debug_dir=_alignment_debug_dir,
+            alignment_debug_frames=_alignment_debug_frames,
             source_label=str(_defaults["label"]),
             profile=_profile,
+            realsense_depth_filters=bool(getattr(args, "rosbag_realsense_depth_filters", True)),
         )
     # Orbbec ROS2 slam bag: metadata.yaml (rosbag2 format)
     if os.path.exists(os.path.join(path, "metadata.yaml")):
