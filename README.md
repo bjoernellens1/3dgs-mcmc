@@ -116,5 +116,12 @@ python train.py --source_path PATH/TO/Shape --config configs/shape.json --eval
 ```
 
 
+## Ecosystem
+
+This fork is the foundation of the **Splatograph** streaming 3DGS stack.
+See [bjoernellens1/splatograph/docs/ECOSYSTEM_CONTRIBUTIONS.md](https://github.com/bjoernellens1/splatograph/blob/main/docs/ECOSYSTEM_CONTRIBUTIONS.md)
+for the full dependency graph, the per-repo contributions (features
+added, performance changes, AMD/ROCm gfx1151 fixes), and NVIDIA/CUDA
+port notes.
 
 
